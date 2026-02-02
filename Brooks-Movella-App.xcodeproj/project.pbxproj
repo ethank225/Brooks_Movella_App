@@ -6,13 +6,42 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXCopyFilesBuildPhase section */
+		AA4A47332F3054DB00CA4F7C /* Embed Frameworks */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 10;
+			files = (
+			);
+			name = "Embed Frameworks";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
 /* Begin PBXFileReference section */
 		AA4A46D42F2D48F800CA4F7C /* Brooks-Movella-App.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Brooks-Movella-App.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
+/* Begin PBXFileSystemSynchronizedGroupBuildPhaseMembershipExceptionSet section */
+		AA4A47342F3054DB00CA4F7C /* Exceptions for "Brooks-Movella-App" folder in "Embed Frameworks" phase from "Brooks-Movella-App" target */ = {
+			isa = PBXFileSystemSynchronizedGroupBuildPhaseMembershipExceptionSet;
+			attributesByRelativePath = {
+				MovellaDotSdk.framework = (CodeSignOnCopy, RemoveHeadersOnCopy, );
+			};
+			buildPhase = AA4A47332F3054DB00CA4F7C /* Embed Frameworks */;
+			membershipExceptions = (
+				MovellaDotSdk.framework,
+			);
+		};
+/* End PBXFileSystemSynchronizedGroupBuildPhaseMembershipExceptionSet section */
+
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		AA4A46D62F2D48F800CA4F7C /* Brooks-Movella-App */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				AA4A47342F3054DB00CA4F7C /* Exceptions for "Brooks-Movella-App" folder in "Embed Frameworks" phase from "Brooks-Movella-App" target */,
+			);
 			path = "Brooks-Movella-App";
 			sourceTree = "<group>";
 		};
@@ -33,6 +62,7 @@
 			isa = PBXGroup;
 			children = (
 				AA4A46D62F2D48F800CA4F7C /* Brooks-Movella-App */,
+				AA4A47302F3054C600CA4F7C /* Frameworks */,
 				AA4A46D52F2D48F800CA4F7C /* Products */,
 			);
 			sourceTree = "<group>";
@@ -45,6 +75,13 @@
 			name = Products;
 			sourceTree = "<group>";
 		};
+		AA4A47302F3054C600CA4F7C /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
@@ -55,6 +92,7 @@
 				AA4A46D02F2D48F800CA4F7C /* Sources */,
 				AA4A46D12F2D48F800CA4F7C /* Frameworks */,
 				AA4A46D22F2D48F800CA4F7C /* Resources */,
+				AA4A47332F3054DB00CA4F7C /* Embed Frameworks */,
 			);
 			buildRules = (
 			);
@@ -255,7 +293,13 @@
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = N3D3Q3AM6Q;
 				ENABLE_PREVIEWS = YES;
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(PROJECT_DIR)/Brooks-Movella-App",
+				);
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_NSBluetoothAlwaysUsageDescription = "This app uses Bluetooth to connect to DOT sensors";
+				INFOPLIST_KEY_NSBluetoothPeripheralUsageDescription = "This app uses Bluetooth to connect to DOT sensors";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -287,7 +331,13 @@
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = N3D3Q3AM6Q;
 				ENABLE_PREVIEWS = YES;
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(PROJECT_DIR)/Brooks-Movella-App",
+				);
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_NSBluetoothAlwaysUsageDescription = "This app uses Bluetooth to connect to DOT sensors";
+				INFOPLIST_KEY_NSBluetoothPeripheralUsageDescription = "This app uses Bluetooth to connect to DOT sensors";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
