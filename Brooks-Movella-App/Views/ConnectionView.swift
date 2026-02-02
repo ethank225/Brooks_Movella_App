@@ -50,7 +50,7 @@ struct ConnectionView: View {
 
                     ForEach(discoveredList, id: \.uuid) { device in
                         DeviceRow(
-                            title: "DOT \(device.shortName())",
+                            title: "DOT \(device.uuid)",
                             subtitle: manager.displayAddress(for: device),
                             isConnected: connectedUuids.contains(device.uuid),
                             onToggle: { toggleConnection(device) }

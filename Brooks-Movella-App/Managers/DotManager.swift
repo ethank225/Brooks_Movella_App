@@ -1,44 +1,32 @@
 import Foundation
 import MovellaDotSdk
 
-// MARK: - Notifications
-
 extension Notification.Name {
     static let dotManagerUpdated = Notification.Name("dotManagerUpdated")
 }
-
-// MARK: - DotManager (UUID-only, multi-dot safe)
 
 final class DotManager: NSObject {
 
     static let shared = DotManager()
 
-    // MARK: Public state
+    // MARK: - Model
 
-    /// Latest discovered devices (deduped by UUID). Persists across scans until you "fresh scan".
-    private(set) var discovered: [DotDevice] = []
+    struct DotState {
+        var device: DotDevice
+        var dot: Dot?              // Present if we've wrapped/connected before
+        var isConnected: Bool
+        var lastSeen: Date
+    }
 
-    /// Connected DOT wrappers. `Dot.address` is UUID.
-    private(set) var dots: [Dot] = []
+    // MARK: - State (single source of truth)
 
-    private(set) var isScanning: Bool = false
+    private var byUuid: [String: DotState] = [:]
 
-    // MARK: Internal state (UUID only)
+    private(set) var isScanning = false
 
-    /// Latest DotDevice per UUID (can persist across scans).
-    private var discoveredByUuid: [String: DotDevice] = [:]
-
-    /// UUIDs seen during the current scan session.
-    private var seenThisScan: Set<String> = []
-
-    /// Pending connect requests (UUIDs).
-    private var pendingConnectUuids: Set<String> = []
-
-    /// Only allow one connect attempt at a time.
-    private var connectInProgressUuid: String?
-
-    /// Whether this scan should wipe discovered first.
-    private var scanIsFresh: Bool = true
+    // Connect queue (serialized)
+    private var connectQueue: [String] = []
+    private var connectInProgress: String?
 
     private override init() {
         super.init()
@@ -48,11 +36,27 @@ final class DotManager: NSObject {
         DotConnectionManager.setConnectionDelegate(self)
     }
 
-    // MARK: - Identifier helpers (UUID-only)
+    // MARK: - Public computed views
 
-    private func uuid(for device: DotDevice) -> String? {
-        let u = device.uuid
-        return u.isEmpty ? nil : u
+    var discovered: [DotDevice] {
+        byUuid.values
+            .sorted { $0.lastSeen > $1.lastSeen }
+            .map { $0.device }
+    }
+
+    var dots: [Dot] {
+        byUuid.values.compactMap { $0.dot }
+    }
+
+    var connectedDots: [Dot] {
+        byUuid.values.compactMap { state in
+            guard state.isConnected else { return nil }
+            return state.dot
+        }
+    }
+
+    func dot(forUuid uuid: String) -> Dot? {
+        byUuid[uuid]?.dot
     }
 
     func displayAddress(for device: DotDevice) -> String {
@@ -61,70 +65,24 @@ final class DotManager: NSObject {
         return "?"
     }
 
-    // MARK: - Lookup
-
-    func dot(for device: DotDevice) -> Dot? {
-        guard let u = uuid(for: device) else { return nil }
-        return dot(forUuid: u)
-    }
-
-    func dot(forUuid uuid: String) -> Dot? {
-        dots.first { $0.address == uuid }
-    }
-
     // MARK: - Scanning
 
-    /// Use when you want to clear the list and rescan from scratch (pull to refresh).
-    func startScanFresh() {
-        scanIsFresh = true
-        startScanInternal()
-    }
-
-    /// Use when you already have a dot connected and want to find more dots without wiping state.
-    func startScanForMore() {
-        scanIsFresh = false
-        startScanInternal()
-    }
-
-    /// Backwards-compatible if you already call `startScan()` from the UI.
-    /// Default to "for more" so you do not wipe state while connected.
     func startScan() {
-        startScanForMore()
-    }
-
-    private func startScanInternal() {
         guard DotConnectionManager.managerStateIsPoweredOn() else {
             print("❌ Bluetooth not powered on")
             return
         }
-
-        // Start a new scan session tracker
-        seenThisScan.removeAll()
-
-        if scanIsFresh {
-            // Only wipe discovered when explicitly requested
-            discoveredByUuid.removeAll()
-            discovered.removeAll()
-        }
-
-        // Avoid spamming scan calls
-        if isScanning {
-            print("🔍 Scan already running")
-            notify()
-            return
-        }
+        guard !isScanning else { return }
 
         isScanning = true
         DotConnectionManager.scan()
-
-        print("🔍 Scan started (\(scanIsFresh ? "fresh" : "for more"))")
+        print("🔍 Scan started")
         notify()
     }
 
     func stopScan() {
         DotConnectionManager.stopScan()
         isScanning = false
-
         print("🔍 Scan stopped")
         notify()
     }
@@ -132,21 +90,16 @@ final class DotManager: NSObject {
     // MARK: - Connect / Disconnect
 
     func connectByUuid(_ uuid: String) {
-        let trimmed = uuid.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
+        let u = uuid.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !u.isEmpty else { return }
 
-        let inserted = pendingConnectUuids.insert(trimmed).inserted
-        if inserted {
-            print("🔗 Queued connect for UUID \(trimmed) (pending: \(pendingConnectUuids.count))")
+        if !connectQueue.contains(u) && connectInProgress != u {
+            connectQueue.append(u)
         }
 
-        // Ensure we are scanning for more devices (do not wipe state)
-        if !isScanning {
-            startScanForMore()
-        }
-
-        // If already discovered, we can attempt immediately
-        attemptNextConnection()
+        // Ensure scanning to discover the DotDevice if we do not have it yet
+        startScan()
+        attemptNextConnect()
         notify()
     }
 
@@ -154,85 +107,21 @@ final class DotManager: NSObject {
         DotConnectionManager.disconnect(dot.device)
     }
 
-    func disconnectAll() {
-        dots.forEach { DotConnectionManager.disconnect($0.device) }
+    // MARK: - Internals
+
+    private func attemptNextConnect() {
+        guard connectInProgress == nil else { return }
+
+        // Find next UUID where we actually have a DotDevice reference
+        guard let nextIndex = connectQueue.firstIndex(where: { byUuid[$0] != nil }) else { return }
+        let u = connectQueue.remove(at: nextIndex)
+
+        guard let state = byUuid[u] else { return }
+
+        connectInProgress = u
+        print("🔗 Connecting to \(displayAddress(for: state.device)) (uuid=\(u))")
+        DotConnectionManager.connect(state.device)
     }
-
-    // MARK: - Connection serialization
-
-    private func attemptNextConnection() {
-        if connectInProgressUuid != nil { return }
-
-        // Find a pending UUID that we already have a DotDevice for
-        guard let nextUuid = pendingConnectUuids.first(where: { discoveredByUuid[$0] != nil }) else {
-            return
-        }
-        guard let device = discoveredByUuid[nextUuid] else { return }
-
-        connectInProgressUuid = nextUuid
-        pendingConnectUuids.remove(nextUuid)
-
-        print("🔗 Connecting (serialized) to \(displayAddress(for: device)) (uuid=\(nextUuid))")
-        DotConnectionManager.connect(device)
-    }
-
-    // MARK: - Configuration
-
-    func configureAll(outputRate: Int = 60, filterIndex: Int = 0) {
-        dots.forEach { $0.configure(outputRate: outputRate, filterIndex: filterIndex) }
-        print("⚙️ Configured all \(dots.count) dots: \(outputRate)Hz, filter \(filterIndex)")
-    }
-
-    // MARK: - Recording
-
-    func startRecordingAll(seconds: UInt16 = 0xFFFF,
-                           completion: @escaping (Bool) -> Void) {
-        guard !dots.isEmpty else { completion(false); return }
-
-        let group = DispatchGroup()
-        var allSuccess = true
-
-        print("🔴 Starting recording on \(dots.count) dots...")
-
-        for dot in dots {
-            group.enter()
-            dot.startRecording(seconds: seconds) { success in
-                if !success { allSuccess = false }
-                group.leave()
-            }
-        }
-
-        group.notify(queue: .main) { [weak self] in
-            print("🔴 Recording started on all: \(allSuccess ? "✅" : "⚠️ some failed")")
-            self?.notify()
-            completion(allSuccess)
-        }
-    }
-
-    func stopRecordingAll(completion: @escaping (Bool) -> Void) {
-        guard !dots.isEmpty else { completion(false); return }
-
-        let group = DispatchGroup()
-        var allSuccess = true
-
-        print("⏹️ Stopping recording on \(dots.count) dots...")
-
-        for dot in dots {
-            group.enter()
-            dot.stopRecording { success in
-                if !success { allSuccess = false }
-                group.leave()
-            }
-        }
-
-        group.notify(queue: .main) { [weak self] in
-            print("⏹️ Recording stopped on all: \(allSuccess ? "✅" : "⚠️ some failed")")
-            self?.notify()
-            completion(allSuccess)
-        }
-    }
-
-    // MARK: - Notifications
 
     private func notify() {
         DispatchQueue.main.async {
@@ -250,101 +139,88 @@ extension DotManager: DotConnectionDelegate {
         notify()
     }
 
-    func onScanCompleted() {
-        isScanning = false
+    func onDiscover(_ device: DotDevice) {
+        guard !device.uuid.isEmpty else { return }
+        let u = device.uuid
 
-        // Update discovered list from dictionary (persists unless fresh scan cleared it)
-        discovered = Array(discoveredByUuid.values)
-        discovered.sort { $0.uuid < $1.uuid }
+        let now = Date()
 
-        if !pendingConnectUuids.isEmpty {
-            print("⚠️ Scan completed, still pending UUIDs: \(pendingConnectUuids)")
+        if var existing = byUuid[u] {
+            existing.device = device
+            existing.lastSeen = now
+            byUuid[u] = existing
+        } else {
+            byUuid[u] = DotState(device: device, dot: nil, isConnected: false, lastSeen: now)
         }
 
-        print("🔍 Scan completed — total known devices: \(discovered.count)")
+        // If we were waiting to connect this UUID, advance queue
+        attemptNextConnect()
         notify()
-
-        // If we still have pending connects, scanning ended before we found them.
-        // Kick another scan for more (does not wipe).
-        if !pendingConnectUuids.isEmpty {
-            startScanForMore()
-        }
     }
 
-    func onDiscover(_ device: DotDevice) {
-        guard let u = uuid(for: device) else {
-            print("⚠️ Discovered device without UUID")
-            return
-        }
-
-        seenThisScan.insert(u)
-
-        // Persist latest device reference
-        discoveredByUuid[u] = device
-
-        // Live-update list
-        discovered = Array(discoveredByUuid.values)
-        discovered.sort { $0.uuid < $1.uuid }
+    func onScanCompleted() {
+        isScanning = false
+        print("🔍 Scan completed — known devices: \(byUuid.count)")
         notify()
 
-        // If this was pending or we are idle, attempt next serialized connection
-        if pendingConnectUuids.contains(u) || connectInProgressUuid == nil {
-            attemptNextConnection()
+        // If we still have queued connects, keep scanning until we discover them
+        if !connectQueue.isEmpty {
+            startScan()
         }
     }
 
     func onDeviceConnectSucceeded(_ device: DotDevice) {
-        guard let u = uuid(for: device) else {
-            print("✅ Connected, but missing UUID")
-            connectInProgressUuid = nil
-            attemptNextConnection()
+        guard !device.uuid.isEmpty else {
+            connectInProgress = nil
+            attemptNextConnect()
             notify()
             return
         }
 
-        if let existing = dots.first(where: { $0.address == u }) {
-            existing.isConnected = true
-            print("✅ Reconnected: \(displayAddress(for: device)) (uuid=\(u))")
+        let u = device.uuid
+
+        var state = byUuid[u] ?? DotState(device: device, dot: nil, isConnected: false, lastSeen: Date())
+        state.device = device
+        state.lastSeen = Date()
+
+        if let dot = state.dot {
+            dot.isConnected = true
+            state.isConnected = true
         } else {
             let dot = Dot(device: device)
             dot.isConnected = true
-            dots.append(dot)
-            print("✅ Connected: \(displayAddress(for: device)) (uuid=\(u)) Total: \(dots.count)")
+            state.dot = dot
+            state.isConnected = true
         }
 
+        byUuid[u] = state
+
+        print("✅ Connected (uuid=\(u))")
+        connectInProgress = nil
+        attemptNextConnect()
         notify()
-
-        // Advance queue
-        connectInProgressUuid = nil
-        attemptNextConnection()
-
-        // Keep scanning for more devices if user is still scanning (do not stop scan early)
-        // No action needed; scan continues until SDK completes.
     }
 
     func onDeviceConnectFailed(_ device: DotDevice) {
-        let u = uuid(for: device) ?? "?"
-        print("❌ Connection failed: \(displayAddress(for: device)) (uuid=\(u))")
+        let u = device.uuid
+        print("❌ Connection failed (uuid=\(u))")
 
+        connectInProgress = nil
+        attemptNextConnect()
         notify()
-
-        // Advance queue even on failure
-        connectInProgressUuid = nil
-        attemptNextConnection()
     }
 
     func onDeviceDisconnected(_ device: DotDevice) {
-        let u = uuid(for: device) ?? "?"
-        print("⛓️‍💥 Disconnected: \(displayAddress(for: device)) (uuid=\(u))")
+        guard !device.uuid.isEmpty else { return }
+        let u = device.uuid
 
-        if let existing = dots.first(where: { $0.address == u }) {
-            existing.isConnected = false
+        if var state = byUuid[u] {
+            state.isConnected = false
+            state.dot?.isConnected = false
+            byUuid[u] = state
         }
 
+        print("⛓️‍💥 Disconnected (uuid=\(u))")
         notify()
-
-        // IMPORTANT:
-        // Do NOT auto-start a scan here. The SDK is already handling teardown.
-        // Let the user initiate scanning for more, or scan periodically from UI.
     }
 }
