@@ -9,11 +9,11 @@ struct ContentView: View {
                     Text("Connect")
                 }
             
-//            SyncView()
-//                .tabItem {
-//                    Image(systemName: "arrow.triangle.2.circlepath")
-//                    Text("Sync")
-//                }
+            SyncView()
+                .tabItem {
+                    Image(systemName: "arrow.triangle.2.circlepath")
+                    Text("Sync")
+                }
             
             ExportView()
                 .tabItem {

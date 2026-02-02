@@ -22,7 +22,7 @@ final class Dot {
     var sessionSynced = false
 
     var address: String {
-        device.macAddress ?? device.uuid ?? "unknown"
+        device.uuid
     }
 
     var isInitialized: Bool {

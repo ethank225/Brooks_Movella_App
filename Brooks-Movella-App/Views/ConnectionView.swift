@@ -5,22 +5,28 @@ struct ConnectionView: View {
 
     private let manager = DotManager.shared
 
-    @State private var discoveredByAddress: [String: DotDevice] = [:]
-    @State private var connectedAddresses: Set<String> = []
+    // UUID -> DotDevice
+    @State private var discoveredByUuid: [String: DotDevice] = [:]
+
+    // Connected UUIDs only
+    @State private var connectedUuids: Set<String> = []
+
     @State private var isScanning = false
 
     private var discoveredList: [DotDevice] {
-        discoveredByAddress.values
-            .sorted { $0.displayAddress() < $1.displayAddress() }
+        discoveredByUuid.values.sorted { left, right in
+            manager.displayAddress(for: left) < manager.displayAddress(for: right)
+        }
     }
 
     var body: some View {
         NavigationView {
             VStack(spacing: 0) {
-                if !connectedAddresses.isEmpty {
+
+                if !connectedUuids.isEmpty {
                     HStack {
                         Image(systemName: "sensor.tag.radiowaves.forward.fill")
-                        Text("\(connectedAddresses.count) connected")
+                        Text("\(connectedUuids.count) connected")
                             .font(.subheadline.weight(.medium))
                         Spacer()
                     }
@@ -42,10 +48,11 @@ struct ConnectionView: View {
                             .foregroundColor(.secondary)
                     }
 
-                    ForEach(discoveredList, id: \.displayAddressString) { device in
+                    ForEach(discoveredList, id: \.uuid) { device in
                         DeviceRow(
-                            device: device,
-                            isConnected: connectedAddresses.contains(device.displayAddress()),
+                            title: "DOT \(device.shortName())",
+                            subtitle: manager.displayAddress(for: device),
+                            isConnected: connectedUuids.contains(device.uuid),
                             onToggle: { toggleConnection(device) }
                         )
                     }
@@ -58,34 +65,26 @@ struct ConnectionView: View {
                     Button {
                         startScan()
                     } label: {
-                        if isScanning {
-                            ProgressView()
-                        } else {
-                            Image(systemName: "arrow.clockwise")
-                        }
+                        if isScanning { ProgressView() }
+                        else { Image(systemName: "arrow.clockwise") }
                     }
                     .disabled(isScanning)
                 }
             }
-            .refreshable {
-                startScan()
-            }
+            .refreshable { startScan() }
             .onAppear {
                 manager.activate()
+                syncState()
                 startScan()
             }
             .onDisappear {
                 manager.stopScan()
             }
-            .onReceive(
-                NotificationCenter.default.publisher(for: .dotManagerUpdated)
-            ) { _ in
+            .onReceive(NotificationCenter.default.publisher(for: .dotManagerUpdated)) { _ in
                 syncState()
             }
         }
     }
-
-    // MARK: - Actions
 
     private func startScan() {
         isScanning = true
@@ -93,45 +92,36 @@ struct ConnectionView: View {
     }
 
     private func toggleConnection(_ device: DotDevice) {
-        let address = device.displayAddress()
+        let uuid = device.uuid
 
-        if connectedAddresses.contains(address) {
-            // Disconnect
-            if let dot = manager.dot(for: device) {
+        if connectedUuids.contains(uuid) {
+            if let dot = manager.dot(forUuid: uuid) {
                 manager.disconnect(dot)
             }
         } else {
-            // Connect via scan-then-connect pattern.
-            // The SDK requires connect to be called inside the onDiscover callback,
-            // so we trigger a fresh scan with the target address queued up.
-            let macAddress = device.macAddress ?? ""
-            manager.connectByAddress(macAddress)
+            manager.connectByUuid(uuid)
         }
     }
 
-    // MARK: - State Sync
-
     private func syncState() {
-        var dict = discoveredByAddress
+        var newDiscovered: [String: DotDevice] = [:]
         for d in manager.discovered {
-            dict[d.displayAddress()] = d
+            if !d.uuid.isEmpty {
+                newDiscovered[d.uuid] = d
+            }
         }
-        discoveredByAddress = dict
-        connectedAddresses = Set(manager.dots.map { $0.address })
+        discoveredByUuid = newDiscovered
+
+        // IMPORTANT FIX
+        connectedUuids = Set(manager.dots.filter { $0.isConnected }.map { $0.address })
+
         isScanning = manager.isScanning
     }
 }
 
-// MARK: - Stable SwiftUI ID
-
-private extension DotDevice {
-    var displayAddressString: String { displayAddress() }
-}
-
-// MARK: - Device Row
-
 struct DeviceRow: View {
-    let device: DotDevice
+    let title: String
+    let subtitle: String
     let isConnected: Bool
     let onToggle: () -> Void
 
@@ -142,9 +132,8 @@ struct DeviceRow: View {
                 .frame(width: 10, height: 10)
 
             VStack(alignment: .leading, spacing: 2) {
-                Text("DOT \(device.shortName())")
-                    .font(.headline)
-                Text(device.displayAddress())
+                Text(title).font(.headline)
+                Text(subtitle)
                     .font(.caption)
                     .foregroundColor(.secondary)
                     .lineLimit(1)
