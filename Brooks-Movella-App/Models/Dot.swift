@@ -3,7 +3,8 @@
 //  Brooks-Movella-App
 //
 //  Thin wrapper around a single DotDevice.
-//  Adds sessionSynced so the UI reflects THIS sync attempt (not device.isSynced()).
+//  Dot owns its own mutable state (isConnected, isRecording, etc.)
+//  DotManager controls when these states change via SDK callbacks.
 //
 
 import Foundation
@@ -11,34 +12,45 @@ import MovellaDotSdk
 
 final class Dot {
 
+    // MARK: - Immutable identity
+    
     let device: DotDevice
-    private let lock = NSLock()
-
-    var isConnected = false
-    var isRecording = false
-    private(set) var isBusy = false
-
-    // This is your per-button-press sync truth
-    var sessionSynced = false
-
+    
     var address: String {
         device.uuid
     }
 
+    // MARK: - Mutable state (owned by Dot, controlled by DotManager)
+    
+    var isConnected = false
+    var isRecording = false
+    
+    /// Per-session sync flag - reset each sync attempt
+    var sessionSynced = false
+
+    // MARK: - Busy lock for async operations
+    
+    private let lock = NSLock()
+    private(set) var isBusy = false
+
+    // MARK: - Computed properties from device
+    
     var isInitialized: Bool {
         device.isInitialized()
     }
 
-    // Do not use this to decide success. It can be stale/persisted.
+    /// Note: This can be stale/persisted. Use sessionSynced for current sync status.
     var isSynced: Bool {
         device.isSynced()
     }
+
+    // MARK: - Init
 
     init(device: DotDevice) {
         self.device = device
     }
 
-    // MARK: - Busy lock
+    // MARK: - Busy lock helpers
 
     private func acquireLock() -> Bool {
         lock.lock()
@@ -130,7 +142,7 @@ final class Dot {
         device.stopRecording()
     }
 
-    // MARK: - Flash helpers (optional)
+    // MARK: - Flash helpers
 
     func getFlashInfo(completion: @escaping (XSFlashInfoStatus) -> Void) {
         guard acquireLock() else {
@@ -165,6 +177,8 @@ final class Dot {
         device.eraseData()
     }
 }
+
+// MARK: - Equatable
 
 extension Dot: Equatable {
     static func == (lhs: Dot, rhs: Dot) -> Bool {

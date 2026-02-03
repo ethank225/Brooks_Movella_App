@@ -80,6 +80,8 @@ struct ConnectionView: View {
             .onDisappear {
                 manager.stopScan()
             }
+
+            // ✅ FIX: listen to the notification DotManager actually posts
             .onReceive(NotificationCenter.default.publisher(for: .dotManagerUpdated)) { _ in
                 syncState()
             }
@@ -112,9 +114,10 @@ struct ConnectionView: View {
         }
         discoveredByUuid = newDiscovered
 
-        // IMPORTANT FIX
+        // Connected = dots whose wrapper says they're connected
         connectedUuids = Set(manager.dots.filter { $0.isConnected }.map { $0.address })
 
+        // Mirror scanning state from manager
         isScanning = manager.isScanning
     }
 }
