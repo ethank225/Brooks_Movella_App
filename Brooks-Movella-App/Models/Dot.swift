@@ -9,8 +9,10 @@
 
 import Foundation
 import MovellaDotSdk
+import Combine  // ← Add this
 
-final class Dot {
+
+final class Dot: ObservableObject {
 
     // MARK: - Immutable identity
     
@@ -22,11 +24,9 @@ final class Dot {
 
     // MARK: - Mutable state (owned by Dot, controlled by DotManager)
     
-    var isConnected = false
-    var isRecording = false
-    
-    /// Per-session sync flag - reset each sync attempt
-    var sessionSynced = false
+    @Published var isConnected = false      // ← Add @Published
+    @Published var isRecording = false      // ← Add @Published
+    @Published var sessionSynced = false    // ← Add @Published
 
     // MARK: - Busy lock for async operations
     
@@ -73,47 +73,92 @@ final class Dot {
 
     // MARK: - Configuration
 
-    func configure(outputRate: Int = 60, filterIndex: Int = 0) {
+    func configure(outputRate: Int = 120, filterIndex: Int = 0) {
         device.setOutputRate(Int32(outputRate), filterIndex: Int32(filterIndex))
         print("⚙️ [\(address)] Configured: \(outputRate)Hz, filter \(filterIndex)")
     }
 
     // MARK: - Recording
 
+    // MARK: - Recording
+
     func startRecording(seconds: UInt16 = 0xFFFF, completion: @escaping (Bool) -> Void) {
+        // First get flash info to ensure flash is ready
+        getFlashInfo { [weak self] status in
+            guard let self = self else {
+                completion(false)
+                return
+            }
+            
+            guard status == .isReady else {
+                print("❌ [\(self.address)] Flash not ready: \(status.rawValue)")
+                completion(false)
+                return
+            }
+            
+            self.actuallyStartRecording(seconds: seconds, completion: completion)
+        }
+    }
+    
+    func getFlashInfo(completion: @escaping (XSFlashInfoStatus) -> Void) {
+        // Don't require lock for flash info check
+        print("💾 [\(address)] Getting flash info...")
+        
+        device.setFlashInfoDoneBlock { [weak self] status in
+            print("💾 [\(self?.address ?? "?")] Flash status: \(status.rawValue)")
+            completion(status)
+        }
+        
+        device.getFlashInfo()
+    }
+
+    private func actuallyStartRecording(seconds: UInt16, completion: @escaping (Bool) -> Void) {
         guard acquireLock() else {
             print("⚠️ [\(address)] Busy, skipping startRecording")
             completion(false)
             return
         }
+        
         guard isInitialized else {
             print("⚠️ [\(address)] Not initialized, skipping startRecording")
             releaseLock()
             completion(false)
             return
         }
-
+        
+        var didComplete = false
+        
+        print("🎬 [\(address)] Starting recording...")
+        
         device.recording.updateRecordingStatus = { [weak self] (status: XSRecordingStatus) in
             guard let self = self else { return }
-
+            
+            print("📨 [\(self.address)] Status: \(status.rawValue)")
+            
+            guard !didComplete else { return }
+            
             switch status {
             case .isRecording:
+                didComplete = true
                 self.isRecording = true
                 self.releaseLock()
                 print("🔴 [\(self.address)] Recording started")
                 completion(true)
-
+                
             case .isRecordingStopped:
-                self.isRecording = false
-                self.releaseLock()
-                print("❌ [\(self.address)] Recording failed to start")
-                completion(false)
-
+                // Only treat as failure if we weren't already recording
+                if !self.isRecording {
+                    didComplete = true
+                    self.releaseLock()
+                    print("❌ [\(self.address)] Recording failed to start")
+                    completion(false)
+                }
+                
             default:
                 break
             }
         }
-
+        
         device.startRecording(seconds)
     }
 
@@ -123,42 +168,38 @@ final class Dot {
             completion(false)
             return
         }
+        
         guard isRecording else {
+            print("⚠️ [\(address)] Not recording, nothing to stop")
             releaseLock()
             completion(true)
             return
         }
-
+        
+        var didComplete = false
+        
+        print("⏹️ [\(address)] Stopping recording...")
+        
         device.recording.updateRecordingStatus = { [weak self] (status: XSRecordingStatus) in
             guard let self = self else { return }
+            
+            print("📨 [\(self.address)] Status: \(status.rawValue)")
+            
+            guard !didComplete else { return }
+            
             if status == .isRecordingStopped {
+                didComplete = true
                 self.isRecording = false
                 self.releaseLock()
                 print("⏹️ [\(self.address)] Recording stopped")
                 completion(true)
             }
         }
-
+        
         device.stopRecording()
     }
+    
 
-    // MARK: - Flash helpers
-
-    func getFlashInfo(completion: @escaping (XSFlashInfoStatus) -> Void) {
-        guard acquireLock() else {
-            print("⚠️ [\(address)] Busy, skipping getFlashInfo")
-            completion(.isUninitialized)
-            return
-        }
-
-        device.setFlashInfoDoneBlock { [weak self] status in
-            self?.releaseLock()
-            print("💾 [\(self?.address ?? "?")] Flash status: \(status)")
-            completion(status)
-        }
-
-        device.getFlashInfo()
-    }
 
     func eraseFlash(completion: @escaping (Bool) -> Void) {
         guard acquireLock() else {

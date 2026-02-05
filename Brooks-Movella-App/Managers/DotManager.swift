@@ -57,6 +57,8 @@ final class DotManager: NSObject {
     /// Call once at app startup to register as the SDK delegate
     func activate() {
         DotConnectionManager.setConnectionDelegate(self)
+        //Manages the reconnection behavior of sensors
+        DotReconnectManager.setEnable(true)
     }
     
     // MARK: - Public API: Queries
@@ -141,6 +143,7 @@ final class DotManager: NSObject {
     
     /// Disconnect a connected sensor
     func disconnect(_ dot: Dot) {
+        DotDevicePool.unbindDevice(dot.device)
         DotConnectionManager.disconnect(dot.device)
     }
     
@@ -216,6 +219,126 @@ final class DotManager: NSObject {
             NotificationCenter.default.post(name: Notification.updated, object: nil)
         }
     }
+    
+    func syncConnectedDots(completion: @escaping (Bool) -> Void) {
+        let devices = connectedDots.map { $0.device }
+        
+        guard devices.count >= 2 else {
+            print("⚠️ Need at least 2 connected dots to sync")
+            completion(false)
+            return
+        }
+        
+        print("🔄 Starting sync with \(devices.count) devices...")
+        
+        DotSyncManager.startSync(devices) { [weak self] results in
+            guard let results = results as? [[String: Any]] else {
+                print("❌ Sync failed - no results")
+                completion(false)
+                return
+            }
+            
+            var allSuccess = true
+            for result in results {
+                let address = result["address"] as? String ?? "?"
+                let success = result["success"] as? Bool ?? false
+                print("   \(success ? "✅" : "❌") \(address)")
+                if !success { allSuccess = false }
+            }
+            
+            // Update sync status on Dot objects
+            for dot in self?.connectedDots ?? [] {
+                dot.sessionSynced = allSuccess
+            }
+            
+            print(allSuccess ? "✅ Sync completed" : "❌ Sync failed")
+            self?.notify()
+            completion(allSuccess)
+        }
+    }
+    
+    // Add to DotManager
+    private func executeSequentially<T>(
+        items: [T],
+        operation: @escaping (T, @escaping (Bool) -> Void) -> Void,
+        completion: @escaping (Bool) -> Void
+    ) {
+        var index = 0
+        var allSuccess = true
+        
+        func next() {
+            guard index < items.count else {
+                completion(allSuccess)
+                return
+            }
+            
+            let item = items[index]
+            operation(item) { success in
+                if !success { allSuccess = false }
+                index += 1
+                next()
+            }
+        }
+        
+        next()
+    }
+
+    // Now your methods become simple:
+    func startRecordingAll(completion: @escaping (Bool) -> Void) {
+        let dots = connectedDots
+        var remaining = dots.count
+        var allSuccess = true
+        
+        guard remaining > 0 else {
+            completion(false)
+            return
+        }
+        
+        for dot in dots {
+            dot.startRecording(seconds: 0xFFFF) { success in
+                if !success { allSuccess = false }
+                remaining -= 1
+                if remaining == 0 {
+                    completion(allSuccess)
+                }
+            }
+        }
+    }
+
+    func stopRecordingAll(completion: @escaping (Bool) -> Void) {
+        executeSequentially(
+            items: connectedDots,
+            operation: { dot, done in
+                print("⏹️ Stopping recording on \(dot.address)...")
+                dot.stopRecording(completion: done)
+            },
+            completion: completion
+        )
+    }
+    
+    func eraseAllFlash(completion: @escaping (Bool) -> Void) {
+        executeSequentially(
+            items: connectedDots,
+            operation: { dot, done in
+                print("🗑️ Erasing flash on \(dot.address)...")
+                dot.eraseFlash(completion: done)
+            },
+            completion: completion
+        )
+    }
+
+    /// Stop sync on all connected dots
+    func stopSync() {
+        let devices = connectedDots.map { $0.device }
+        DotSyncManager.stopSync(devices)
+        
+        for dot in connectedDots {
+            dot.sessionSynced = false
+        }
+        
+        print("⏹️ Sync stopped")
+        notify()
+    }
 }
 
 // MARK: - SDK Delegate
@@ -246,6 +369,32 @@ extension DotManager: DotConnectionDelegate {
         }
     }
     
+    // MARK: - Debug
+    func printStatus() {
+        print("═══════════════════════════════════")
+        print("DotManager Status")
+        print("───────────────────────────────────")
+        print("Discovered: \(byUuid.count)")
+        print("Dots created: \(dots.count)")
+        print("Connected: \(connectedDots.count)")
+        print("───────────────────────────────────")
+        
+        for (uuid, state) in byUuid {
+            let connected = state.dot?.isConnected ?? false
+            let symbol = connected ? "✅" : "⚪️"
+            print("\(symbol) \(state.device.macAddress) - connected: \(connected)")
+        }
+        
+        // Check DotDevicePool
+        let boundDevices = DotDevicePool.allBoundDevices() ?? []
+        print("───────────────────────────────────")
+        print("DotDevicePool bound: \(boundDevices.count)")
+        for device in boundDevices {
+            print("   🔗 \(device.macAddress)")
+        }
+        print("═══════════════════════════════════")
+    }
+    
     func onDeviceConnectSucceeded(_ device: DotDevice) {
         guard !device.uuid.isEmpty else {
             advanceConnectQueue()
@@ -254,6 +403,7 @@ extension DotManager: DotConnectionDelegate {
         }
         
         recordConnection(device)
+        DotDevicePool.bindDevice(device)
         print("✅ Connected (uuid=\(device.uuid))")
         
         advanceConnectQueue()
