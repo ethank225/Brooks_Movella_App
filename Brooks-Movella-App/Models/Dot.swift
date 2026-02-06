@@ -6,40 +6,43 @@
 //  Dot owns its own mutable state (isConnected, isRecording, etc.)
 //  DotManager controls when these states change via SDK callbacks.
 //
+//  Architecture:
+//  - One PERMANENT recording status handler that always keeps isRecording accurate.
+//  - Operations (start/stop recording, erase) send the SDK command then poll
+//    for the expected state change with a timeout. No callback swapping, no locks.
+//  - DotManager calls installDefaultRecordingStatusHandler() after reconnect.
+//
 
 import Foundation
 import MovellaDotSdk
-import Combine  // ← Add this
-
+import Combine
 
 final class Dot: ObservableObject {
 
     // MARK: - Immutable identity
+
     
-    let device: DotDevice
-    
+    private(set) var device: DotDevice
+
+
+
     var address: String {
         device.uuid
     }
 
-    // MARK: - Mutable state (owned by Dot, controlled by DotManager)
-    
-    @Published var isConnected = false      // ← Add @Published
-    @Published var isRecording = false      // ← Add @Published
-    @Published var sessionSynced = false    // ← Add @Published
+    // MARK: - Published state
 
-    // MARK: - Busy lock for async operations
-    
-    private let lock = NSLock()
-    private(set) var isBusy = false
+    @Published var isConnected = false
+    @Published var isRecording = false
+    @Published var sessionSynced = false
+    @Published var storagePercentageUsed: Double = 0
 
     // MARK: - Computed properties from device
-    
+
     var isInitialized: Bool {
         device.isInitialized()
     }
 
-    /// Note: This can be stale/persisted. Use sessionSynced for current sync status.
     var isSynced: Bool {
         device.isSynced()
     }
@@ -48,27 +51,68 @@ final class Dot: ObservableObject {
 
     init(device: DotDevice) {
         self.device = device
+        installDefaultRecordingStatusHandler()
+    }
+    
+    
+    func updateDevice(_ newDevice: DotDevice) {
+        self.device = newDevice
+        installDefaultRecordingStatusHandler()
+        print("🔄 [\(address)] Device reference updated")
     }
 
-    // MARK: - Busy lock helpers
+    // MARK: - Permanent Recording Status Handler
+    //
+    // This is the ONLY place updateRecordingStatus is set.
+    // It never gets overwritten by start/stop operations.
+    // Call this again after reconnect to re-register on the (potentially new) device state.
 
-    private func acquireLock() -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        if isBusy { return false }
-        isBusy = true
-        return true
+    func installDefaultRecordingStatusHandler() {
+        device.recording.updateRecordingStatus = { [weak self] status in
+            guard let self else { return }
+            print("📨 [\(self.address)] Recording status: \(status.rawValue)")
+
+            switch status {
+            case .isRecording:
+                self.setOnMain { self.isRecording = true }
+
+            case .isRecordingStopped, .isIdle:
+                self.setOnMain { self.isRecording = false }
+
+            default:
+                break
+            }
+        }
+    }
+    
+
+
+    // MARK: - Main-thread helper
+
+    private func setOnMain(_ work: @escaping () -> Void) {
+        if Thread.isMainThread {
+            work()
+        } else {
+            DispatchQueue.main.async(execute: work)
+        }
     }
 
-    private func releaseLock() {
-        lock.lock()
-        defer { lock.unlock() }
-        isBusy = false
+    // MARK: - State setters (called by DotManager)
+
+    func setIsConnected(_ value: Bool) {
+        setOnMain { self.isConnected = value }
     }
 
-    func forceRelease() {
-        releaseLock()
-        print("⚠️ [\(address)] Force released lock")
+    func setSessionSynced(_ value: Bool) {
+        setOnMain { self.sessionSynced = value }
+    }
+
+    // MARK: - Sync status refresh (called after reconnect + initialization)
+
+    func refreshSyncStatus() {
+        let synced = device.isSynced()
+        setOnMain { self.sessionSynced = synced }
+        print("🔄 [\(address)] Sync status from device: \(synced)")
     }
 
     // MARK: - Configuration
@@ -80,138 +124,205 @@ final class Dot: ObservableObject {
 
     // MARK: - Recording
 
-    // MARK: - Recording
-
     func startRecording(seconds: UInt16 = 0xFFFF, completion: @escaping (Bool) -> Void) {
-        // First get flash info to ensure flash is ready
         getFlashInfo { [weak self] status in
-            guard let self = self else {
+            guard let self else {
                 completion(false)
                 return
             }
-            
-            guard status == .isReady else {
-                print("❌ [\(self.address)] Flash not ready: \(status.rawValue)")
+
+            guard status == .isReady, self.isInitialized else {
+                print("❌ [\(self.address)] Cannot start recording")
                 completion(false)
                 return
             }
+
+            print("🎬 [\(self.address)] Starting recording...")
             
-            self.actuallyStartRecording(seconds: seconds, completion: completion)
+            // Send the command
+            self.device.startRecording(seconds)
+            
+            // Request status update immediately to trigger callback
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                self?.device.getRecordingStatus()
+            }
+
+            // Wait for state change
+            self.waitForRecordingState(true, timeout: 5.0) { success in
+                if success {
+                    print("🔴 [\(self.address)] Recording confirmed started")
+                } else {
+                    print("❌ [\(self.address)] Recording did not start in time")
+                }
+                completion(success)
+            }
         }
     }
     
-    func getFlashInfo(completion: @escaping (XSFlashInfoStatus) -> Void) {
-        // Don't require lock for flash info check
-        print("💾 [\(address)] Getting flash info...")
+    func refreshRecordingStatus() {
+        device.getRecordingStatus()  // triggers the callback
+    }
+
+    func stopRecording(completion: @escaping (Bool) -> Void) {
+        print("⏹️ [\(address)] Stopping recording...")
         
+        // Send stop command
+        device.stopRecording()
+        
+        // Also explicitly request status after a beat
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            self?.device.getRecordingStatus()
+        }
+        
+        waitForRecordingState(false, timeout: 8.0) { [weak self] success in
+            guard let self else { completion(false); return }
+            
+            if success {
+                print("⏹️ [\(self.address)] Recording confirmed stopped")
+                self.refreshStorageInfo()
+                completion(true)
+            } else {
+                // Fallback: send stop again and check device status directly
+                print("⚠️ [\(self.address)] First stop timed out, retrying...")
+                self.device.stopRecording()
+                
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                    guard let self else { completion(false); return }
+                    self.device.getRecordingStatus()
+                    
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                        let status = self.device.recording.recordingStatus
+                        print("⚠️ [\(self.address)] Retry status: \(status.rawValue)")
+                        if status == .isRecordingStopped || status == .isIdle {
+                            self.setOnMain { self.isRecording = false }
+                            self.refreshStorageInfo()
+                            completion(true)
+                        } else {
+                            // Nuclear option: force the state
+                            print("❌ [\(self.address)] Force-resetting isRecording")
+                            self.setOnMain { self.isRecording = false }
+                            completion(false)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func pollDeviceRecordingStatus(timeout: TimeInterval, completion: @escaping (Bool) -> Void) {
+        let start = Date()
+
+        func check() {
+            // Ask the SDK to refresh from the sensor
+            self.device.getRecordingStatus()
+
+            // Check the SDK's stored status directly
+            let status = self.device.recording.recordingStatus
+            print("🔍 [\(address)] Polled recordingStatus: \(status.rawValue)")
+
+            if status == .isRecordingStopped || status == .isIdle {
+                completion(true)
+                return
+            }
+
+            if Date().timeIntervalSince(start) > timeout {
+                completion(false)
+                return
+            }
+
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                check()
+            }
+        }
+
+        // First check after a short delay to let getRecordingStatus process
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            check()
+        }
+    }
+
+    // MARK: - Polling helper
+    //
+    // Watches isRecording until it matches the target value, or times out.
+    // No callback swapping, no locks — just checking state.
+
+    private func waitForRecordingState(
+        _ target: Bool,
+        timeout: TimeInterval,
+        completion: @escaping (Bool) -> Void
+    ) {
+        let start = Date()
+
+        func check() {
+            self.device.getRecordingStatus()
+            
+            // Check after delay, but stay on main for reading @Published state
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                if self.isRecording == target {
+                    completion(true)
+                    return
+                }
+                if Date().timeIntervalSince(start) > timeout {
+                    print("⏰ [\(self.address)] Timed out waiting for isRecording=\(target)")
+                    completion(false)
+                    return
+                }
+                check()
+            }
+        }
+        check()
+    }
+
+    // MARK: - Flash / Storage
+
+    func getFlashInfo(completion: @escaping (XSFlashInfoStatus) -> Void) {
+        print("💾 [\(address)] Getting flash info...")
+
         device.setFlashInfoDoneBlock { [weak self] status in
             print("💾 [\(self?.address ?? "?")] Flash status: \(status.rawValue)")
             completion(status)
         }
-        
+
         device.getFlashInfo()
     }
 
-    private func actuallyStartRecording(seconds: UInt16, completion: @escaping (Bool) -> Void) {
-        guard acquireLock() else {
-            print("⚠️ [\(address)] Busy, skipping startRecording")
-            completion(false)
-            return
-        }
-        
-        guard isInitialized else {
-            print("⚠️ [\(address)] Not initialized, skipping startRecording")
-            releaseLock()
-            completion(false)
-            return
-        }
-        
-        var didComplete = false
-        
-        print("🎬 [\(address)] Starting recording...")
-        
-        device.recording.updateRecordingStatus = { [weak self] (status: XSRecordingStatus) in
-            guard let self = self else { return }
-            
-            print("📨 [\(self.address)] Status: \(status.rawValue)")
-            
-            guard !didComplete else { return }
-            
-            switch status {
-            case .isRecording:
-                didComplete = true
-                self.isRecording = true
-                self.releaseLock()
-                print("🔴 [\(self.address)] Recording started")
-                completion(true)
-                
-            case .isRecordingStopped:
-                // Only treat as failure if we weren't already recording
-                if !self.isRecording {
-                    didComplete = true
-                    self.releaseLock()
-                    print("❌ [\(self.address)] Recording failed to start")
-                    completion(false)
-                }
-                
-            default:
-                break
+    func refreshStorageInfo() {
+        print("🔄 [\(address)] refreshStorageInfo called")
+        getFlashInfo { [weak self] status in
+            guard let self else {
+                print("🔄 [?] self is nil in refreshStorageInfo callback")
+                return
             }
+            print("🔄 [\(self.address)] getFlashInfo returned, calling updateStorageDisplay")
+            self.updateStorageDisplay()
         }
-        
-        device.startRecording(seconds)
     }
 
-    func stopRecording(completion: @escaping (Bool) -> Void) {
-        guard acquireLock() else {
-            print("⚠️ [\(address)] Busy, skipping stopRecording")
-            completion(false)
-            return
+    func updateStorageDisplay() {
+        let total = device.totalSpace
+        let percentage: Double
+        if total > 0 {
+            percentage = Double(device.usedSpace) / Double(total) * 100
+        } else {
+            percentage = 0
         }
-        
-        guard isRecording else {
-            print("⚠️ [\(address)] Not recording, nothing to stop")
-            releaseLock()
-            completion(true)
-            return
-        }
-        
-        var didComplete = false
-        
-        print("⏹️ [\(address)] Stopping recording...")
-        
-        device.recording.updateRecordingStatus = { [weak self] (status: XSRecordingStatus) in
-            guard let self = self else { return }
-            
-            print("📨 [\(self.address)] Status: \(status.rawValue)")
-            
-            guard !didComplete else { return }
-            
-            if status == .isRecordingStopped {
-                didComplete = true
-                self.isRecording = false
-                self.releaseLock()
-                print("⏹️ [\(self.address)] Recording stopped")
-                completion(true)
-            }
-        }
-        
-        device.stopRecording()
-    }
-    
 
+        print("💾 [\(address)] Storage: \(String(format: "%.1f", percentage))% used")
+
+        setOnMain {
+            self.storagePercentageUsed = percentage
+        }
+    }
 
     func eraseFlash(completion: @escaping (Bool) -> Void) {
-        guard acquireLock() else {
-            print("⚠️ [\(address)] Busy, skipping eraseFlash")
-            completion(false)
-            return
-        }
+        print("🗑️ [\(address)] Erasing flash...")
 
         device.setEraseDataDoneBlock { [weak self] success in
-            self?.releaseLock()
             let ok = success != 0
             print("🗑️ [\(self?.address ?? "?")] Erase: \(ok ? "success" : "failed")")
+
+            // Refresh storage after erase
+            self?.refreshStorageInfo()
             completion(ok)
         }
 
