@@ -1,17 +1,6 @@
 import Foundation
 import MovellaDotSdk
 
-// MARK: - DotManager
-//
-// Full fixed version:
-// - Makes DotManager state thread-safe (serial stateQueue)
-// - Serializes *all* SDK calls (sdkQueue) to avoid concurrent SDK operations
-// - Prevents sync from starting while connecting/initializing/refreshing
-// - Prevents post-connect refresh (flash info) from running while syncing
-// - Uses snapshots when iterating to avoid dictionary mutation crashes
-// - Keeps notifications on main thread for SwiftUI
-//
-
 final class DotManager: NSObject {
 
     // MARK: - Singleton
@@ -34,21 +23,14 @@ final class DotManager: NSObject {
         var device: DotDevice
         var dot: Dot?
         var lastSeen: Date
-
-        // App-owned intent: what we expect this dot to be doing for the session
-        var sessionWantsRecording: Bool = false
-
-        // If we ended session while it was away, stop it as soon as it returns
-        var pendingStopOnReconnect: Bool = false
     }
-
 
     // MARK: - Queues
 
-    /// Serializes DotManager state (byUuid/connectQueue flags, etc.)
+    /// Serializes DotManager state (byUuid, flags, etc.)
     private let stateQueue = DispatchQueue(label: "DotManager.stateQueue")
 
-    /// Serializes all SDK calls (connect, scan, sync, etc.)
+    /// Serializes all SDK calls (connect, scan, sync, operations)
     private let sdkQueue = DispatchQueue(label: "DotManager.sdkQueue")
 
     // MARK: - State (ONLY touch on stateQueue)
@@ -57,10 +39,11 @@ final class DotManager: NSObject {
 
     private var connectQueue: [String] = []
     private var connectInProgress: String?
+    
+    // We treat "initializing" as a busy state to prevent interfering with setup
+    private var initializationInProgress: Set<String> = []
 
     private var syncInProgress: Bool = false
-    private var refreshInProgress: Bool = false
-
     private var isScanningInternal: Bool = false
 
     // MARK: - Lifecycle
@@ -96,27 +79,15 @@ final class DotManager: NSObject {
         stateQueue.sync { byUuid[uuid]?.dot }
     }
 
-    func isConnected(forUuid uuid: String) -> Bool {
-        stateQueue.sync { byUuid[uuid]?.dot?.isConnected ?? false }
-    }
-
-    func displayAddress(for device: DotDevice) -> String {
-        if !device.macAddress.isEmpty { return device.macAddress }
-        if !device.uuid.isEmpty { return device.uuid }
-        return "?"
-    }
-
     // MARK: - Scanning
 
     func startScan() {
         stateQueue.async {
             if self.isScanningInternal { return }
 
-            // Check powered on on sdkQueue (SDK call)
             self.sdkQueue.async {
                 guard DotConnectionManager.managerStateIsPoweredOn() else {
                     print("❌ Bluetooth not powered on")
-                    self.notify()
                     return
                 }
 
@@ -126,7 +97,6 @@ final class DotManager: NSObject {
                     print("🔍 Scan started")
                     self.notify()
                 }
-
                 DotConnectionManager.scan()
             }
         }
@@ -152,45 +122,36 @@ final class DotManager: NSObject {
         guard !u.isEmpty else { return }
 
         stateQueue.async {
-            // Avoid duplicate queue entries
             if self.connectQueue.contains(u) || self.connectInProgress == u { return }
             self.connectQueue.append(u)
-
-            // Start scanning to find the device
+            
+            // Start scanning to find it if we haven't yet
             self.startScan()
-
-            // Try to connect if already discovered
+            
+            // Attempt connection
             self.processConnectQueue_locked()
             self.notify()
         }
     }
 
     func disconnect(_ dot: Dot) {
-        // Do not mutate state in here; this is an SDK call
         sdkQueue.async {
             DotDevicePool.unbindDevice(dot.device)
             DotConnectionManager.disconnect(dot.device)
         }
     }
-    
-    
 
     // MARK: - Sync
 
     func syncConnectedDots(completion: @escaping (Bool) -> Void) {
         stateQueue.async {
-            if self.syncInProgress {
+            if self.syncInProgress || !self.initializationInProgress.isEmpty {
+                print("⚠️ Cannot sync: busy initializing or syncing")
                 DispatchQueue.main.async { completion(false) }
                 return
             }
-
-            // Hard gate: no sync while connecting or refreshing
-            if self.connectInProgress != nil || !self.connectQueue.isEmpty {
-                print("⚠️ Cannot sync while connecting. Wait until idle.")
-                DispatchQueue.main.async { completion(false) }
-                return
-            }
-
+            
+            // 1. Gather devices
             let dotsSnapshot = self.byUuid.values.compactMap { $0.dot }.filter { $0.isConnected }
             let devices = dotsSnapshot.map { $0.device }
 
@@ -204,18 +165,17 @@ final class DotManager: NSObject {
             print("🔄 Starting sync with \(devices.count) devices...")
             self.notify()
 
-            // Serialize SDK call
+            // 2. Run on SDK Queue
             self.sdkQueue.async { [weak self] in
                 guard let self else { return }
 
                 DotSyncManager.startSync(devices) { results in
-                    // Hop back to stateQueue for state changes
                     self.stateQueue.async {
                         self.syncInProgress = false
-
+                        
                         guard let results = results as? [[String: Any]] else {
                             print("❌ Sync failed - no results")
-                            for d in dotsSnapshot { d.sessionSynced = false }
+                            dotsSnapshot.forEach { $0.setSessionSynced(false) }
                             self.notify()
                             DispatchQueue.main.async { completion(false) }
                             return
@@ -223,17 +183,16 @@ final class DotManager: NSObject {
 
                         var allSuccess = true
                         for result in results {
-                            let address = result["address"] as? String ?? "?"
                             let success = result["success"] as? Bool ?? false
-                            print("   \(success ? "✅" : "❌") \(address)")
                             if !success { allSuccess = false }
                         }
 
-                        for d in dotsSnapshot {
-                            d.setSessionSynced(allSuccess)
-                        }
-
+                        dotsSnapshot.forEach { $0.setSessionSynced(allSuccess) }
                         print(allSuccess ? "✅ Sync completed" : "❌ Sync failed")
+                        
+                        // Refresh storage for everyone after sync
+                        self.queueStorageRefresh_locked(dots: dotsSnapshot)
+                        
                         self.notify()
                         DispatchQueue.main.async { completion(allSuccess) }
                     }
@@ -246,11 +205,9 @@ final class DotManager: NSObject {
         stateQueue.async {
             let dotsSnapshot = self.byUuid.values.compactMap { $0.dot }.filter { $0.isConnected }
             let devices = dotsSnapshot.map { $0.device }
-
-            for d in dotsSnapshot { d.setSessionSynced(false)}
-
+            
+            dotsSnapshot.forEach { $0.setSessionSynced(false) }
             self.syncInProgress = false
-            print("⏹️ Sync stopped")
             self.notify()
 
             self.sdkQueue.async {
@@ -259,8 +216,145 @@ final class DotManager: NSObject {
         }
     }
 
-    // MARK: - Sequential helper (runs operations one-by-one)
+    // MARK: - Operations (Recording / Flash)
+    
+    func startRecordingAll(completion: @escaping (Bool) -> Void) {
+        stateQueue.async {
+            if self.syncInProgress {
+                DispatchQueue.main.async { completion(false) }
+                return
+            }
+            let dotsSnapshot = self.byUuid.values.compactMap { $0.dot }.filter { $0.isConnected }
+            
+            self.sdkQueue.async {
+                self.executeSequentially(items: dotsSnapshot) { dot, done in
+                    dot.startRecording(seconds: 0xFFFF, completion: done)
+                } completion: { ok in
+                    DispatchQueue.main.async { completion(ok) }
+                }
+            }
+        }
+    }
 
+    func stopRecordingAll(completion: @escaping (Bool) -> Void) {
+        stateQueue.async {
+            if self.syncInProgress {
+                DispatchQueue.main.async { completion(false) }
+                return
+            }
+            let dotsSnapshot = self.byUuid.values.compactMap { $0.dot }.filter { $0.isConnected }
+            
+            self.sdkQueue.async {
+                self.executeSequentially(items: dotsSnapshot) { dot, done in
+                    dot.stopRecording(completion: done)
+                } completion: { ok in
+                    DispatchQueue.main.async { completion(ok) }
+                }
+            }
+        }
+    }
+    
+    func eraseAllFlash(completion: @escaping (Bool) -> Void) {
+        stateQueue.async {
+            if self.syncInProgress {
+                DispatchQueue.main.async { completion(false) }
+                return
+            }
+            let dotsSnapshot = self.byUuid.values.compactMap { $0.dot }.filter { $0.isConnected }
+            
+            self.sdkQueue.async {
+                self.executeSequentially(items: dotsSnapshot) { dot, done in
+                    dot.eraseFlash(completion: done)
+                } completion: { ok in
+                    DispatchQueue.main.async { completion(ok) }
+                }
+            }
+        }
+    }
+    
+    // MARK: - Storage Refresh Queueing
+    
+    /// Checks `isInitialized` on the background thread before asking for storage
+    private func queueStorageRefresh_locked(dots: [Dot]) {
+        // Must be called on stateQueue
+        guard !dots.isEmpty else { return }
+        
+        print("💾 Queueing storage refresh for \(dots.count) dots")
+        
+        self.sdkQueue.async { [weak self] in
+            guard let self else { return }
+            
+            self.executeSequentially(items: dots) { dot, done in
+                // 1. Wait for initialization if needed (polling on SDK queue)
+                self.waitForInitialization(dot: dot, timeout: 5.0) { ready in
+                    if !ready {
+                        print("⚠️ [\(dot.address)] Not initialized, skipping storage refresh")
+                        done(false)
+                        return
+                    }
+                    
+                    // 2. Refresh Storage
+                    dot.getFlashInfo { _ in
+                        dot.updateStorageDisplay()
+                        done(true)
+                    }
+                }
+            } completion: { _ in
+                print("💾 Storage refresh queue finished")
+                self.notify()
+            }
+        }
+    }
+    
+    /// Blocks the SDK queue (sleeps) briefly while waiting for a single dot to initialize.
+    /// Safe because we are on a background serial queue.
+    private func waitForInitialization(dot: Dot, timeout: TimeInterval, completion: @escaping (Bool) -> Void) {
+        let start = Date()
+        
+        func check() {
+            if dot.isInitialized {
+                completion(true)
+                return
+            }
+            
+            if Date().timeIntervalSince(start) > timeout {
+                completion(false)
+                return
+            }
+            
+            // Sleep briefly on sdkQueue to let the SDK work on other threads
+            Thread.sleep(forTimeInterval: 0.2)
+            check()
+        }
+        
+        check()
+    }
+
+    // MARK: - Connection Queue Processing (LOCKED)
+
+    private func processConnectQueue_locked() {
+        guard connectInProgress == nil else { return }
+        guard !syncInProgress else { return }
+
+        guard let index = connectQueue.firstIndex(where: { byUuid[$0] != nil }) else { return }
+        let uuid = connectQueue.remove(at: index)
+        guard let state = byUuid[uuid] else { return }
+
+        connectInProgress = uuid
+        print("🔗 Connecting to \(displayAddress(for: state.device))")
+
+        sdkQueue.async {
+            DotConnectionManager.connect(state.device)
+        }
+    }
+
+    private func advanceConnectQueue_locked() {
+        connectInProgress = nil
+        processConnectQueue_locked()
+    }
+
+    // MARK: - Internal Helpers
+    
     private func executeSequentially<T>(
         items: [T],
         operation: @escaping (T, @escaping (Bool) -> Void) -> Void,
@@ -274,7 +368,6 @@ final class DotManager: NSObject {
                 completion(allSuccess)
                 return
             }
-
             let item = items[index]
             operation(item) { success in
                 if !success { allSuccess = false }
@@ -282,184 +375,23 @@ final class DotManager: NSObject {
                 next()
             }
         }
-
         next()
     }
-
-    // MARK: - Recording / Flash (gated during sync)
-
-    func startRecordingAll(completion: @escaping (Bool) -> Void) {
-        stateQueue.async {
-            if self.syncInProgress {
-                DispatchQueue.main.async { completion(false) }
-                return
-            }
-            let dotsSnapshot = self.byUuid.values.compactMap { $0.dot }.filter { $0.isConnected }
-
-            self.sdkQueue.async {
-                self.executeSequentially(
-                    items: dotsSnapshot,
-                    operation: { dot, done in
-                        print("🎬 Starting recording on \(dot.address)...")
-                        dot.startRecording(seconds: 0xFFFF, completion: done)
-                    },
-                    completion: { ok in
-                        DispatchQueue.main.async { completion(ok) }
-                    }
-                )
-            }
-        }
-    }
-
-    func stopRecordingAll(completion: @escaping (Bool) -> Void) {
-        stateQueue.async {
-            if self.syncInProgress {
-                DispatchQueue.main.async { completion(false) }
-                return
-            }
-            
-            // Debug: Check all dots
-            print("🔍 Checking all dots in dictionary:")
-            for (uuid, state) in self.byUuid {
-                let isConnected = state.dot?.isConnected ?? false
-                let isRecording = state.dot?.isRecording ?? false
-                print("🔍   UUID: \(uuid)")
-                print("🔍     isConnected: \(isConnected)")
-                print("🔍     isRecording: \(isRecording)")
-            }
-            
-            let dotsSnapshot = self.byUuid.values.compactMap { $0.dot }.filter { $0.isConnected }
-            
-            print("🔍 Filtered connected dots: \(dotsSnapshot.count)")
-            for dot in dotsSnapshot {
-                print("🔍   - \(dot.address): isConnected=\(dot.isConnected), isRecording=\(dot.isRecording)")
-            }
-
-            self.sdkQueue.async {
-                self.executeSequentially(
-                    items: dotsSnapshot,
-                    operation: { dot, done in
-                        print("⏹️ Stopping recording on \(dot.address)...")
-                        dot.stopRecording(completion: done)
-                    },
-                    completion: { ok in
-                        print("✅ stopRecordingAll completed: \(ok)")
-                        DispatchQueue.main.async { completion(ok) }
-                    }
-                )
-            }
-        }
-    }
-
-    func eraseAllFlash(completion: @escaping (Bool) -> Void) {
-        stateQueue.async {
-            if self.syncInProgress {
-                DispatchQueue.main.async { completion(false) }
-                return
-            }
-            let dotsSnapshot = self.byUuid.values.compactMap { $0.dot }.filter { $0.isConnected }
-
-            self.sdkQueue.async {
-                self.executeSequentially(
-                    items: dotsSnapshot,
-                    operation: { dot, done in
-                        print("🗑️ Erasing flash on \(dot.address)...")
-                        dot.eraseFlash(completion: done)
-                    },
-                    completion: { ok in
-                        DispatchQueue.main.async { completion(ok) }
-                    }
-                )
-            }
-        }
-    }
-
-    // MARK: - Refresh storage info (also gated)
-
-    private func refreshAllStorageInfo_locked() {
-        // Must be called on stateQueue
-        if syncInProgress { return }
-        if refreshInProgress { return }
-
-        let dotsSnapshot = byUuid.values.compactMap { $0.dot }.filter { $0.isConnected }
-        if dotsSnapshot.isEmpty { return }
-
-        refreshInProgress = true
-        print("💾 Refreshing storage info for \(dotsSnapshot.count) dots...")
-
-        sdkQueue.async { [weak self] in
-            guard let self else { return }
-
-            self.executeSequentially(
-                items: dotsSnapshot,
-                operation: { dot, done in
-                    dot.getFlashInfo { _ in
-                        dot.updateStorageDisplay()
-                        done(true)
-                    }
-                },
-                completion: { _ in
-                    self.stateQueue.async {
-                        self.refreshInProgress = false
-                        print("💾 All storage info refreshed")
-                        self.notify()
-                    }
-                }
-            )
-        }
-    }
-
-    // MARK: - Connection Queue Processing (LOCKED)
-
-    private func processConnectQueue_locked() {
-        // Must be called on stateQueue
-        guard connectInProgress == nil else { return }
-        guard !syncInProgress else { return } // do not start connects mid-sync
-
-        guard let index = connectQueue.firstIndex(where: { byUuid[$0] != nil }) else { return }
-
-        let uuid = connectQueue.remove(at: index)
-        guard let state = byUuid[uuid] else { return }
-
-        connectInProgress = uuid
-        print("🔗 Connecting to \(displayAddress(for: state.device)) (uuid=\(uuid))")
-
-        // SDK call serialized
-        sdkQueue.async {
-            DotConnectionManager.connect(state.device)
-        }
-    }
-
-    private func advanceConnectQueue_locked() {
-        // Must be called on stateQueue
-        connectInProgress = nil
-        processConnectQueue_locked()
-    }
-
-    // MARK: - State Updates (LOCKED)
-
+    
     private func recordDiscovery_locked(_ device: DotDevice) {
-        // Must be called on stateQueue
         let uuid = device.uuid
-        let now = Date()
-
-        if var existing = byUuid[uuid] {
-            existing.device = device
-            existing.lastSeen = now
-            byUuid[uuid] = existing
-        } else {
-            byUuid[uuid] = DotState(device: device, dot: nil, lastSeen: now)
-        }
+        var state = byUuid[uuid] ?? DotState(device: device, dot: nil, lastSeen: Date())
+        state.device = device
+        state.lastSeen = Date()
+        byUuid[uuid] = state
     }
 
     private func recordConnection_locked(_ device: DotDevice) {
         let uuid = device.uuid
         var state = byUuid[uuid] ?? DotState(device: device, dot: nil, lastSeen: Date())
         state.device = device
-        state.lastSeen = Date()
-
+        
         if let dot = state.dot {
-            // CRITICAL: Update the device reference so BLE writes work
             dot.updateDevice(device)
             dot.setIsConnected(true)
         } else {
@@ -467,54 +399,36 @@ final class DotManager: NSObject {
             dot.setIsConnected(true)
             state.dot = dot
         }
-
         byUuid[uuid] = state
+        
+        // Mark as initializing
+        initializationInProgress.insert(uuid)
     }
     
     private func recordDisconnection_locked(_ uuid: String) {
-        // Must be called on stateQueue
         byUuid[uuid]?.dot?.setIsConnected(false)
+        initializationInProgress.remove(uuid)
     }
-
-    // MARK: - Notifications
-
+    
     private func notify() {
         DispatchQueue.main.async {
             NotificationCenter.default.post(name: Notification.updated, object: nil)
         }
     }
-
+    
     // MARK: - Debug
-
+    
     func printStatus() {
         stateQueue.sync {
-            print("═══════════════════════════════════")
-            print("DotManager Status")
-            print("───────────────────────────────────")
-            print("Discovered: \(byUuid.count)")
-            print("Dots created: \(byUuid.values.compactMap { $0.dot }.count)")
-            print("Connected: \(byUuid.values.compactMap { $0.dot }.filter { $0.isConnected }.count)")
-            print("Scanning: \(isScanningInternal)")
-            print("Connect queue: \(connectQueue.count)")
-            print("Connect in progress: \(connectInProgress ?? "nil")")
-            print("Sync in progress: \(syncInProgress)")
-            print("Refresh in progress: \(refreshInProgress)")
-            print("───────────────────────────────────")
-
-            for (uuid, state) in byUuid {
-                let connected = state.dot?.isConnected ?? false
-                let symbol = connected ? "✅" : "⚪️"
-                print("\(symbol) \(state.device.macAddress) (uuid=\(uuid)) connected=\(connected)")
-            }
-
-            let boundDevices = DotDevicePool.allBoundDevices() ?? []
-            print("───────────────────────────────────")
-            print("DotDevicePool bound: \(boundDevices.count)")
-            for device in boundDevices {
-                print("   🔗 \(device.macAddress)")
-            }
-            print("═══════════════════════════════════")
+            print("--- DotManager Status ---")
+            print("Dots: \(byUuid.count) | Connected: \(connectedDots.count)")
+            print("Connect Queue: \(connectQueue.count)")
+            print("Init Queue: \(initializationInProgress)")
         }
+    }
+    
+    func displayAddress(for device: DotDevice) -> String {
+        !device.macAddress.isEmpty ? device.macAddress : device.uuid
     }
 }
 
@@ -522,14 +436,8 @@ final class DotManager: NSObject {
 
 extension DotManager: DotConnectionDelegate {
 
-    func onManagerStateUpdate(_ managerState: XSDotManagerState) {
-        print("📡 Bluetooth state: \(managerState.rawValue)")
-        notify()
-    }
-
     func onDiscover(_ device: DotDevice) {
         guard !device.uuid.isEmpty else { return }
-
         stateQueue.async {
             self.recordDiscovery_locked(device)
             self.processConnectQueue_locked()
@@ -540,99 +448,43 @@ extension DotManager: DotConnectionDelegate {
     func onScanCompleted() {
         stateQueue.async {
             self.isScanningInternal = false
-            print("🔍 Scan completed — known devices: \(self.byUuid.count)")
+            print("🔍 Scan completed")
             self.notify()
-
-            // Keep scanning if we still have pending connections
-            if !self.connectQueue.isEmpty {
-                self.startScan()
-            }
+            if !self.connectQueue.isEmpty { self.startScan() }
         }
     }
 
     func onDeviceConnectSucceeded(_ device: DotDevice) {
-        guard !device.uuid.isEmpty else {
-            stateQueue.async {
-                self.advanceConnectQueue_locked()
-                self.notify()
-            }
-            return
-        }
-
         stateQueue.async {
-            self.recordConnection_locked(device)
+            guard !device.uuid.isEmpty else {
+                self.advanceConnectQueue_locked()
+                return
+            }
 
-            // SDK call serialized
+            self.recordConnection_locked(device)
+            
+            // 1. Bind immediately on SDK queue
             self.sdkQueue.async {
                 DotDevicePool.bindDevice(device)
             }
             
-//            if (device.uuid).count > 0 {
-//                print("This is the UUID: " + device.uuid)
-//            } else {
-//                print("NOOOO THERE IS NO UUID")
-//            }
-            
-            
-
-            self.advanceConnectQueue_locked()
-            self.notify()
-
-            // If idle (no sync, no connects), refresh storage
-            if !self.syncInProgress && self.connectQueue.isEmpty && self.connectInProgress == nil {
-                self.waitForAllInitialized_thenRefresh_locked()
-            }
-        }
-    }
-    
-    private func pingRecordingStatus_locked(uuid: String) {
-        // Must be called on stateQueue
-        guard let state = byUuid[uuid], let dot = state.dot, dot.isConnected else { return }
-
-        sdkQueue.async {
-            state.device.getRecordingStatus()
-        }
-    }
-
-    private func waitForAllInitialized_thenRefresh_locked() {
-        // Must be called on stateQueue
-        let dotsSnapshot = byUuid.values.compactMap { $0.dot }.filter { $0.isConnected }
-
-        func allInitialized() -> Bool {
-            dotsSnapshot.allSatisfy { $0.isInitialized }
-        }
-
-        if allInitialized() {
-            print("✅ All devices initialized")
-
-            for (uuid, s) in byUuid {
-                if let dot = s.dot, dot.isConnected {
-                    dot.installDefaultRecordingStatusHandler()  // ← MOVE IT HERE
-                    pingRecordingStatus_locked(uuid: uuid)
-                    dot.refreshSyncStatus()
-                }
-            }
-
-            refreshAllStorageInfo_locked()
-            return
-        }
-
-
-        let pending = dotsSnapshot.filter { !$0.isInitialized }.count
-        print("⏳ Waiting for \(pending) device(s) to initialize...")
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
-            guard let self else { return }
-            self.stateQueue.async {
-                // Do not refresh if sync started in the meantime
-                if self.syncInProgress { return }
-                self.waitForAllInitialized_thenRefresh_locked()
+            // 2. Queue the "Initialize & Refresh" task on SDK queue
+            //    This replaces the old "wait loop".
+            if let dot = self.byUuid[device.uuid]?.dot {
+                print("⏳ [\(device.uuid)] Queuing initialization & storage refresh...")
+                
+                self.queueStorageRefresh_locked(dots: [dot])
+                
+                // Once that block is submitted to sdkQueue, we can move on to connecting the next device
+                // The refresh will happen in the background when this device is ready.
+                self.advanceConnectQueue_locked()
+                self.notify()
             }
         }
     }
 
     func onDeviceConnectFailed(_ device: DotDevice) {
-        print("❌ Connection failed (uuid=\(device.uuid))")
+        print("❌ Connect failed: \(device.uuid)")
         stateQueue.async {
             self.advanceConnectQueue_locked()
             self.notify()
@@ -641,11 +493,14 @@ extension DotManager: DotConnectionDelegate {
 
     func onDeviceDisconnected(_ device: DotDevice) {
         guard !device.uuid.isEmpty else { return }
-
+        print("⛓️‍💥 Disconnected: \(device.uuid)")
         stateQueue.async {
             self.recordDisconnection_locked(device.uuid)
-            print("⛓️‍💥 Disconnected (uuid=\(device.uuid))")
             self.notify()
         }
+    }
+    
+    func onManagerStateUpdate(_ managerState: XSDotManagerState) {
+        // Handle bluetooth power off if needed
     }
 }

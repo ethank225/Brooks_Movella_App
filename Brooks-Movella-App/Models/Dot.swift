@@ -166,78 +166,21 @@ final class Dot: ObservableObject {
     func stopRecording(completion: @escaping (Bool) -> Void) {
         print("⏹️ [\(address)] Stopping recording...")
         
-        // Send stop command
         device.stopRecording()
         
-        // Also explicitly request status after a beat
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
             self?.device.getRecordingStatus()
         }
         
-        waitForRecordingState(false, timeout: 8.0) { [weak self] success in
+        waitForRecordingState(false, timeout: 5.0) { [weak self] success in
             guard let self else { completion(false); return }
-            
             if success {
                 print("⏹️ [\(self.address)] Recording confirmed stopped")
                 self.refreshStorageInfo()
-                completion(true)
             } else {
-                // Fallback: send stop again and check device status directly
-                print("⚠️ [\(self.address)] First stop timed out, retrying...")
-                self.device.stopRecording()
-                
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
-                    guard let self else { completion(false); return }
-                    self.device.getRecordingStatus()
-                    
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-                        let status = self.device.recording.recordingStatus
-                        print("⚠️ [\(self.address)] Retry status: \(status.rawValue)")
-                        if status == .isRecordingStopped || status == .isIdle {
-                            self.setOnMain { self.isRecording = false }
-                            self.refreshStorageInfo()
-                            completion(true)
-                        } else {
-                            // Nuclear option: force the state
-                            print("❌ [\(self.address)] Force-resetting isRecording")
-                            self.setOnMain { self.isRecording = false }
-                            completion(false)
-                        }
-                    }
-                }
+                print("❌ [\(self.address)] Recording did not stop in time")
             }
-        }
-    }
-
-    private func pollDeviceRecordingStatus(timeout: TimeInterval, completion: @escaping (Bool) -> Void) {
-        let start = Date()
-
-        func check() {
-            // Ask the SDK to refresh from the sensor
-            self.device.getRecordingStatus()
-
-            // Check the SDK's stored status directly
-            let status = self.device.recording.recordingStatus
-            print("🔍 [\(address)] Polled recordingStatus: \(status.rawValue)")
-
-            if status == .isRecordingStopped || status == .isIdle {
-                completion(true)
-                return
-            }
-
-            if Date().timeIntervalSince(start) > timeout {
-                completion(false)
-                return
-            }
-
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                check()
-            }
-        }
-
-        // First check after a short delay to let getRecordingStatus process
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-            check()
+            completion(success)
         }
     }
 
@@ -276,15 +219,23 @@ final class Dot: ObservableObject {
     // MARK: - Flash / Storage
 
     func getFlashInfo(completion: @escaping (XSFlashInfoStatus) -> Void) {
-        print("💾 [\(address)] Getting flash info...")
+        let run = { [weak self] in
+            guard let self else { return }
+            print("💾 [\(self.address)] Getting flash info...")
 
-        device.setFlashInfoDoneBlock { [weak self] status in
-            print("💾 [\(self?.address ?? "?")] Flash status: \(status.rawValue)")
-            completion(status)
+            self.device.setFlashInfoDoneBlock { [weak self] status in
+                guard let self else { return }
+                print("💾 [\(self.address)] Flash status: \(status.rawValue)")
+                completion(status)
+            }
+
+            self.device.getFlashInfo()
         }
 
-        device.getFlashInfo()
+        if Thread.isMainThread { run() }
+        else { DispatchQueue.main.async(execute: run) }
     }
+
 
     func refreshStorageInfo() {
         print("🔄 [\(address)] refreshStorageInfo called")
