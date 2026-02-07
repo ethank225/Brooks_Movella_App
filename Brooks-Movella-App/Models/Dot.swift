@@ -1,32 +1,18 @@
-//
-//  Dot.swift
-//  Brooks-Movella-App
-//
-//  Thin wrapper around a single DotDevice.
-//  Dot owns its own mutable state (isConnected, isRecording, etc.)
-//  DotManager controls when these states change via SDK callbacks.
-//
-//  Architecture:
-//  - One PERMANENT recording status handler that always keeps isRecording accurate.
-//  - Operations (start/stop recording, erase) send the SDK command then poll
-//    for the expected state change with a timeout. No callback swapping, no locks.
-//  - DotManager calls installDefaultRecordingStatusHandler() after reconnect.
-//
-
 import Foundation
 import MovellaDotSdk
 import Combine
 
-final class Dot: ObservableObject {
+final class Dot: ObservableObject, Identifiable {
 
     // MARK: - Immutable identity
 
-    
     private(set) var device: DotDevice
 
-
-
     var address: String {
+        device.uuid
+    }
+    
+    var id: String {
         device.uuid
     }
 
@@ -35,7 +21,16 @@ final class Dot: ObservableObject {
     @Published var isConnected = false
     @Published var isRecording = false
     @Published var sessionSynced = false
-    @Published var storagePercentageUsed: Double = 0
+    
+    // MARK: - Snapshot State (The Truth)
+    // We strictly use these for UI. We do not calculate from 'device' during render.
+    @Published private(set) var flashUsedBytes: Int = 0
+    @Published private(set) var flashTotalBytes: Int = 1 // Prevent divide by zero default
+
+    var storagePercentageUsed: Double {
+        guard flashTotalBytes > 0 else { return 0 }
+        return (Double(flashUsedBytes) / Double(flashTotalBytes)) * 100.0
+    }
 
     // MARK: - Computed properties from device
 
@@ -54,7 +49,6 @@ final class Dot: ObservableObject {
         installDefaultRecordingStatusHandler()
     }
     
-    
     func updateDevice(_ newDevice: DotDevice) {
         self.device = newDevice
         installDefaultRecordingStatusHandler()
@@ -62,30 +56,22 @@ final class Dot: ObservableObject {
     }
 
     // MARK: - Permanent Recording Status Handler
-    //
-    // This is the ONLY place updateRecordingStatus is set.
-    // It never gets overwritten by start/stop operations.
-    // Call this again after reconnect to re-register on the (potentially new) device state.
 
     func installDefaultRecordingStatusHandler() {
         device.recording.updateRecordingStatus = { [weak self] status in
-            guard let self else { return }
+            guard let self = self else { return }
             print("📨 [\(self.address)] Recording status: \(status.rawValue)")
 
             switch status {
             case .isRecording:
                 self.setOnMain { self.isRecording = true }
-
             case .isRecordingStopped, .isIdle:
                 self.setOnMain { self.isRecording = false }
-
             default:
                 break
             }
         }
     }
-    
-
 
     // MARK: - Main-thread helper
 
@@ -97,7 +83,7 @@ final class Dot: ObservableObject {
         }
     }
 
-    // MARK: - State setters (called by DotManager)
+    // MARK: - State setters
 
     func setIsConnected(_ value: Bool) {
         setOnMain { self.isConnected = value }
@@ -107,7 +93,7 @@ final class Dot: ObservableObject {
         setOnMain { self.sessionSynced = value }
     }
 
-    // MARK: - Sync status refresh (called after reconnect + initialization)
+    // MARK: - Sync status refresh
 
     func refreshSyncStatus() {
         let synced = device.isSynced()
@@ -122,32 +108,85 @@ final class Dot: ObservableObject {
         print("⚙️ [\(address)] Configured: \(outputRate)Hz, filter \(filterIndex)")
     }
 
+    // MARK: - Flash / Storage (SNAPSHOT MODEL)
+
+    /// Fetches flash info, updates the local snapshot, and returns success/failure.
+    // MARK: - Flash / Storage (LATCHED SNAPSHOT)
+
+    func getFlashInfo(completion: @escaping (Bool) -> Void) {
+            let run = { [weak self] in
+                guard let self = self else { return }
+                print("💾 [\(self.address)] Requesting flash info...")
+
+                // 🛑 GATEKEEPER:
+                // The SDK often fires twice. Sometimes the second time is a "double count" bug
+                // (e.g. 36% -> 72%). We use this flag to capture ONLY the first result.
+                var hasCapturedResult = false
+
+                // 1. Set the callback
+                self.device.setFlashInfoDoneBlock { [weak self] status in
+                    guard let self = self else { return }
+                    
+                    // If we already got our snapshot, ignore the SDK's second "correction"
+                    if hasCapturedResult {
+                        return
+                    }
+                    
+                    // Lock the gate
+                    hasCapturedResult = true
+                    
+                    // 2. IMMEDIATE SNAPSHOT
+                    let used = Int(self.device.usedSpace)
+                    let total = Int(self.device.totalSpace)
+                    
+                    self.setFlashSnapshot(usedBytes: used, totalBytes: total)
+                    
+                    print("💾 [\(self.address)] Snapshot: \(used)/\(total) (\(String(format: "%.1f", self.storagePercentageUsed))%)")
+                    
+                    // 3. Clear the block so the SDK stops pestering us (optional but clean)
+                    self.device.setFlashInfoDoneBlock(nil)
+                    
+                    // 4. Report success once
+                    completion(true)
+                }
+
+                // 5. Fire the command
+                self.device.getFlashInfo()
+            }
+
+            if Thread.isMainThread { run() }
+            else { DispatchQueue.main.async(execute: run) }
+    }
+
+    /// Thread-safe setter for the snapshot
+    private func setFlashSnapshot(usedBytes: Int, totalBytes: Int) {
+        setOnMain {
+            self.flashUsedBytes = usedBytes
+            self.flashTotalBytes = max(totalBytes, 1)
+        }
+    }
+
     // MARK: - Recording
 
     func startRecording(seconds: UInt16 = 0xFFFF, completion: @escaping (Bool) -> Void) {
-        getFlashInfo { [weak self] status in
-            guard let self else {
-                completion(false)
-                return
-            }
+        // Updated to use the new getFlashInfo signature (Bool)
+        getFlashInfo { [weak self] success in
+            guard let self = self else { completion(false); return }
 
-            guard status == .isReady, self.isInitialized else {
-                print("❌ [\(self.address)] Cannot start recording")
+            guard success, self.isInitialized else {
+                print("❌ [\(self.address)] Cannot start recording (Not ready/init)")
                 completion(false)
                 return
             }
 
             print("🎬 [\(self.address)] Starting recording...")
             
-            // Send the command
             self.device.startRecording(seconds)
             
-            // Request status update immediately to trigger callback
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
                 self?.device.getRecordingStatus()
             }
 
-            // Wait for state change
             self.waitForRecordingState(true, timeout: 5.0) { success in
                 if success {
                     print("🔴 [\(self.address)] Recording confirmed started")
@@ -160,7 +199,7 @@ final class Dot: ObservableObject {
     }
     
     func refreshRecordingStatus() {
-        device.getRecordingStatus()  // triggers the callback
+        device.getRecordingStatus()
     }
 
     func stopRecording(completion: @escaping (Bool) -> Void) {
@@ -173,10 +212,11 @@ final class Dot: ObservableObject {
         }
         
         waitForRecordingState(false, timeout: 5.0) { [weak self] success in
-            guard let self else { completion(false); return }
+            guard let self = self else { completion(false); return }
             if success {
                 print("⏹️ [\(self.address)] Recording confirmed stopped")
-                self.refreshStorageInfo()
+                // Update snapshot
+                self.getFlashInfo { _ in }
             } else {
                 print("❌ [\(self.address)] Recording did not stop in time")
             }
@@ -185,21 +225,13 @@ final class Dot: ObservableObject {
     }
 
     // MARK: - Polling helper
-    //
-    // Watches isRecording until it matches the target value, or times out.
-    // No callback swapping, no locks — just checking state.
 
-    private func waitForRecordingState(
-        _ target: Bool,
-        timeout: TimeInterval,
-        completion: @escaping (Bool) -> Void
-    ) {
+    private func waitForRecordingState(_ target: Bool, timeout: TimeInterval, completion: @escaping (Bool) -> Void) {
         let start = Date()
 
         func check() {
             self.device.getRecordingStatus()
             
-            // Check after delay, but stay on main for reading @Published state
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
                 if self.isRecording == target {
                     completion(true)
@@ -216,54 +248,7 @@ final class Dot: ObservableObject {
         check()
     }
 
-    // MARK: - Flash / Storage
-
-    func getFlashInfo(completion: @escaping (XSFlashInfoStatus) -> Void) {
-        let run = { [weak self] in
-            guard let self else { return }
-            print("💾 [\(self.address)] Getting flash info...")
-
-            self.device.setFlashInfoDoneBlock { [weak self] status in
-                guard let self else { return }
-                print("💾 [\(self.address)] Flash status: \(status.rawValue)")
-                completion(status)
-            }
-
-            self.device.getFlashInfo()
-        }
-
-        if Thread.isMainThread { run() }
-        else { DispatchQueue.main.async(execute: run) }
-    }
-
-
-    func refreshStorageInfo() {
-        print("🔄 [\(address)] refreshStorageInfo called")
-        getFlashInfo { [weak self] status in
-            guard let self else {
-                print("🔄 [?] self is nil in refreshStorageInfo callback")
-                return
-            }
-            print("🔄 [\(self.address)] getFlashInfo returned, calling updateStorageDisplay")
-            self.updateStorageDisplay()
-        }
-    }
-
-    func updateStorageDisplay() {
-        let total = device.totalSpace
-        let percentage: Double
-        if total > 0 {
-            percentage = Double(device.usedSpace) / Double(total) * 100
-        } else {
-            percentage = 0
-        }
-
-        print("💾 [\(address)] Storage: \(String(format: "%.1f", percentage))% used")
-
-        setOnMain {
-            self.storagePercentageUsed = percentage
-        }
-    }
+    // MARK: - Erase
 
     func eraseFlash(completion: @escaping (Bool) -> Void) {
         print("🗑️ [\(address)] Erasing flash...")
@@ -272,8 +257,8 @@ final class Dot: ObservableObject {
             let ok = success != 0
             print("🗑️ [\(self?.address ?? "?")] Erase: \(ok ? "success" : "failed")")
 
-            // Refresh storage after erase
-            self?.refreshStorageInfo()
+            // Update snapshot after erase
+            self?.getFlashInfo { _ in }
             completion(ok)
         }
 

@@ -274,50 +274,47 @@ final class DotManager: NSObject {
     
     // MARK: - Storage Refresh Queueing
     
+    /// Recursively fetches flash info until the value remains constant between checks.
     /// Checks `isInitialized` on the background thread before asking for storage
-    private func queueStorageRefresh_locked(dots: [Dot]) {
-        guard !dots.isEmpty else { return }
+    // MARK: - Storage Refresh Queueing (Snapshot Version)
+        
+        private func queueStorageRefresh_locked(dots: [Dot]) {
+            guard !dots.isEmpty else { return }
 
-        print("💾 Queueing storage refresh for \(dots.count) dots")
+            print("💾 Queueing storage refresh for \(dots.count) dots")
 
-        self.sdkQueue.async { [weak self] in
-            guard let self else { return }
+            self.sdkQueue.async { [weak self] in
+                guard let self = self else { return }
 
-            self.executeSequentially(items: dots) { dot, done in
-                self.waitForInitialization(dot: dot, timeout: 5.0) { ready in
-                    let uuid = dot.device.uuid
+                self.executeSequentially(items: dots) { dot, done in
+                    self.waitForInitialization(dot: dot, timeout: 5.0) { ready in
+                        let uuid = dot.device.uuid
 
-                    if !ready {
-                        print("⚠️ [\(dot.address)] Not initialized, skipping storage refresh")
-
-                        // ✅ IMPORTANT: unblock future sync attempts
-                        self.stateQueue.async {
-                            self.initializationInProgress.remove(uuid)
-                            self.notify()
+                        if !ready {
+                            print("⚠️ [\(dot.address)] Not initialized, skipping storage refresh")
+                            self.stateQueue.async {
+                                self.initializationInProgress.remove(uuid)
+                                self.notify()
+                            }
+                            done(false)
+                            return
                         }
 
-                        done(false)
-                        return
-                    }
-
-                    dot.getFlashInfo { _ in
-                        dot.updateStorageDisplay()
-
-                        // ✅ Mark init finished so sync is allowed
-                        self.stateQueue.async {
-                            self.initializationInProgress.remove(uuid)
-                            self.notify()
+                        // 🚀 ONE-SHOT REFRESH
+                        // The Dot object captures its own snapshot inside getFlashInfo.
+                        dot.getFlashInfo { _ in
+                            self.stateQueue.async {
+                                self.initializationInProgress.remove(uuid)
+                                self.notify()
+                                done(true)
+                            }
                         }
-
-                        done(true)
                     }
+                } completion: { _ in
+                    print("💾 Storage refresh queue finished")
                 }
-            } completion: { _ in
-                print("💾 Storage refresh queue finished")
-                self.notify()
             }
         }
-    }
 
     
     /// Blocks the SDK queue (sleeps) briefly while waiting for a single dot to initialize.
