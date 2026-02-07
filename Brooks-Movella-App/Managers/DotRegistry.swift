@@ -89,6 +89,7 @@ final class DotRegistry {
 
     func recordDisconnection(_ uuid: String) {
         byUuid[uuid]?.dot?.setIsConnected(false)
+        byUuid[uuid]?.dot?.setSessionSynced(false)
         initializationInProgress.remove(uuid)
     }
 
