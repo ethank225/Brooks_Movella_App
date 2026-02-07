@@ -347,6 +347,13 @@ extension DotManager: DotConnectionDelegate {
             case .poweredOn:
                 print("✅ Bluetooth powered ON")
 
+                // Re-queue all previously connected devices for reconnection
+                for uuid in self.registry.previouslyConnectedUuids {
+                    if !self.registry.connectQueue.contains(uuid) {
+                        self.registry.connectQueue.append(uuid)
+                    }
+                }
+
                 if !self.registry.connectQueue.isEmpty {
                     print("🔄 Resuming connection logic for \(self.registry.connectQueue.count) pending devices...")
                     self.registry.isScanningInternal = false

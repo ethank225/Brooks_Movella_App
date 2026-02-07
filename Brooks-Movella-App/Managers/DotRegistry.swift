@@ -42,6 +42,11 @@ final class DotRegistry {
         byUuid[uuid]?.dot
     }
 
+    /// UUIDs of devices that have been connected at least once this session.
+    var previouslyConnectedUuids: [String] {
+        byUuid.compactMap { $0.value.dot != nil ? $0.key : nil }
+    }
+
     // MARK: - Mutations
 
     func recordDiscovery(_ device: DotDevice) {
