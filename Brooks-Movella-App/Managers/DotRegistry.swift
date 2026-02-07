@@ -9,6 +9,7 @@ final class DotRegistry {
         var device: DotDevice
         var dot: Dot?
         var lastSeen: Date
+        var isConnected: Bool = false
     }
 
     // MARK: - State
@@ -35,7 +36,7 @@ final class DotRegistry {
     }
 
     var connectedDots: [Dot] {
-        byUuid.values.compactMap { $0.dot }.filter { $0.isConnected }
+        byUuid.values.filter { $0.isConnected }.compactMap { $0.dot }
     }
 
     func dot(forUuid uuid: String) -> Dot? {
@@ -61,6 +62,7 @@ final class DotRegistry {
         let uuid = device.uuid
         var state = byUuid[uuid] ?? DotState(device: device, dot: nil, lastSeen: Date())
         state.device = device
+        state.isConnected = true
 
         if let dot = state.dot {
             dot.updateDevice(device)
@@ -80,6 +82,7 @@ final class DotRegistry {
         let uuid = device.uuid
         guard var state = byUuid[uuid] else { return }
         state.device = device
+        state.isConnected = true
         if let dot = state.dot {
             dot.updateDevice(device)
             dot.setIsConnected(true)
@@ -88,6 +91,7 @@ final class DotRegistry {
     }
 
     func recordDisconnection(_ uuid: String) {
+        byUuid[uuid]?.isConnected = false
         byUuid[uuid]?.dot?.setIsConnected(false)
         byUuid[uuid]?.dot?.setSessionSynced(false)
         initializationInProgress.remove(uuid)
@@ -112,8 +116,9 @@ final class DotRegistry {
     }
 
     func markAllDisconnected() {
-        for state in byUuid.values {
-            state.dot?.setIsConnected(false)
+        for uuid in byUuid.keys {
+            byUuid[uuid]?.isConnected = false
+            byUuid[uuid]?.dot?.setIsConnected(false)
         }
     }
 
