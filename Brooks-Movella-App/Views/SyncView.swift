@@ -1,17 +1,17 @@
 import SwiftUI
 
 struct SyncView: View {
+    @ObservedObject private var manager = DotManager.shared
+
     @State private var isSyncing = false
     @State private var isRecordingInProgress = false
     @State private var isStoppingRecording = false
     @State private var syncResult: String = ""
-    @State private var connectedCount = 0
     @State private var isErasing = false
-    @State private var dots: [Dot] = []
     @State private var showEraseConfirmation = false
 
     private var anyDotRecording: Bool {
-        dots.contains { $0.isRecording }
+        manager.connectedDots.contains { $0.isRecording }
     }
 
     var body: some View {
@@ -21,7 +21,7 @@ struct SyncView: View {
                 // MARK: - Sensor Status
 
                 SectionCard(title: "Sensor Status", icon: "sensor.tag.radiowaves.forward") {
-                    if dots.isEmpty {
+                    if manager.connectedDots.isEmpty {
                         VStack(spacing: 8) {
                             Image(systemName: "sensor.tag.radiowaves.forward")
                                 .font(.largeTitle)
@@ -36,7 +36,7 @@ struct SyncView: View {
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 20)
                     } else {
-                        ForEach(dots, id: \.address) { dot in
+                        ForEach(manager.connectedDots, id: \.address) { dot in
                             DotStatusRow(dot: dot)
                         }
                     }
@@ -62,7 +62,7 @@ struct SyncView: View {
                             .foregroundColor(.white)
                             .cornerRadius(10)
                         }
-                        .disabled(isSyncing || connectedCount < 2 || anyDotRecording)
+                        .disabled(isSyncing || manager.connectedDots.count < 2 || anyDotRecording)
 
                         Button {
                             stopSync()
@@ -102,7 +102,7 @@ struct SyncView: View {
                             .foregroundColor(.white)
                             .cornerRadius(10)
                         }
-                        .disabled(isRecordingInProgress || anyDotRecording || connectedCount == 0 || isSyncing)
+                        .disabled(isRecordingInProgress || anyDotRecording || manager.connectedDots.isEmpty || isSyncing)
 
                         Button {
                             stopRecording()
@@ -146,7 +146,7 @@ struct SyncView: View {
                         .foregroundColor(.white)
                         .cornerRadius(10)
                     }
-                    .disabled(isErasing || connectedCount == 0 || anyDotRecording || isSyncing)
+                    .disabled(isErasing || manager.connectedDots.isEmpty || anyDotRecording || isSyncing)
                 }
 
                 // MARK: - Status Banner
@@ -165,12 +165,6 @@ struct SyncView: View {
             .padding(.top)
         }
         .navigationTitle("Sync & Record")
-        .onAppear {
-            updateStatus()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: DotManager.Notification.updated)) { _ in
-            updateStatus()
-        }
         .confirmationDialog("Erase all flash storage?", isPresented: $showEraseConfirmation, titleVisibility: .visible) {
             Button("Erase All", role: .destructive) { eraseFlash() }
             Button("Cancel", role: .cancel) {}
@@ -181,40 +175,32 @@ struct SyncView: View {
 
     // MARK: - Actions
 
-    private func updateStatus() {
-        connectedCount = DotManager.shared.connectedDots.count
-        dots = DotManager.shared.connectedDots
-    }
-
     private func startSync() {
         isSyncing = true
         syncResult = ""
 
-        DotManager.shared.syncConnectedDots { success in
+        manager.syncConnectedDots { success in
             DispatchQueue.main.async {
                 isSyncing = false
                 syncResult = success ? "Sync successful" : "Sync failed"
-                updateStatus()
             }
         }
     }
 
     private func stopSync() {
-        DotManager.shared.stopSync()
+        manager.stopSync()
         isSyncing = false
         syncResult = "Sync stopped"
-        updateStatus()
     }
 
     private func eraseFlash() {
         isErasing = true
         syncResult = "Erasing flash..."
 
-        DotManager.shared.eraseAllFlash { success in
+        manager.eraseAllFlash { success in
             DispatchQueue.main.async {
                 isErasing = false
                 syncResult = success ? "Flash erased" : "Erase failed"
-                updateStatus()
             }
         }
     }
@@ -223,11 +209,10 @@ struct SyncView: View {
         isRecordingInProgress = true
         syncResult = "Starting recording..."
 
-        DotManager.shared.startRecordingAll { success in
+        manager.startRecordingAll { success in
             DispatchQueue.main.async {
                 isRecordingInProgress = false
                 syncResult = success ? "Recording started" : "Recording failed"
-                updateStatus()
             }
         }
     }
@@ -236,11 +221,10 @@ struct SyncView: View {
         isStoppingRecording = true
         syncResult = "Stopping recording..."
 
-        DotManager.shared.stopRecordingAll { success in
+        manager.stopRecordingAll { success in
             DispatchQueue.main.async {
                 isStoppingRecording = false
                 syncResult = success ? "Recording stopped" : "Stop failed"
-                updateStatus()
             }
         }
     }

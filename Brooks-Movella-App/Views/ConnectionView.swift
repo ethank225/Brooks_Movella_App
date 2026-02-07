@@ -1,20 +1,11 @@
 import SwiftUI
-import Combine      // <--- ADD THIS
+import Combine
 import MovellaDotSdk
 
 struct ConnectionView: View {
 
-    private let manager = DotManager.shared
+    @ObservedObject private var manager = DotManager.shared
 
-    // UUID -> DotDevice
-    @State private var discoveredByUuid: [String: DotDevice] = [:]
-    
-    // Connected UUIDs only
-    @State private var connectedUuids: Set<String> = []
-
-    @State private var isScanning = false
-    
-    // NEW: UI phases
     enum DevicePhase: Equatable {
         case idle
         case connecting
@@ -24,24 +15,28 @@ struct ConnectionView: View {
     }
 
     @State private var phaseByUuid: [String: DevicePhase] = [:]
-    
+
     // Timer to force scan retries
     @State private var timer = Timer.publish(every: 1.0, on: .main, in: .common).autoconnect()
 
     private var discoveredList: [DotDevice] {
-        discoveredByUuid.values.sorted { left, right in
+        manager.discovered.sorted { left, right in
             manager.displayAddress(for: left) < manager.displayAddress(for: right)
         }
+    }
+
+    private var connectedCount: Int {
+        manager.connectedDots.count
     }
 
     var body: some View {
         NavigationView {
             VStack(spacing: 0) {
 
-                if !connectedUuids.isEmpty {
+                if connectedCount > 0 {
                     HStack {
                         Image(systemName: "sensor.tag.radiowaves.forward.fill")
-                        Text("\(connectedUuids.count) connected")
+                        Text("\(connectedCount) connected")
                             .font(.subheadline.weight(.medium))
                         Spacer()
                     }
@@ -51,7 +46,7 @@ struct ConnectionView: View {
                 }
 
                 List {
-                    if discoveredList.isEmpty && isScanning {
+                    if discoveredList.isEmpty && manager.isScanning {
                         HStack {
                             ProgressView()
                                 .padding(.trailing, 8)
@@ -100,44 +95,33 @@ struct ConnectionView: View {
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Button {
-                        startScan()
+                        manager.startScan()
                     } label: {
-                        if isScanning { ProgressView() }
+                        if manager.isScanning { ProgressView() }
                         else { Image(systemName: "arrow.clockwise") }
                     }
-                    .disabled(isScanning)
+                    .disabled(manager.isScanning)
                 }
             }
-            .refreshable { startScan() }
+            .refreshable { manager.startScan() }
             .onAppear {
                 manager.activate()
-                syncState()
+                syncPhases()
             }
             .onDisappear {
                 manager.stopScan()
                 timer.upstream.connect().cancel()
             }
-            .onReceive(NotificationCenter.default.publisher(for: .dotManagerUpdated)) { _ in
-                syncState()
+            .onReceive(manager.objectWillChange) { _ in
+                DispatchQueue.main.async { syncPhases() }
             }
-            // THE FIX: Retry Timer
+            // Retry Timer
             .onReceive(timer) { _ in
                 if !manager.isScanning {
-                    // Force start
                     manager.startScan()
-                    // Visual update
-                    isScanning = true
-                } else {
-                    // It is scanning! Ensure UI matches
-                    if !isScanning { isScanning = true }
                 }
             }
         }
-    }
-
-    private func startScan() {
-        isScanning = true
-        manager.startScan()
     }
 
     private func toggleConnection(_ device: DotDevice) {
@@ -149,7 +133,7 @@ struct ConnectionView: View {
             return
         }
 
-        if connectedUuids.contains(uuid) {
+        if manager.dot(forUuid: uuid)?.isConnected == true {
             if let dot = manager.dot(forUuid: uuid) {
                 manager.disconnect(dot)
             }
@@ -161,22 +145,11 @@ struct ConnectionView: View {
         }
     }
 
-    private func syncState() {
-        // Discovered snapshot
-        var newDiscovered: [String: DotDevice] = [:]
-        for d in manager.discovered where !d.uuid.isEmpty {
-            newDiscovered[d.uuid] = d
-        }
-        discoveredByUuid = newDiscovered
-
-        // Connected snapshot
-        let dots = manager.dots
-        connectedUuids = Set(dots.filter { $0.isConnected }.map { $0.address })
-
-        // Phase snapshot
+    private func syncPhases() {
         var newPhases = phaseByUuid
 
-        for (uuid, _) in discoveredByUuid {
+        for device in manager.discovered {
+            let uuid = device.uuid
             if let dot = manager.dot(forUuid: uuid) {
                 if dot.isConnected {
                     newPhases[uuid] = dot.isInitialized ? .ready : .initializing
@@ -193,9 +166,6 @@ struct ConnectionView: View {
         }
 
         phaseByUuid = newPhases
-        
-        // Sync scanning state from manager source of truth
-        isScanning = manager.isScanning
     }
 }
 

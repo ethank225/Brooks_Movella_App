@@ -1,7 +1,8 @@
 import Foundation
+import Combine
 import MovellaDotSdk
 
-final class DotManager: NSObject {
+final class DotManager: NSObject, ObservableObject {
 
     // MARK: - Singleton
 
@@ -9,12 +10,6 @@ final class DotManager: NSObject {
 
     private override init() {
         super.init()
-    }
-
-    // MARK: - Notification
-
-    enum Notification {
-        static let updated = Foundation.Notification.Name("dotManagerUpdated")
     }
 
     // MARK: - Queues
@@ -35,23 +30,12 @@ final class DotManager: NSObject {
         DotReconnectManager.setEnable(true)
     }
 
-    // MARK: - Thread-safe snapshots for UI
+    // MARK: - Published state for UI
 
-    var isScanning: Bool {
-        stateQueue.sync { registry.isScanningInternal }
-    }
-
-    var discovered: [DotDevice] {
-        stateQueue.sync { registry.discovered }
-    }
-
-    var dots: [Dot] {
-        stateQueue.sync { registry.dots }
-    }
-
-    var connectedDots: [Dot] {
-        stateQueue.sync { registry.connectedDots }
-    }
+    @Published private(set) var isScanning: Bool = false
+    @Published private(set) var discovered: [DotDevice] = []
+    @Published private(set) var dots: [Dot] = []
+    @Published private(set) var connectedDots: [Dot] = []
 
     func dot(forUuid uuid: String) -> Dot? {
         stateQueue.sync { registry.dot(forUuid: uuid) }
@@ -253,9 +237,18 @@ final class DotManager: NSObject {
         } completion: {}
     }
 
+    /// Must be called on stateQueue.
     private func notify() {
+        let scanning = registry.isScanningInternal
+        let disc = registry.discovered
+        let all = registry.dots
+        let connected = registry.connectedDots
+
         DispatchQueue.main.async {
-            NotificationCenter.default.post(name: Notification.updated, object: nil)
+            self.isScanning = scanning
+            self.discovered = disc
+            self.dots = all
+            self.connectedDots = connected
         }
     }
 
@@ -306,10 +299,10 @@ extension DotManager: DotConnectionDelegate {
             }
 
             // During sync, the SDK reconnects devices internally.
-            // Only update state — don't re-bind or refresh storage.
+            // Update device reference but skip re-bind, refresh, and UI notify
+            // since dots were never shown as disconnected.
             if self.registry.syncInProgress {
                 self.registry.recordReconnection(device)
-                self.notify()
                 return
             }
 
@@ -334,6 +327,7 @@ extension DotManager: DotConnectionDelegate {
     func onDeviceConnectFailed(_ device: DotDevice) {
         print("❌ Connect failed: \(device.uuid)")
         stateQueue.async {
+            if self.registry.syncInProgress { return }
             self.registry.advanceConnectQueue()
             self.processConnectQueue()
             self.notify()
@@ -345,9 +339,8 @@ extension DotManager: DotConnectionDelegate {
         print("⛓️‍💥 Disconnected: \(device.uuid)")
         stateQueue.async {
             if self.registry.syncInProgress {
-                // SDK-managed disconnect during sync — just update UI
-                self.registry.byUuid[device.uuid]?.dot?.setIsConnected(false)
-                self.notify()
+                // SDK-managed disconnect during sync — ignore entirely.
+                // The dots remain visually "connected" throughout the sync process.
                 return
             }
             self.registry.recordDisconnection(device.uuid)

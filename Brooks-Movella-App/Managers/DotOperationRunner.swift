@@ -86,7 +86,7 @@ final class DotOperationRunner {
         next()
     }
 
-    /// Polls `dot.isInitialized` on the current (background) thread.
+    /// Polls `dot.isInitialized` using asyncAfter to yield sdkQueue between checks.
     private func waitForInitialization(dot: Dot, timeout: TimeInterval, completion: @escaping (Bool) -> Void) {
         let start = Date()
 
@@ -99,8 +99,9 @@ final class DotOperationRunner {
                 completion(false)
                 return
             }
-            Thread.sleep(forTimeInterval: 0.2)
-            check()
+            sdkQueue.asyncAfter(deadline: .now() + 0.2) {
+                check()
+            }
         }
         check()
     }
