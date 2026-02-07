@@ -305,6 +305,14 @@ extension DotManager: DotConnectionDelegate {
                 return
             }
 
+            // During sync, the SDK reconnects devices internally.
+            // Only update state — don't re-bind or refresh storage.
+            if self.registry.syncInProgress {
+                self.registry.recordReconnection(device)
+                self.notify()
+                return
+            }
+
             self.registry.recordConnection(device)
 
             self.sdkQueue.async {
@@ -336,6 +344,12 @@ extension DotManager: DotConnectionDelegate {
         guard !device.uuid.isEmpty else { return }
         print("⛓️‍💥 Disconnected: \(device.uuid)")
         stateQueue.async {
+            if self.registry.syncInProgress {
+                // SDK-managed disconnect during sync — just update UI
+                self.registry.byUuid[device.uuid]?.dot?.setIsConnected(false)
+                self.notify()
+                return
+            }
             self.registry.recordDisconnection(device.uuid)
             self.notify()
         }

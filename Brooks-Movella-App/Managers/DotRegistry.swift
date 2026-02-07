@@ -74,6 +74,19 @@ final class DotRegistry {
         initializationInProgress.insert(uuid)
     }
 
+    /// Lightweight update for SDK-managed reconnections (e.g. during sync).
+    /// Updates device reference and marks connected, but does NOT trigger initialization.
+    func recordReconnection(_ device: DotDevice) {
+        let uuid = device.uuid
+        guard var state = byUuid[uuid] else { return }
+        state.device = device
+        if let dot = state.dot {
+            dot.updateDevice(device)
+            dot.setIsConnected(true)
+        }
+        byUuid[uuid] = state
+    }
+
     func recordDisconnection(_ uuid: String) {
         byUuid[uuid]?.dot?.setIsConnected(false)
         initializationInProgress.remove(uuid)
