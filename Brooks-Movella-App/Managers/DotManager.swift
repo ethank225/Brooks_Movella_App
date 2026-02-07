@@ -512,6 +512,49 @@ extension DotManager: DotConnectionDelegate {
     }
     
     func onManagerStateUpdate(_ managerState: XSDotManagerState) {
-        // Handle bluetooth power off if needed
-    }
+            stateQueue.async {
+                switch managerState {
+                case .poweredOn:
+                    print("✅ Bluetooth powered ON")
+                    
+                    // RESTORE STATE:
+                    // If we have devices we want to connect to (queue is not empty),
+                    // we must restart scanning immediately to find them again.
+                    //
+                    // Note: We check !connectQueue.isEmpty. If the user never asked to connect
+                    // to anything, we stay idle to save battery.
+                    if !self.connectQueue.isEmpty {
+                        print("🔄 Resuming connection logic for \(self.connectQueue.count) pending devices...")
+                        
+                        // Force the internal flag to false so startScan() doesn't early-exit
+                        self.isScanningInternal = false
+                        self.startScan()
+                    }
+
+                case .poweredOff, .resetting:
+                    print("⚠️ Bluetooth powered OFF/RESET")
+                    
+                    // 1. CLEAR BUSY FLAGS (But keep the connectQueue!)
+                    // We stop "doing" things, but we remember what we *want* to do.
+                    self.isScanningInternal = false
+                    self.connectInProgress = nil
+                    self.initializationInProgress.removeAll()
+                    self.syncInProgress = false
+
+                    // 2. UPDATE UI
+                    // Mark everyone as disconnected so the UI reflects reality immediately.
+                    // We do NOT remove them from 'byUuid' or 'dots', preserving the list.
+                    for state in self.byUuid.values {
+                        state.dot?.setIsConnected(false)
+                    }
+                    self.notify()
+
+                case .unauthorized, .unsupported:
+                     print("❌ Bluetooth Error: \(managerState.rawValue)")
+                    
+                @unknown default:
+                    break
+                }
+            }
+        }
 }
