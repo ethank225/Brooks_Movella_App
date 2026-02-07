@@ -1,4 +1,5 @@
 import SwiftUI
+import Combine      // <--- ADD THIS
 import MovellaDotSdk
 
 struct ConnectionView: View {
@@ -7,12 +8,12 @@ struct ConnectionView: View {
 
     // UUID -> DotDevice
     @State private var discoveredByUuid: [String: DotDevice] = [:]
-
+    
     // Connected UUIDs only
     @State private var connectedUuids: Set<String> = []
 
     @State private var isScanning = false
-
+    
     // NEW: UI phases
     enum DevicePhase: Equatable {
         case idle
@@ -23,6 +24,9 @@ struct ConnectionView: View {
     }
 
     @State private var phaseByUuid: [String: DevicePhase] = [:]
+    
+    // Timer to force scan retries
+    @State private var timer = Timer.publish(every: 1.0, on: .main, in: .common).autoconnect()
 
     private var discoveredList: [DotDevice] {
         discoveredByUuid.values.sorted { left, right in
@@ -66,7 +70,6 @@ struct ConnectionView: View {
                         // Only allow navigation when initialized
                         if phase == .ready {
                             NavigationLink {
-                                // Replace with your real destination view
                                 DotDetailView(uuid: uuid)
                             } label: {
                                 DeviceRow(
@@ -77,7 +80,7 @@ struct ConnectionView: View {
                                 )
                             }
                         } else {
-                            // Not ready: row is not a link, so user cannot change pages
+                            // Not ready: row is not a link
                             DeviceRow(
                                 title: "DOT \(uuid)",
                                 subtitle: manager.displayAddress(for: device),
@@ -86,8 +89,7 @@ struct ConnectionView: View {
                             )
                             .contentShape(Rectangle())
                             .onTapGesture {
-                                // Optional: give quick feedback on why tapping does nothing
-                                // You could show a toast/alert if you want
+                                // Optional feedback
                             }
                         }
                     }
@@ -110,13 +112,25 @@ struct ConnectionView: View {
             .onAppear {
                 manager.activate()
                 syncState()
-                startScan()
             }
             .onDisappear {
                 manager.stopScan()
+                timer.upstream.connect().cancel()
             }
             .onReceive(NotificationCenter.default.publisher(for: .dotManagerUpdated)) { _ in
                 syncState()
+            }
+            // THE FIX: Retry Timer
+            .onReceive(timer) { _ in
+                if !manager.isScanning {
+                    // Force start
+                    manager.startScan()
+                    // Visual update
+                    isScanning = true
+                } else {
+                    // It is scanning! Ensure UI matches
+                    if !isScanning { isScanning = true }
+                }
             }
         }
     }
@@ -159,10 +173,7 @@ struct ConnectionView: View {
         let dots = manager.dots
         connectedUuids = Set(dots.filter { $0.isConnected }.map { $0.address })
 
-        // Phase snapshot: derive from Dot wrapper signals
-        // connecting: we optimistically set this in toggleConnection
-        // initializing: connected but not initialized yet
-        // ready: connected + initialized
+        // Phase snapshot
         var newPhases = phaseByUuid
 
         for (uuid, _) in discoveredByUuid {
@@ -170,14 +181,11 @@ struct ConnectionView: View {
                 if dot.isConnected {
                     newPhases[uuid] = dot.isInitialized ? .ready : .initializing
                 } else {
-                    // If we thought we were connecting but it is not connected, keep spinner briefly
-                    // or reset to idle. Here we reset.
                     if newPhases[uuid] != .connecting {
                         newPhases[uuid] = .idle
                     }
                 }
             } else {
-                // No Dot object yet. If user requested connect, stay connecting. Otherwise idle.
                 if newPhases[uuid] != .connecting {
                     newPhases[uuid] = .idle
                 }
@@ -185,13 +193,13 @@ struct ConnectionView: View {
         }
 
         phaseByUuid = newPhases
-
-        // Mirror scanning
+        
+        // Sync scanning state from manager source of truth
         isScanning = manager.isScanning
     }
 }
 
-// Placeholder destination view
+// Subviews
 struct DotDetailView: View {
     let uuid: String
     var body: some View {
@@ -199,8 +207,6 @@ struct DotDetailView: View {
             .navigationTitle("DOT")
     }
 }
-
-
 
 struct DeviceRow: View {
     let title: String
