@@ -276,26 +276,39 @@ final class DotManager: NSObject {
     
     /// Checks `isInitialized` on the background thread before asking for storage
     private func queueStorageRefresh_locked(dots: [Dot]) {
-        // Must be called on stateQueue
         guard !dots.isEmpty else { return }
-        
+
         print("💾 Queueing storage refresh for \(dots.count) dots")
-        
+
         self.sdkQueue.async { [weak self] in
             guard let self else { return }
-            
+
             self.executeSequentially(items: dots) { dot, done in
-                // 1. Wait for initialization if needed (polling on SDK queue)
                 self.waitForInitialization(dot: dot, timeout: 5.0) { ready in
+                    let uuid = dot.device.uuid
+
                     if !ready {
                         print("⚠️ [\(dot.address)] Not initialized, skipping storage refresh")
+
+                        // ✅ IMPORTANT: unblock future sync attempts
+                        self.stateQueue.async {
+                            self.initializationInProgress.remove(uuid)
+                            self.notify()
+                        }
+
                         done(false)
                         return
                     }
-                    
-                    // 2. Refresh Storage
+
                     dot.getFlashInfo { _ in
                         dot.updateStorageDisplay()
+
+                        // ✅ Mark init finished so sync is allowed
+                        self.stateQueue.async {
+                            self.initializationInProgress.remove(uuid)
+                            self.notify()
+                        }
+
                         done(true)
                     }
                 }
@@ -305,6 +318,7 @@ final class DotManager: NSObject {
             }
         }
     }
+
     
     /// Blocks the SDK queue (sleeps) briefly while waiting for a single dot to initialize.
     /// Safe because we are on a background serial queue.
