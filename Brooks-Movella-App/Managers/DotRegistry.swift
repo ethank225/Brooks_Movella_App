@@ -10,6 +10,7 @@ final class DotRegistry {
         var dot: Dot?
         var lastSeen: Date
         var isConnected: Bool = false
+        var connectionPhase: ConnectionPhase = .idle
     }
 
     // MARK: - State
@@ -48,6 +49,15 @@ final class DotRegistry {
         byUuid.compactMap { $0.value.dot != nil ? $0.key : nil }
     }
 
+    /// Snapshot of connection phases for all known devices.
+    var connectionPhases: [String: ConnectionPhase] {
+        byUuid.mapValues { $0.connectionPhase }
+    }
+
+    func setConnectionPhase(_ uuid: String, _ phase: ConnectionPhase) {
+        byUuid[uuid]?.connectionPhase = phase
+    }
+
     // MARK: - Mutations
 
     func recordDiscovery(_ device: DotDevice) {
@@ -63,6 +73,7 @@ final class DotRegistry {
         var state = byUuid[uuid] ?? DotState(device: device, dot: nil, lastSeen: Date())
         state.device = device
         state.isConnected = true
+        state.connectionPhase = .initializing
 
         if let dot = state.dot {
             dot.updateDevice(device)
@@ -92,6 +103,7 @@ final class DotRegistry {
 
     func recordDisconnection(_ uuid: String) {
         byUuid[uuid]?.isConnected = false
+        byUuid[uuid]?.connectionPhase = .idle
         byUuid[uuid]?.dot?.setIsConnected(false)
         byUuid[uuid]?.dot?.setSessionSynced(false)
         initializationInProgress.remove(uuid)
@@ -118,6 +130,7 @@ final class DotRegistry {
     func markAllDisconnected() {
         for uuid in byUuid.keys {
             byUuid[uuid]?.isConnected = false
+            byUuid[uuid]?.connectionPhase = .idle
             byUuid[uuid]?.dot?.setIsConnected(false)
         }
     }

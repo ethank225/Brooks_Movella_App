@@ -50,6 +50,36 @@ extension SessionPhase {
     }
 }
 
+// MARK: - Connection Phase
+
+/// Per-device connection lifecycle, managed by `DotManager` and stored in `DotRegistry`.
+///
+/// Transitions:
+///     idle ──▶ connecting ──▶ initializing ──▶ ready
+///                  │                              │
+///                  ▼                              ▼
+///            failed(…)                     idle (disconnect)
+nonisolated enum ConnectionPhase: Equatable, Sendable {
+    case idle
+    case connecting
+    case initializing
+    case ready
+    case failed(String)
+
+    var isFailed: Bool {
+        if case .failed = self { return true }
+        return false
+    }
+
+    var isBusy: Bool {
+        self == .connecting || self == .initializing
+    }
+
+    var isConnected: Bool {
+        self == .initializing || self == .ready
+    }
+}
+
 // MARK: - DotManager
 
 /// Singleton that owns all app state related to Movella DOT sensors.
@@ -112,6 +142,10 @@ final class DotManager: NSObject, ObservableObject {
     @Published private(set) var dots: [Dot] = []
     @Published private(set) var connectedDots: [Dot] = []
     @Published private(set) var sessionPhase: SessionPhase = .idle
+    @Published private(set) var connectionPhases: [String: ConnectionPhase] = [:]
+
+    /// Per-device connection timeout timers. Managed on the main thread.
+    private var connectTimers: [String: DispatchWorkItem] = [:]
 
     /// Thread-safe lookup of a `Dot` model by UUID.
     func dot(forUuid uuid: String) -> Dot? {
@@ -158,8 +192,10 @@ final class DotManager: NSObject, ObservableObject {
         stateQueue.async {
             if self.registry.connectQueue.contains(u) || self.registry.connectInProgress == u { return }
             self.registry.connectQueue.append(u)
+            self.registry.setConnectionPhase(u, .connecting)
 
             self.startScan()
+            self.startConnectTimer(u)
 
             self.processConnectQueue()
             self.notify()
@@ -179,6 +215,7 @@ final class DotManager: NSObject, ObservableObject {
     func cancelConnect(uuid: String) {
         stateQueue.async {
             self.registry.connectQueue.removeAll { $0 == uuid }
+            self.registry.setConnectionPhase(uuid, .failed("Connection timed out"))
             if self.registry.connectInProgress == uuid {
                 self.registry.advanceConnectQueue()
                 self.processConnectQueue()
@@ -368,7 +405,9 @@ final class DotManager: NSObject, ObservableObject {
     private func refreshStorage(dots: [Dot]) {
         operations.refreshStorage(dots: dots) { [weak self] dot, _ in
             self?.stateQueue.async {
-                self?.registry.initializationInProgress.remove(dot.device.uuid)
+                let uuid = dot.device.uuid
+                self?.registry.initializationInProgress.remove(uuid)
+                self?.registry.setConnectionPhase(uuid, .ready)
                 self?.notify()
             }
         } completion: {}
@@ -381,12 +420,48 @@ final class DotManager: NSObject, ObservableObject {
         let disc = registry.discovered
         let all = registry.dots
         let connected = registry.connectedDots
+        let phases = registry.connectionPhases
 
         DispatchQueue.main.async {
             self.isScanning = scanning
             self.discovered = disc
             self.dots = all
             self.connectedDots = connected
+            self.connectionPhases = phases
+        }
+    }
+
+    // MARK: - Connect Timers
+
+    /// Start a 10-second timeout for a connection attempt.
+    /// If the timer fires, marks the device as failed and cancels the connect.
+    /// Safe to call from any thread — dispatches to main for timer scheduling.
+    private func startConnectTimer(_ uuid: String) {
+        cancelConnectTimer(uuid)
+
+        let work = DispatchWorkItem { [weak self] in
+            self?.cancelConnect(uuid: uuid)
+        }
+        DispatchQueue.main.async {
+            self.connectTimers[uuid] = work
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10, execute: work)
+    }
+
+    /// Cancel a pending connect timer for a specific UUID.
+    /// Safe to call from any thread.
+    private func cancelConnectTimer(_ uuid: String) {
+        DispatchQueue.main.async {
+            self.connectTimers[uuid]?.cancel()
+            self.connectTimers.removeValue(forKey: uuid)
+        }
+    }
+
+    /// Cancel all pending connect timers (e.g. on Bluetooth power-off).
+    private func cancelAllConnectTimers() {
+        DispatchQueue.main.async {
+            for (_, work) in self.connectTimers { work.cancel() }
+            self.connectTimers.removeAll()
         }
     }
 
@@ -442,6 +517,8 @@ extension DotManager: DotConnectionDelegate {
                 return
             }
 
+            self.cancelConnectTimer(device.uuid)
+
             // During sync the SDK internally reconnects each sensor.
             // Update the device reference but skip the full initialization
             // path — the dots were never shown as disconnected to the user.
@@ -450,6 +527,7 @@ extension DotManager: DotConnectionDelegate {
                 return
             }
 
+            // recordConnection sets phase to .initializing
             self.registry.recordConnection(device)
 
             self.sdkQueue.async {
@@ -459,6 +537,7 @@ extension DotManager: DotConnectionDelegate {
             if let dot = self.registry.dot(forUuid: device.uuid) {
                 print("⏳ [\(device.uuid)] Queuing initialization & storage refresh...")
 
+                // refreshStorage will set phase to .ready on completion
                 self.refreshStorage(dots: [dot])
 
                 self.registry.advanceConnectQueue()
@@ -473,6 +552,8 @@ extension DotManager: DotConnectionDelegate {
         stateQueue.async {
             // During sync the SDK manages connections itself — don't interfere.
             if self.sessionPhase.isSyncActive { return }
+            self.cancelConnectTimer(device.uuid)
+            self.registry.setConnectionPhase(device.uuid, .failed("Connection failed"))
             self.registry.advanceConnectQueue()
             self.processConnectQueue()
             self.notify()
@@ -514,6 +595,7 @@ extension DotManager: DotConnectionDelegate {
 
             case .poweredOff, .resetting:
                 print("⚠️ Bluetooth powered OFF/RESET")
+                self.cancelAllConnectTimers()
                 self.registry.clearBusyFlags()
                 self.registry.markAllDisconnected()
                 self.setPhase(.error("Bluetooth disconnected."))

@@ -6,22 +6,7 @@ struct ConnectionView: View {
 
     @ObservedObject private var manager = DotManager.shared
 
-    enum DevicePhase: Equatable {
-        case idle
-        case connecting
-        case initializing
-        case ready
-        case failed(String)
-
-        var isFailed: Bool {
-            if case .failed = self { return true }
-            return false
-        }
-    }
-
-    @State private var phaseByUuid: [String: DevicePhase] = [:]
     @State private var identifyingUuid: String?
-    @State private var connectTimers: [String: DispatchWorkItem] = [:]
 
     // Timer to force scan retries
     @State private var timer = Timer.publish(every: 1.0, on: .main, in: .common).autoconnect()
@@ -67,7 +52,7 @@ struct ConnectionView: View {
 
                     ForEach(discoveredList, id: \.uuid) { device in
                         let uuid = device.uuid
-                        let phase = phaseByUuid[uuid] ?? .idle
+                        let phase = manager.connectionPhases[uuid] ?? .idle
 
                         DeviceRow(
                             title: "DOT \(uuid)",
@@ -106,14 +91,10 @@ struct ConnectionView: View {
             .refreshable { manager.startScan() }
             .onAppear {
                 manager.activate()
-                syncPhases()
             }
             .onDisappear {
                 manager.stopScan()
                 timer.upstream.connect().cancel()
-            }
-            .onReceive(manager.objectWillChange) { _ in
-                DispatchQueue.main.async { syncPhases() }
             }
             // Retry Timer
             .onReceive(timer) { _ in
@@ -126,44 +107,18 @@ struct ConnectionView: View {
 
     private func toggleConnection(_ device: DotDevice) {
         let uuid = device.uuid
+        let phase = manager.connectionPhases[uuid] ?? .idle
 
         // If currently busy, ignore repeated taps
-        let currentPhase = phaseByUuid[uuid] ?? .idle
-        if currentPhase == .connecting || currentPhase == .initializing {
-            return
-        }
+        if phase.isBusy { return }
 
         if manager.dot(forUuid: uuid)?.isConnected == true {
             if let dot = manager.dot(forUuid: uuid) {
                 manager.disconnect(dot)
             }
-            cancelConnectTimer(uuid)
-            phaseByUuid[uuid] = .idle
         } else {
-            phaseByUuid[uuid] = .connecting
             manager.connectByUuid(uuid)
-            startConnectTimer(uuid)
         }
-    }
-
-    private func startConnectTimer(_ uuid: String) {
-        cancelConnectTimer(uuid)
-
-        let work = DispatchWorkItem { [self] in
-            let phase = phaseByUuid[uuid] ?? .idle
-            if phase == .connecting {
-                phaseByUuid[uuid] = .failed("Connection timed out")
-                manager.cancelConnect(uuid: uuid)
-            }
-            connectTimers.removeValue(forKey: uuid)
-        }
-        connectTimers[uuid] = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 10, execute: work)
-    }
-
-    private func cancelConnectTimer(_ uuid: String) {
-        connectTimers[uuid]?.cancel()
-        connectTimers.removeValue(forKey: uuid)
     }
 
     private func triggerIdentify(uuid: String) {
@@ -176,50 +131,17 @@ struct ConnectionView: View {
             }
         }
     }
-
-    private func syncPhases() {
-        var newPhases = phaseByUuid
-
-        for device in manager.discovered {
-            let uuid = device.uuid
-            if let dot = manager.dot(forUuid: uuid) {
-                if dot.isConnected {
-                    cancelConnectTimer(uuid)
-                    newPhases[uuid] = dot.isInitialized ? .ready : .initializing
-                } else {
-                    let current = newPhases[uuid] ?? .idle
-                    // Preserve .connecting and .failed states
-                    if current != .connecting && !current.isFailed {
-                        newPhases[uuid] = .idle
-                    }
-                }
-            } else {
-                let current = newPhases[uuid] ?? .idle
-                if current != .connecting && !current.isFailed {
-                    newPhases[uuid] = .idle
-                }
-            }
-        }
-
-        phaseByUuid = newPhases
-    }
 }
 
 struct DeviceRow: View {
     let title: String
     let subtitle: String
-    let phase: ConnectionView.DevicePhase
+    let phase: ConnectionPhase
     var isIdentifying: Bool = false
     var batteryLevel: Int? = nil
     let onToggle: () -> Void
 
-    private var isConnected: Bool {
-        phase == .initializing || phase == .ready
-    }
-
-    private var isBusy: Bool {
-        phase == .connecting || phase == .initializing
-    }
+    private var isBusy: Bool { phase.isBusy }
 
     private func batteryIcon(for level: Int) -> String {
         switch level {
@@ -260,7 +182,7 @@ struct DeviceRow: View {
                     .font(.caption)
             } else {
                 Circle()
-                    .fill(isConnected ? Color.green : Color.gray.opacity(0.3))
+                    .fill(phase.isConnected ? Color.green : Color.gray.opacity(0.3))
                     .frame(width: 10, height: 10)
             }
 
@@ -304,7 +226,7 @@ struct DeviceRow: View {
             Spacer()
 
             Toggle("", isOn: Binding(
-                get: { isConnected },
+                get: { phase.isConnected },
                 set: { _ in onToggle() }
             ))
             .labelsHidden()
