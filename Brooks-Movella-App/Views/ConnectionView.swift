@@ -15,6 +15,7 @@ struct ConnectionView: View {
     }
 
     @State private var phaseByUuid: [String: DevicePhase] = [:]
+    @State private var identifyingUuid: String?
 
     // Timer to force scan retries
     @State private var timer = Timer.publish(every: 1.0, on: .main, in: .common).autoconnect()
@@ -62,31 +63,21 @@ struct ConnectionView: View {
                         let uuid = device.uuid
                         let phase = phaseByUuid[uuid] ?? .idle
 
-                        // Only allow navigation when initialized
-                        if phase == .ready {
-                            NavigationLink {
-                                DotDetailView(uuid: uuid)
-                            } label: {
-                                DeviceRow(
-                                    title: "DOT \(uuid)",
-                                    subtitle: manager.displayAddress(for: device),
-                                    phase: phase,
-                                    onToggle: { toggleConnection(device) }
-                                )
-                            }
-                        } else {
-                            // Not ready: row is not a link
-                            DeviceRow(
-                                title: "DOT \(uuid)",
-                                subtitle: manager.displayAddress(for: device),
-                                phase: phase,
-                                onToggle: { toggleConnection(device) }
-                            )
-                            .contentShape(Rectangle())
-                            .onTapGesture {
-                                // Optional feedback
+                        DeviceRow(
+                            title: "DOT \(uuid)",
+                            subtitle: manager.displayAddress(for: device),
+                            phase: phase,
+                            isIdentifying: identifyingUuid == uuid,
+                            batteryLevel: manager.dot(forUuid: uuid)?.device.battery?.value as? Int,
+                            onToggle: { toggleConnection(device) }
+                        )
+                        .contentShape(Rectangle())
+                        .onTapGesture {
+                            if phase == .ready {
+                                triggerIdentify(uuid: uuid)
                             }
                         }
+                        .listRowBackground(identifyingUuid == uuid ? Color.orange.opacity(0.08) : nil)
                     }
                 }
                 .listStyle(.plain)
@@ -145,6 +136,17 @@ struct ConnectionView: View {
         }
     }
 
+    private func triggerIdentify(uuid: String) {
+        guard let dot = manager.dot(forUuid: uuid) else { return }
+        dot.identify()
+        identifyingUuid = uuid
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+            if identifyingUuid == uuid {
+                identifyingUuid = nil
+            }
+        }
+    }
+
     private func syncPhases() {
         var newPhases = phaseByUuid
 
@@ -169,19 +171,12 @@ struct ConnectionView: View {
     }
 }
 
-// Subviews
-struct DotDetailView: View {
-    let uuid: String
-    var body: some View {
-        Text("DOT Detail for \(uuid)")
-            .navigationTitle("DOT")
-    }
-}
-
 struct DeviceRow: View {
     let title: String
     let subtitle: String
     let phase: ConnectionView.DevicePhase
+    var isIdentifying: Bool = false
+    var batteryLevel: Int? = nil
     let onToggle: () -> Void
 
     private var isConnected: Bool {
@@ -192,7 +187,23 @@ struct DeviceRow: View {
         phase == .connecting || phase == .initializing
     }
 
+    private func batteryIcon(for level: Int) -> String {
+        switch level {
+        case 75...: return "battery.100"
+        case 50..<75: return "battery.75"
+        case 25..<50: return "battery.50"
+        default: return "battery.25"
+        }
+    }
+
+    private func batteryColor(for level: Int) -> Color {
+        if level <= 15 { return .red }
+        if level <= 30 { return .orange }
+        return .secondary
+    }
+
     private var statusText: String? {
+        if isIdentifying { return "Identifying…" }
         switch phase {
         case .connecting: return "Connecting…"
         case .initializing: return "Initializing…"
@@ -204,13 +215,23 @@ struct DeviceRow: View {
 
     var body: some View {
         HStack(spacing: 12) {
-            Circle()
-                .fill(isConnected ? Color.green : Color.gray.opacity(0.3))
-                .frame(width: 10, height: 10)
+            if isIdentifying {
+                Image(systemName: "light.beacon.max.fill")
+                    .foregroundColor(.orange)
+                    .font(.caption)
+                    .symbolEffect(.pulse)
+            } else {
+                Circle()
+                    .fill(isConnected ? Color.green : Color.gray.opacity(0.3))
+                    .frame(width: 10, height: 10)
+            }
 
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 8) {
-                    Text(title).font(.headline)
+                    Text(title)
+                        .font(.headline)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.7)
 
                     if isBusy {
                         ProgressView()
@@ -218,17 +239,29 @@ struct DeviceRow: View {
                     }
                 }
 
-                Text(subtitle)
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                    .lineLimit(1)
+                HStack(spacing: 4) {
+                    Text(subtitle)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
+
+                    if let batteryLevel {
+                        Image(systemName: batteryIcon(for: batteryLevel))
+                            .font(.caption2)
+                            .foregroundColor(batteryColor(for: batteryLevel))
+                        Text("\(batteryLevel)%")
+                            .font(.caption2)
+                            .foregroundColor(batteryColor(for: batteryLevel))
+                    }
+                }
 
                 if let statusText {
                     Text(statusText)
                         .font(.caption2)
-                        .foregroundColor(.secondary)
+                        .foregroundColor(isIdentifying ? .orange : .secondary)
                 }
             }
+            .layoutPriority(1)
 
             Spacer()
 
@@ -240,5 +273,6 @@ struct DeviceRow: View {
             .disabled(isBusy)
         }
         .padding(.vertical, 4)
+        .animation(.easeInOut(duration: 0.3), value: isIdentifying)
     }
 }
