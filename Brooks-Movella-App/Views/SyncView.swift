@@ -3,16 +3,11 @@ import SwiftUI
 struct SyncView: View {
     @ObservedObject private var manager = DotManager.shared
 
-    @State private var isSyncing = false
-    @State private var isRecordingInProgress = false
-    @State private var isStoppingRecording = false
-    @State private var syncResult: String = ""
     @State private var isErasing = false
     @State private var showEraseConfirmation = false
+    @State private var eraseResult: String = ""
 
-    private var anyDotRecording: Bool {
-        manager.connectedDots.contains { $0.isRecording }
-    }
+    private var phase: SessionPhase { manager.sessionPhase }
 
     var body: some View {
         ScrollView {
@@ -37,93 +32,69 @@ struct SyncView: View {
                         .padding(.vertical, 20)
                     } else {
                         ForEach(manager.connectedDots, id: \.address) { dot in
-                            DotStatusRow(dot: dot)
+                            DotStatusRow(dot: dot, sessionPhase: phase)
                         }
                     }
                 }
 
-                // MARK: - Synchronization
+                // MARK: - Session (Record)
 
-                SectionCard(title: "Synchronization", icon: "arrow.triangle.2.circlepath") {
-                    HStack(spacing: 12) {
-                        Button {
-                            startSync()
-                        } label: {
-                            HStack {
-                                if isSyncing {
-                                    ProgressView()
-                                        .progressViewStyle(CircularProgressViewStyle(tint: .white))
-                                }
-                                Text(isSyncing ? "Syncing..." : "Start Sync")
+                SectionCard(title: "Session", icon: "record.circle") {
+
+                    // Error banner
+                    if case .error(let msg) = phase {
+                        HStack {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .foregroundColor(.orange)
+                            Text(msg)
+                                .font(.subheadline)
+                                .foregroundColor(.orange)
+                            Spacer()
+                            Button { manager.dismissError() } label: {
+                                Image(systemName: "xmark.circle.fill")
+                                    .foregroundColor(.secondary)
                             }
-                            .frame(maxWidth: .infinity)
-                            .padding()
-                            .background(isSyncing ? Color.gray : Color.blue)
-                            .foregroundColor(.white)
-                            .cornerRadius(10)
                         }
-                        .disabled(isSyncing || manager.connectedDots.count < 2 || anyDotRecording)
-
-                        Button {
-                            stopSync()
-                        } label: {
-                            Text("Stop")
-                                .frame(maxWidth: .infinity)
-                                .padding()
-                                .background(!isSyncing ? Color.gray : Color.red)
-                                .foregroundColor(.white)
-                                .cornerRadius(10)
-                        }
-                        .disabled(!isSyncing)
+                        .padding()
+                        .background(Color.orange.opacity(0.1))
+                        .cornerRadius(8)
                     }
-                }
 
-                // MARK: - Recording
-
-                SectionCard(title: "Recording", icon: "record.circle") {
-                    HStack(spacing: 12) {
-                        Button {
-                            startRecording()
-                        } label: {
-                            HStack {
-                                if isRecordingInProgress {
-                                    ProgressView()
-                                        .progressViewStyle(CircularProgressViewStyle(tint: .white))
-                                } else {
-                                    Circle()
-                                        .fill(Color.white)
-                                        .frame(width: 12, height: 12)
-                                }
-                                Text(isRecordingInProgress ? "Starting..." : anyDotRecording ? "Recording..." : "Record")
+                    // Status text
+                    if let statusText = phaseStatusText {
+                        HStack(spacing: 8) {
+                            if phase.isBusy {
+                                ProgressView()
+                                    .progressViewStyle(CircularProgressViewStyle(tint: phaseColor))
+                                    .scaleEffect(0.8)
                             }
-                            .frame(maxWidth: .infinity)
-                            .padding()
-                            .background(anyDotRecording ? Color.red : (isRecordingInProgress ? Color.gray : Color.green))
-                            .foregroundColor(.white)
-                            .cornerRadius(10)
+                            Text(statusText)
+                                .font(.subheadline)
+                                .foregroundColor(phaseColor)
                         }
-                        .disabled(isRecordingInProgress || anyDotRecording || manager.connectedDots.isEmpty || isSyncing)
-
-                        Button {
-                            stopRecording()
-                        } label: {
-                            HStack {
-                                if isStoppingRecording {
-                                    ProgressView()
-                                        .progressViewStyle(CircularProgressViewStyle(tint: .white))
-                                } else {
-                                    Image(systemName: "stop.fill")
-                                }
-                                Text(isStoppingRecording ? "Stopping..." : "Stop")
-                            }
-                            .frame(maxWidth: .infinity)
-                            .padding()
-                            .background(isStoppingRecording ? Color.gray : Color.orange)
-                            .foregroundColor(.white)
-                            .cornerRadius(10)
-                        }
-                        .disabled(!anyDotRecording || isStoppingRecording)
+                        .padding(.bottom, 4)
                     }
+
+                    // Primary button
+                    Button {
+                        handlePrimaryAction()
+                    } label: {
+                        HStack {
+                            if phase.isBusy {
+                                ProgressView()
+                                    .progressViewStyle(CircularProgressViewStyle(tint: .white))
+                            } else {
+                                Image(systemName: primaryButtonIcon)
+                            }
+                            Text(primaryButtonTitle)
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding()
+                        .background(primaryButtonColor)
+                        .foregroundColor(.white)
+                        .cornerRadius(10)
+                    }
+                    .disabled(primaryButtonDisabled)
                 }
 
                 // MARK: - Storage Management
@@ -146,25 +117,27 @@ struct SyncView: View {
                         .foregroundColor(.white)
                         .cornerRadius(10)
                     }
-                    .disabled(isErasing || manager.connectedDots.isEmpty || anyDotRecording || isSyncing)
-                }
+                    .disabled(isErasing || manager.connectedDots.isEmpty || phase != .idle)
 
-                // MARK: - Status Banner
-
-                if !syncResult.isEmpty {
-                    Text(syncResult)
-                        .padding()
-                        .frame(maxWidth: .infinity)
-                        .background(Color(.secondarySystemBackground))
-                        .cornerRadius(10)
-                        .padding(.horizontal)
+                    if !eraseResult.isEmpty {
+                        Text(eraseResult)
+                            .font(.subheadline)
+                            .foregroundColor(.secondary)
+                            .padding(.top, 4)
+                    }
                 }
 
                 Spacer()
             }
             .padding(.top)
         }
-        .navigationTitle("Sync & Record")
+        .navigationTitle("Record")
+        .onAppear {
+            // Recover session state after app relaunch if dots are still recording
+            if manager.sessionPhase == .idle && manager.connectedDots.contains(where: { $0.isRecording }) {
+                manager.resumeRecordingSession()
+            }
+        }
         .confirmationDialog("Erase all flash storage?", isPresented: $showEraseConfirmation, titleVisibility: .visible) {
             Button("Erase All", role: .destructive) { eraseFlash() }
             Button("Cancel", role: .cancel) {}
@@ -173,58 +146,84 @@ struct SyncView: View {
         }
     }
 
-    // MARK: - Actions
+    // MARK: - Button State
 
-    private func startSync() {
-        isSyncing = true
-        syncResult = ""
-
-        manager.syncConnectedDots { success in
-            DispatchQueue.main.async {
-                isSyncing = false
-                syncResult = success ? "Sync successful" : "Sync failed"
-            }
+    private var primaryButtonTitle: String {
+        switch phase {
+        case .idle:                return "Start Recording"
+        case .syncing:             return "Syncing Sensors..."
+        case .startingRecording:   return "Starting..."
+        case .recording:           return "Stop Recording"
+        case .stoppingRecording:   return "Stopping..."
+        case .error:               return "Start Recording"
         }
     }
 
-    private func stopSync() {
-        manager.stopSync()
-        isSyncing = false
-        syncResult = "Sync stopped"
+    private var primaryButtonIcon: String {
+        switch phase {
+        case .recording:           return "stop.fill"
+        default:                   return "circle.fill"
+        }
+    }
+
+    private var primaryButtonColor: Color {
+        switch phase {
+        case .idle:                return .green
+        case .recording:           return .red
+        case .error:               return .green
+        default:                   return .gray
+        }
+    }
+
+    private var primaryButtonDisabled: Bool {
+        switch phase {
+        case .idle:    return manager.connectedDots.isEmpty
+        case .recording: return false
+        case .error:   return manager.connectedDots.isEmpty
+        default:       return true
+        }
+    }
+
+    private var phaseStatusText: String? {
+        switch phase {
+        case .idle:                        return nil
+        case .syncing:                     return "Synchronizing sensor clocks..."
+        case .startingRecording:           return "Starting recording on all sensors..."
+        case .recording:                   return "Recording in progress"
+        case .stoppingRecording:           return "Stopping recording..."
+        case .error:                       return nil // shown in error banner instead
+        }
+    }
+
+    private var phaseColor: Color {
+        switch phase {
+        case .recording:   return .red
+        case .error:       return .orange
+        default:           return .blue
+        }
+    }
+
+    // MARK: - Actions
+
+    private func handlePrimaryAction() {
+        switch phase {
+        case .idle, .error:
+            manager.beginSession()
+        case .recording:
+            manager.endSession()
+        default:
+            break
+        }
     }
 
     private func eraseFlash() {
         isErasing = true
-        syncResult = "Erasing flash..."
+        eraseResult = "Erasing flash..."
 
         manager.eraseAllFlash { success in
             DispatchQueue.main.async {
                 isErasing = false
-                syncResult = success ? "Flash erased" : "Erase failed"
-            }
-        }
-    }
-
-    private func startRecording() {
-        isRecordingInProgress = true
-        syncResult = "Starting recording..."
-
-        manager.startRecordingAll { success in
-            DispatchQueue.main.async {
-                isRecordingInProgress = false
-                syncResult = success ? "Recording started" : "Recording failed"
-            }
-        }
-    }
-
-    private func stopRecording() {
-        isStoppingRecording = true
-        syncResult = "Stopping recording..."
-
-        manager.stopRecordingAll { success in
-            DispatchQueue.main.async {
-                isStoppingRecording = false
-                syncResult = success ? "Recording stopped" : "Stop failed"
+                eraseResult = success ? "Flash erased" : "Erase failed"
             }
         }
     }
@@ -256,12 +255,20 @@ private struct SectionCard<Content: View>: View {
 
 struct DotStatusRow: View {
     @ObservedObject var dot: Dot
+    var sessionPhase: SessionPhase = .idle
 
     var body: some View {
         HStack {
-            Circle()
-                .fill(dot.isConnected ? Color.green : Color.gray)
-                .frame(width: 12, height: 12)
+            if sessionPhase.isSyncActive {
+                Image(systemName: "arrow.triangle.2.circlepath")
+                    .foregroundColor(.blue)
+                    .font(.caption)
+                    .symbolEffect(.rotate)
+            } else {
+                Circle()
+                    .fill(dot.isConnected ? (dot.isRecording ? Color.red : Color.green) : Color.gray)
+                    .frame(width: 12, height: 12)
+            }
 
             VStack(alignment: .leading, spacing: 4) {
                 Text(dot.address)
@@ -269,7 +276,6 @@ struct DotStatusRow: View {
 
                 HStack(spacing: 8) {
                     StatusTag(text: "Connected", isActive: dot.isConnected, color: .green)
-                    StatusTag(text: "Synced", isActive: dot.sessionSynced, color: .blue)
                     StatusTag(text: "Recording", isActive: dot.isRecording, color: .red)
                 }
 
@@ -302,8 +308,22 @@ struct DotStatusRow: View {
             Spacer()
         }
         .padding()
-        .background(Color.gray.opacity(0.1))
+        .background(rowBackground)
         .cornerRadius(10)
+        .animation(.easeInOut(duration: 0.3), value: sessionPhase)
+    }
+
+    private var rowBackground: Color {
+        if dot.isErasing {
+            return Color.pink.opacity(0.1)
+        }
+        if sessionPhase.isSyncActive {
+            return Color.blue.opacity(0.08)
+        }
+        if dot.isRecording {
+            return Color.red.opacity(0.06)
+        }
+        return Color.gray.opacity(0.1)
     }
 
     private func storageColor(for percentage: Double) -> Color {

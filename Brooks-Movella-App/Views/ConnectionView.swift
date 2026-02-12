@@ -12,10 +12,16 @@ struct ConnectionView: View {
         case initializing
         case ready
         case failed(String)
+
+        var isFailed: Bool {
+            if case .failed = self { return true }
+            return false
+        }
     }
 
     @State private var phaseByUuid: [String: DevicePhase] = [:]
     @State private var identifyingUuid: String?
+    @State private var connectTimers: [String: DispatchWorkItem] = [:]
 
     // Timer to force scan retries
     @State private var timer = Timer.publish(every: 1.0, on: .main, in: .common).autoconnect()
@@ -77,7 +83,10 @@ struct ConnectionView: View {
                                 triggerIdentify(uuid: uuid)
                             }
                         }
-                        .listRowBackground(identifyingUuid == uuid ? Color.orange.opacity(0.08) : nil)
+                        .listRowBackground(
+                            identifyingUuid == uuid ? Color.orange.opacity(0.08) :
+                            phase.isFailed ? Color.orange.opacity(0.06) : nil
+                        )
                     }
                 }
                 .listStyle(.plain)
@@ -128,12 +137,33 @@ struct ConnectionView: View {
             if let dot = manager.dot(forUuid: uuid) {
                 manager.disconnect(dot)
             }
+            cancelConnectTimer(uuid)
             phaseByUuid[uuid] = .idle
         } else {
-            // Immediately show loading while SDK connect proceeds
             phaseByUuid[uuid] = .connecting
             manager.connectByUuid(uuid)
+            startConnectTimer(uuid)
         }
+    }
+
+    private func startConnectTimer(_ uuid: String) {
+        cancelConnectTimer(uuid)
+
+        let work = DispatchWorkItem { [self] in
+            let phase = phaseByUuid[uuid] ?? .idle
+            if phase == .connecting {
+                phaseByUuid[uuid] = .failed("Connection timed out")
+                manager.cancelConnect(uuid: uuid)
+            }
+            connectTimers.removeValue(forKey: uuid)
+        }
+        connectTimers[uuid] = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10, execute: work)
+    }
+
+    private func cancelConnectTimer(_ uuid: String) {
+        connectTimers[uuid]?.cancel()
+        connectTimers.removeValue(forKey: uuid)
     }
 
     private func triggerIdentify(uuid: String) {
@@ -154,14 +184,18 @@ struct ConnectionView: View {
             let uuid = device.uuid
             if let dot = manager.dot(forUuid: uuid) {
                 if dot.isConnected {
+                    cancelConnectTimer(uuid)
                     newPhases[uuid] = dot.isInitialized ? .ready : .initializing
                 } else {
-                    if newPhases[uuid] != .connecting {
+                    let current = newPhases[uuid] ?? .idle
+                    // Preserve .connecting and .failed states
+                    if current != .connecting && !current.isFailed {
                         newPhases[uuid] = .idle
                     }
                 }
             } else {
-                if newPhases[uuid] != .connecting {
+                let current = newPhases[uuid] ?? .idle
+                if current != .connecting && !current.isFailed {
                     newPhases[uuid] = .idle
                 }
             }
@@ -220,6 +254,10 @@ struct DeviceRow: View {
                     .foregroundColor(.orange)
                     .font(.caption)
                     .symbolEffect(.pulse)
+            } else if phase.isFailed {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundColor(.orange)
+                    .font(.caption)
             } else {
                 Circle()
                     .fill(isConnected ? Color.green : Color.gray.opacity(0.3))
@@ -258,7 +296,7 @@ struct DeviceRow: View {
                 if let statusText {
                     Text(statusText)
                         .font(.caption2)
-                        .foregroundColor(isIdentifying ? .orange : .secondary)
+                        .foregroundColor(isIdentifying || phase.isFailed ? .orange : .secondary)
                 }
             }
             .layoutPriority(1)

@@ -26,6 +26,7 @@ final class Dot: ObservableObject, Identifiable {
     @Published var isConnected = false
     @Published var isRecording = false
     @Published var sessionSynced = false
+    @Published var isErasing = false
 
     /// Flash storage snapshot. Updated after connection, recording, and erase.
     /// We store our own copy because reading `device.usedSpace` / `device.totalSpace`
@@ -244,10 +245,12 @@ final class Dot: ObservableObject, Identifiable {
     /// Refreshes the flash snapshot on completion.
     func eraseFlash(completion: @escaping (Bool) -> Void) {
         print("🗑️ [\(address)] Erasing flash...")
+        setOnMain { self.isErasing = true }
 
         device.setEraseDataDoneBlock { [weak self] success in
             let ok = success != 0
             print("🗑️ [\(self?.address ?? "?")] Erase: \(ok ? "success" : "failed")")
+            self?.setOnMain { self?.isErasing = false }
             self?.getFlashInfo { _ in }
             completion(ok)
         }
