@@ -52,7 +52,7 @@ struct ConnectionView: View {
 
                     ForEach(discoveredList, id: \.uuid) { device in
                         let uuid = device.uuid
-                        let phase = manager.connectionPhases[uuid] ?? .idle
+                        let phase = manager.connectionPhase(forUuid: uuid)
 
                         DeviceRow(
                             title: "DOT \(uuid)",
@@ -107,7 +107,7 @@ struct ConnectionView: View {
 
     private func toggleConnection(_ device: DotDevice) {
         let uuid = device.uuid
-        let phase = manager.connectionPhases[uuid] ?? .idle
+        let phase = manager.connectionPhase(forUuid: uuid)
 
         // If currently busy, ignore repeated taps
         if phase.isBusy { return }

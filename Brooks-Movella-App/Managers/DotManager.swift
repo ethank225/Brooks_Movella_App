@@ -118,7 +118,7 @@ final class DotManager: NSObject, ObservableObject {
     // MARK: - Components
 
     /// Non-thread-safe bookkeeping for all known devices. Access only on `stateQueue`.
-    private let registry = DotRegistry()
+    private lazy var registry = DotRegistry(sdkQueue: sdkQueue)
 
     /// Triggers Bluetooth scans on `sdkQueue`.
     private lazy var scanner = DotScanner(sdkQueue: sdkQueue)
@@ -142,7 +142,6 @@ final class DotManager: NSObject, ObservableObject {
     @Published private(set) var dots: [Dot] = []
     @Published private(set) var connectedDots: [Dot] = []
     @Published private(set) var sessionPhase: SessionPhase = .idle
-    @Published private(set) var connectionPhases: [String: ConnectionPhase] = [:]
 
     /// Per-device connection timeout timers. Managed on the main thread.
     private var connectTimers: [String: DispatchWorkItem] = [:]
@@ -150,6 +149,17 @@ final class DotManager: NSObject, ObservableObject {
     /// Thread-safe lookup of a `Dot` model by UUID.
     func dot(forUuid uuid: String) -> Dot? {
         stateQueue.sync { registry.dot(forUuid: uuid) }
+    }
+
+    /// Thread-safe lookup of a device's connection phase.
+    /// Reads from the Dot (canonical source) first; falls back to DotState
+    /// for pre-Dot phases like `.connecting`.
+    func connectionPhase(forUuid uuid: String) -> ConnectionPhase {
+        stateQueue.sync {
+            registry.dot(forUuid: uuid)?.connectionPhase
+                ?? registry.byUuid[uuid]?.connectionPhase
+                ?? .idle
+        }
     }
 
     // MARK: - Scanning
@@ -236,7 +246,11 @@ final class DotManager: NSObject, ObservableObject {
         stateQueue.async {
             guard self.sessionPhase == .idle || self.sessionPhase.isError else { return }
 
-            let dots = self.registry.connectedDots
+            let dots = self.registry.connectedDots.filter { dot in
+                let uuid = dot.address
+                let phase = self.registry.byUuid[uuid]?.connectionPhase ?? .idle
+                return phase == .ready
+            }
             guard !dots.isEmpty else { return }
 
             if dots.count >= 2 {
@@ -329,6 +343,10 @@ final class DotManager: NSObject, ObservableObject {
 
         sdkQueue.async { [weak self] in
             guard let self else { return }
+
+            for device in devices {
+                print("🔍 [PRE-SYNC] \(device.uuid): isInitialized=\(device.isInitialized())")
+            }
 
             DotSyncManager.startSync(devices) { results in
                 self.stateQueue.async {
@@ -429,14 +447,12 @@ final class DotManager: NSObject, ObservableObject {
         let disc = registry.discovered
         let all = registry.dots
         let connected = registry.connectedDots
-        let phases = registry.connectionPhases
 
         DispatchQueue.main.async {
             self.isScanning = scanning
             self.discovered = disc
             self.dots = all
             self.connectedDots = connected
-            self.connectionPhases = phases
         }
     }
 
@@ -547,6 +563,7 @@ extension DotManager: DotConnectionDelegate {
             if isAutoReconnect {
                 print("🔄 [\(device.uuid)] Auto-reconnect detected")
                 self.registry.recordReconnection(device)
+                self.registry.setConnectionPhase(device.uuid, .initializing)
 
                 self.sdkQueue.async {
                     DotDevicePool.bindDevice(device)

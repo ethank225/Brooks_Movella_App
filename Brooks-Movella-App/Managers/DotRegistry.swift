@@ -5,6 +5,12 @@ import MovellaDotSdk
 /// DotManager guards every access with `stateQueue`.
 final class DotRegistry {
 
+    let sdkQueue: DispatchQueue
+
+    init(sdkQueue: DispatchQueue) {
+        self.sdkQueue = sdkQueue
+    }
+
     struct DotState {
         var device: DotDevice
         var dot: Dot?
@@ -49,11 +55,6 @@ final class DotRegistry {
         byUuid.compactMap { $0.value.dot != nil ? $0.key : nil }
     }
 
-    /// Snapshot of connection phases for all known devices.
-    var connectionPhases: [String: ConnectionPhase] {
-        byUuid.mapValues { $0.connectionPhase }
-    }
-
     func setConnectionPhase(_ uuid: String, _ phase: ConnectionPhase) {
         byUuid[uuid]?.connectionPhase = phase
         byUuid[uuid]?.dot?.setConnectionPhase(phase)
@@ -73,12 +74,11 @@ final class DotRegistry {
         let uuid = device.uuid
         var state = byUuid[uuid] ?? DotState(device: device, dot: nil, lastSeen: Date())
         state.device = device
-//        state.connectionPhase = .initializing
 
         if let dot = state.dot {
             dot.updateDevice(device)
         } else {
-            state.dot = Dot(device: device)
+            state.dot = Dot(device: device, sdkQueue: sdkQueue)
         }
         byUuid[uuid] = state
         initializationInProgress.insert(uuid)
@@ -86,17 +86,15 @@ final class DotRegistry {
     }
 
     /// Lightweight update for SDK-managed reconnections (e.g. during sync).
-    /// Updates device reference and marks connected, but does NOT trigger initialization.
+    /// Updates device reference but does NOT change the connection phase.
     func recordReconnection(_ device: DotDevice) {
         let uuid = device.uuid
         guard var state = byUuid[uuid] else { return }
         state.device = device
-       // state.connectionPhase = .ready
         if let dot = state.dot {
             dot.updateDevice(device)
         }
         byUuid[uuid] = state
-        setConnectionPhase(uuid, .ready)
     }
 
     func recordDisconnection(_ uuid: String) {
