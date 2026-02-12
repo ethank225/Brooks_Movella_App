@@ -23,7 +23,9 @@ final class Dot: ObservableObject, Identifiable {
 
     // MARK: - Published State (UI-facing)
 
-    @Published var isConnected = false
+    @Published private(set) var connectionPhase: ConnectionPhase = .idle
+
+    var isConnected: Bool { connectionPhase.isConnected }
     @Published var isRecording = false
     @Published var sessionSynced = false
     @Published var isErasing = false
@@ -89,8 +91,8 @@ final class Dot: ObservableObject, Identifiable {
         else { DispatchQueue.main.async(execute: work) }
     }
 
-    func setIsConnected(_ value: Bool) {
-        setOnMain { self.isConnected = value }
+    func setConnectionPhase(_ phase: ConnectionPhase) {
+        setOnMain { self.connectionPhase = phase }
     }
 
     func setSessionSynced(_ value: Bool) {
@@ -148,6 +150,15 @@ final class Dot: ObservableObject, Identifiable {
             }
 
             self.device.getFlashInfo()
+
+            // Safety timeout — the SDK sometimes doesn't fire the callback after reconnect.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 5.0) { [weak self] in
+                guard !hasCapturedResult else { return }
+                hasCapturedResult = true
+                print("⏰ [\(self?.address ?? "?")] Flash info timed out")
+                self?.device.setFlashInfoDoneBlock(nil)
+                completion(false)
+            }
         }
 
         if Thread.isMainThread { run() }

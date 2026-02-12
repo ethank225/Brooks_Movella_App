@@ -405,10 +405,19 @@ final class DotManager: NSObject, ObservableObject {
     private func refreshStorage(dots: [Dot]) {
         operations.refreshStorage(dots: dots) { [weak self] dot, _ in
             self?.stateQueue.async {
+                guard let self else { return }
                 let uuid = dot.device.uuid
-                self?.registry.initializationInProgress.remove(uuid)
-                self?.registry.setConnectionPhase(uuid, .ready)
-                self?.notify()
+                self.registry.initializationInProgress.remove(uuid)
+                self.registry.setConnectionPhase(uuid, .ready)
+                self.notify()
+
+                // After a BT power cycle, restore the recording session once
+                // at least one device is back and ready.
+                if self.registry.wasRecordingBeforeDisconnect {
+                    self.registry.wasRecordingBeforeDisconnect = false
+                    print("🔄 Restoring recording session after BT reconnect")
+                    self.setPhase(.recording)
+                }
             }
         } completion: {}
     }
@@ -527,6 +536,29 @@ extension DotManager: DotConnectionDelegate {
                 return
             }
 
+            // SDK auto-reconnect: device was previously connected but the
+            // reconnect wasn't user-initiated (not in the connect queue).
+            // Use the lightweight path — mark ready immediately and refresh
+            // storage in the background.
+            let isAutoReconnect = self.registry.byUuid[device.uuid]?.dot != nil
+                && self.registry.connectInProgress != device.uuid
+                && !self.registry.connectQueue.contains(device.uuid)
+
+            if isAutoReconnect {
+                print("🔄 [\(device.uuid)] Auto-reconnect detected")
+                self.registry.recordReconnection(device)
+
+                self.sdkQueue.async {
+                    DotDevicePool.bindDevice(device)
+                }
+
+                if let dot = self.registry.dot(forUuid: device.uuid) {
+                    self.refreshStorage(dots: [dot])
+                }
+                self.notify()
+                return
+            }
+
             // recordConnection sets phase to .initializing
             self.registry.recordConnection(device)
 
@@ -595,6 +627,7 @@ extension DotManager: DotConnectionDelegate {
 
             case .poweredOff, .resetting:
                 print("⚠️ Bluetooth powered OFF/RESET")
+                self.registry.wasRecordingBeforeDisconnect = (self.sessionPhase == .recording)
                 self.cancelAllConnectTimers()
                 self.registry.clearBusyFlags()
                 self.registry.markAllDisconnected()
