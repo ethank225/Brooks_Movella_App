@@ -6,9 +6,3 @@
 //
 
 import Foundation
-
-extension Notification.Name {
-    static let dotConnectionUpdated = Notification.Name("dotConnectionUpdated")
-    static let dotManagerUpdated = Notification.Name("dotManagerUpdated")
-}
-

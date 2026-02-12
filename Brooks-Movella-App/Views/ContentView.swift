@@ -11,8 +11,8 @@ struct ContentView: View {
             
             SyncView()
                 .tabItem {
-                    Image(systemName: "arrow.triangle.2.circlepath")
-                    Text("Sync")
+                    Image(systemName: "record.circle")
+                    Text("Record")
                 }
             
             ExportView()

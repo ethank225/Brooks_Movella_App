@@ -1,7 +1,103 @@
 import Foundation
+import Combine
 import MovellaDotSdk
 
-final class DotManager: NSObject {
+// MARK: - Session Phase
+
+/// Tracks the lifecycle of a recording session.
+///
+/// The UI derives button labels, colors, and disabled states from this single
+/// value. Transitions are linear:
+///
+///     idle ──▶ syncing ──▶ startingRecording ──▶ recording ──▶ stoppingRecording ──▶ idle
+///                │                  │                                  │
+///                ▼                  ▼                                  ▼
+///            error(…)          error(…)                           error(…)
+///
+/// Any `error` state can transition back to `idle` via `dismissError()`,
+/// allowing the user to retry.
+nonisolated enum SessionPhase: Equatable, Sendable {
+    case idle
+    case syncing
+    case startingRecording
+    case recording
+    case stoppingRecording
+    case error(String)
+}
+
+extension SessionPhase {
+
+    /// True while a background operation is in flight and the UI should show a spinner.
+    var isBusy: Bool {
+        switch self {
+        case .syncing, .startingRecording, .stoppingRecording:
+            return true
+        default:
+            return false
+        }
+    }
+
+    var isError: Bool {
+        if case .error = self { return true }
+        return false
+    }
+
+    /// True when the SDK is performing clock synchronization.
+    /// Used by delegate methods to suppress spurious disconnect/reconnect events
+    /// that the SDK fires internally during sync.
+    var isSyncActive: Bool {
+        self == .syncing
+    }
+}
+
+// MARK: - Connection Phase
+
+/// Per-device connection lifecycle, managed by `DotManager` and stored in `DotRegistry`.
+///
+/// Transitions:
+///     idle ──▶ connecting ──▶ initializing ──▶ ready
+///                  │                              │
+///                  ▼                              ▼
+///            failed(…)                     idle (disconnect)
+nonisolated enum ConnectionPhase: Equatable, Sendable {
+    case idle
+    case connecting
+    case initializing
+    case ready
+    case failed(String)
+
+    var isFailed: Bool {
+        if case .failed = self { return true }
+        return false
+    }
+
+    var isBusy: Bool {
+        self == .connecting || self == .initializing
+    }
+
+    var isConnected: Bool {
+        self == .initializing || self == .ready
+    }
+}
+
+// MARK: - DotManager
+
+/// Singleton that owns all app state related to Movella DOT sensors.
+///
+/// Responsibilities:
+///   - Bluetooth scanning and device discovery
+///   - Connection queuing (one at a time to avoid SDK contention)
+///   - Session management (sync → record → stop as a single user action)
+///   - Flash storage operations (erase)
+///
+/// **Threading contract:**
+///   - `stateQueue` (serial) — protects `DotRegistry` mutations and internal flags.
+///   - `sdkQueue`   (serial) — serializes all `MovellaDotSdk` API calls.
+///   - Main thread            — all `@Published` property writes for SwiftUI.
+///
+/// Views observe this object via `@ObservedObject` and read `@Published`
+/// properties; they never touch the registry or queues directly.
+final class DotManager: NSObject, ObservableObject {
 
     // MARK: - Singleton
 
@@ -11,129 +107,102 @@ final class DotManager: NSObject {
         super.init()
     }
 
-    // MARK: - Notification
-
-    enum Notification {
-        static let updated = Foundation.Notification.Name("dotManagerUpdated")
-    }
-
-    // MARK: - Types
-
-    struct DotState {
-        var device: DotDevice
-        var dot: Dot?
-        var lastSeen: Date
-    }
-
     // MARK: - Queues
 
-    /// Serializes DotManager state (byUuid, flags, etc.)
+    /// Guards all `DotRegistry` reads/writes.
     private let stateQueue = DispatchQueue(label: "DotManager.stateQueue")
 
-    /// Serializes all SDK calls (connect, scan, sync, operations)
+    /// Serializes every call into the Movella SDK.
     private let sdkQueue = DispatchQueue(label: "DotManager.sdkQueue")
 
-    // MARK: - State (ONLY touch on stateQueue)
+    // MARK: - Components
 
-    private var byUuid: [String: DotState] = [:]
+    /// Non-thread-safe bookkeeping for all known devices. Access only on `stateQueue`.
+    private let registry = DotRegistry()
 
-    private var connectQueue: [String] = []
-    private var connectInProgress: String?
-    
-    // We treat "initializing" as a busy state to prevent interfering with setup
-    private var initializationInProgress: Set<String> = []
+    /// Triggers Bluetooth scans on `sdkQueue`.
+    private lazy var scanner = DotScanner(sdkQueue: sdkQueue)
 
-    private var syncInProgress: Bool = false
-    private var isScanningInternal: Bool = false
+    /// Runs bulk sequential operations (record, erase, etc.) on `sdkQueue`.
+    private lazy var operations = DotOperationRunner(sdkQueue: sdkQueue)
 
     // MARK: - Lifecycle
 
+    /// Call once at app launch to register as the SDK's connection delegate
+    /// and enable automatic reconnection.
     func activate() {
         DotConnectionManager.setConnectionDelegate(self)
         DotReconnectManager.setEnable(true)
     }
 
-    // MARK: - Thread-safe snapshots for UI
+    // MARK: - Published State (UI-facing)
 
-    var isScanning: Bool {
-        stateQueue.sync { isScanningInternal }
-    }
+    @Published private(set) var isScanning: Bool = false
+    @Published private(set) var discovered: [DotDevice] = []
+    @Published private(set) var dots: [Dot] = []
+    @Published private(set) var connectedDots: [Dot] = []
+    @Published private(set) var sessionPhase: SessionPhase = .idle
+    @Published private(set) var connectionPhases: [String: ConnectionPhase] = [:]
 
-    var discovered: [DotDevice] {
-        stateQueue.sync {
-            byUuid.values
-                .sorted { $0.lastSeen > $1.lastSeen }
-                .map { $0.device }
-        }
-    }
+    /// Per-device connection timeout timers. Managed on the main thread.
+    private var connectTimers: [String: DispatchWorkItem] = [:]
 
-    var dots: [Dot] {
-        stateQueue.sync { byUuid.values.compactMap { $0.dot } }
-    }
-
-    var connectedDots: [Dot] {
-        stateQueue.sync { byUuid.values.compactMap { $0.dot }.filter { $0.isConnected } }
-    }
-
+    /// Thread-safe lookup of a `Dot` model by UUID.
     func dot(forUuid uuid: String) -> Dot? {
-        stateQueue.sync { byUuid[uuid]?.dot }
+        stateQueue.sync { registry.dot(forUuid: uuid) }
     }
 
     // MARK: - Scanning
 
+    /// Begin Bluetooth discovery. Ignored if a scan is already running.
     func startScan() {
         stateQueue.async {
-            if self.isScanningInternal { return }
+            if self.registry.isScanningInternal { return }
 
-            self.sdkQueue.async {
-                guard DotConnectionManager.managerStateIsPoweredOn() else {
-                    print("❌ Bluetooth not powered on")
-                    return
-                }
-
-                self.stateQueue.async {
-                    if self.isScanningInternal { return }
-                    self.isScanningInternal = true
+            self.scanner.scan { [weak self] in
+                self?.stateQueue.async {
+                    guard let self, !self.registry.isScanningInternal else { return }
+                    self.registry.isScanningInternal = true
                     print("🔍 Scan started")
                     self.notify()
                 }
-                DotConnectionManager.scan()
             }
         }
     }
 
     func stopScan() {
         stateQueue.async {
-            if !self.isScanningInternal { return }
-            self.isScanningInternal = false
+            if !self.registry.isScanningInternal { return }
+            self.registry.isScanningInternal = false
             print("🔍 Scan stopped")
             self.notify()
 
-            self.sdkQueue.async {
-                DotConnectionManager.stopScan()
-            }
+            self.scanner.stopScan()
         }
     }
 
     // MARK: - Connection
 
+    /// Queue a device for connection by UUID. Starts scanning if needed.
+    /// Duplicate requests for the same UUID are ignored.
     func connectByUuid(_ uuid: String) {
         let u = uuid.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !u.isEmpty else { return }
 
         stateQueue.async {
-            if self.connectQueue.contains(u) || self.connectInProgress == u { return }
-            self.connectQueue.append(u)
-            
-            // Start scanning to find it if we haven't yet
+            if self.registry.connectQueue.contains(u) || self.registry.connectInProgress == u { return }
+            self.registry.connectQueue.append(u)
+            self.registry.setConnectionPhase(u, .connecting)
+
             self.startScan()
-            
-            // Attempt connection
-            self.processConnectQueue_locked()
+            self.startConnectTimer(u)
+
+            self.processConnectQueue()
             self.notify()
         }
     }
 
+    /// Unbind and disconnect a connected device.
     func disconnect(_ dot: Dot) {
         sdkQueue.async {
             DotDevicePool.unbindDevice(dot.device)
@@ -141,354 +210,338 @@ final class DotManager: NSObject {
         }
     }
 
-    // MARK: - Sync
-
-    func syncConnectedDots(completion: @escaping (Bool) -> Void) {
+    /// Remove a UUID from the connect queue (e.g. after a connection timeout).
+    /// If the UUID is currently mid-connect, advances to the next queued device.
+    func cancelConnect(uuid: String) {
         stateQueue.async {
-            if self.syncInProgress || !self.initializationInProgress.isEmpty {
-                print("⚠️ Cannot sync: busy initializing or syncing")
-                DispatchQueue.main.async { completion(false) }
-                return
+            self.registry.connectQueue.removeAll { $0 == uuid }
+            self.registry.setConnectionPhase(uuid, .failed("Connection timed out"))
+            if self.registry.connectInProgress == uuid {
+                self.registry.advanceConnectQueue()
+                self.processConnectQueue()
             }
-            
-            // 1. Gather devices
-            let dotsSnapshot = self.byUuid.values.compactMap { $0.dot }.filter { $0.isConnected }
-            let devices = dotsSnapshot.map { $0.device }
-
-            guard devices.count >= 2 else {
-                print("⚠️ Need at least 2 connected dots to sync")
-                DispatchQueue.main.async { completion(false) }
-                return
-            }
-
-            self.syncInProgress = true
-            print("🔄 Starting sync with \(devices.count) devices...")
             self.notify()
-
-            // 2. Run on SDK Queue
-            self.sdkQueue.async { [weak self] in
-                guard let self else { return }
-
-                DotSyncManager.startSync(devices) { results in
-                    self.stateQueue.async {
-                        self.syncInProgress = false
-                        
-                        guard let results = results as? [[String: Any]] else {
-                            print("❌ Sync failed - no results")
-                            dotsSnapshot.forEach { $0.setSessionSynced(false) }
-                            self.notify()
-                            DispatchQueue.main.async { completion(false) }
-                            return
-                        }
-
-                        var allSuccess = true
-                        for result in results {
-                            let success = result["success"] as? Bool ?? false
-                            if !success { allSuccess = false }
-                        }
-
-                        dotsSnapshot.forEach { $0.setSessionSynced(allSuccess) }
-                        print(allSuccess ? "✅ Sync completed" : "❌ Sync failed")
-                        
-                        // Refresh storage for everyone after sync
-                        self.queueStorageRefresh_locked(dots: dotsSnapshot)
-                        
-                        self.notify()
-                        DispatchQueue.main.async { completion(allSuccess) }
-                    }
-                }
-            }
         }
     }
 
-    func stopSync() {
+    // MARK: - Session (Unified Sync + Record)
+
+    /// Start a recording session.
+    ///
+    /// If two or more sensors are connected, clocks are synchronized first to
+    /// align multi-sensor data. With a single sensor, recording starts immediately.
+    ///
+    /// Flow: `idle` → `syncing` → `startingRecording` → `recording`
+    func beginSession() {
         stateQueue.async {
-            let dotsSnapshot = self.byUuid.values.compactMap { $0.dot }.filter { $0.isConnected }
-            let devices = dotsSnapshot.map { $0.device }
-            
-            dotsSnapshot.forEach { $0.setSessionSynced(false) }
-            self.syncInProgress = false
-            self.notify()
+            guard self.sessionPhase == .idle || self.sessionPhase.isError else { return }
 
-            self.sdkQueue.async {
-                DotSyncManager.stopSync(devices)
-            }
-        }
-    }
-
-    // MARK: - Operations (Recording / Flash)
-    
-    func startRecordingAll(completion: @escaping (Bool) -> Void) {
-        stateQueue.async {
-            if self.syncInProgress {
-                DispatchQueue.main.async { completion(false) }
-                return
-            }
-            let dotsSnapshot = self.byUuid.values.compactMap { $0.dot }.filter { $0.isConnected }
-            
-            self.sdkQueue.async {
-                self.executeSequentially(items: dotsSnapshot) { dot, done in
-                    dot.startRecording(seconds: 0xFFFF, completion: done)
-                } completion: { ok in
-                    DispatchQueue.main.async { completion(ok) }
-                }
-            }
-        }
-    }
-
-    func stopRecordingAll(completion: @escaping (Bool) -> Void) {
-        stateQueue.async {
-            if self.syncInProgress {
-                DispatchQueue.main.async { completion(false) }
-                return
-            }
-            let dotsSnapshot = self.byUuid.values.compactMap { $0.dot }.filter { $0.isConnected }
-            
-            self.sdkQueue.async {
-                self.executeSequentially(items: dotsSnapshot) { dot, done in
-                    dot.stopRecording(completion: done)
-                } completion: { ok in
-                    DispatchQueue.main.async { completion(ok) }
-                }
-            }
-        }
-    }
-    
-    func eraseAllFlash(completion: @escaping (Bool) -> Void) {
-        stateQueue.async {
-            if self.syncInProgress {
-                DispatchQueue.main.async { completion(false) }
-                return
-            }
-            let dotsSnapshot = self.byUuid.values.compactMap { $0.dot }.filter { $0.isConnected }
-            
-            self.sdkQueue.async {
-                self.executeSequentially(items: dotsSnapshot) { dot, done in
-                    dot.eraseFlash(completion: done)
-                } completion: { ok in
-                    DispatchQueue.main.async { completion(ok) }
-                }
-            }
-        }
-    }
-    
-    // MARK: - Storage Refresh Queueing
-    
-    /// Recursively fetches flash info until the value remains constant between checks.
-    /// Checks `isInitialized` on the background thread before asking for storage
-    // MARK: - Storage Refresh Queueing (Snapshot Version)
-        
-        private func queueStorageRefresh_locked(dots: [Dot]) {
+            let dots = self.registry.connectedDots
             guard !dots.isEmpty else { return }
 
-            print("💾 Queueing storage refresh for \(dots.count) dots")
-
-            self.sdkQueue.async { [weak self] in
-                guard let self = self else { return }
-
-                self.executeSequentially(items: dots) { dot, done in
-                    self.waitForInitialization(dot: dot, timeout: 5.0) { ready in
-                        let uuid = dot.device.uuid
-
-                        if !ready {
-                            print("⚠️ [\(dot.address)] Not initialized, skipping storage refresh")
-                            self.stateQueue.async {
-                                self.initializationInProgress.remove(uuid)
-                                self.notify()
-                            }
-                            done(false)
-                            return
-                        }
-
-                        // 🚀 ONE-SHOT REFRESH
-                        // The Dot object captures its own snapshot inside getFlashInfo.
-                        dot.getFlashInfo { _ in
-                            self.stateQueue.async {
-                                self.initializationInProgress.remove(uuid)
-                                self.notify()
-                                done(true)
-                            }
-                        }
+            if dots.count >= 2 {
+                self.setPhase(.syncing)
+                self.performSync(dots: dots) { [weak self] success in
+                    guard let self else { return }
+                    if success {
+                        self.performStartRecording(dots: dots)
+                    } else {
+                        self.setPhase(.error("Sync failed. Please try again."))
                     }
-                } completion: { _ in
-                    print("💾 Storage refresh queue finished")
+                }
+            } else {
+                self.performStartRecording(dots: dots)
+            }
+        }
+    }
+
+    /// Stop the active recording session.
+    ///
+    /// Flow: `recording` → `stoppingRecording` → `idle`
+    func endSession() {
+        stateQueue.async {
+            guard self.sessionPhase == .recording else { return }
+
+            let dots = self.registry.connectedDots
+            self.setPhase(.stoppingRecording)
+
+            self.operations.runAll(
+                dots: dots,
+                operation: { dot, done in dot.stopRecording(completion: done) }
+            ) { [weak self] success in
+                guard let self else { return }
+                self.stateQueue.async {
+                    if success {
+                        self.setPhase(.idle)
+                    } else {
+                        self.setPhase(.error("Failed to stop recording. Please try again."))
+                    }
                 }
             }
         }
-
-    
-    /// Blocks the SDK queue (sleeps) briefly while waiting for a single dot to initialize.
-    /// Safe because we are on a background serial queue.
-    private func waitForInitialization(dot: Dot, timeout: TimeInterval, completion: @escaping (Bool) -> Void) {
-        let start = Date()
-        
-        func check() {
-            if dot.isInitialized {
-                completion(true)
-                return
-            }
-            
-            if Date().timeIntervalSince(start) > timeout {
-                completion(false)
-                return
-            }
-            
-            // Sleep briefly on sdkQueue to let the SDK work on other threads
-            Thread.sleep(forTimeInterval: 0.2)
-            check()
-        }
-        
-        check()
     }
 
-    // MARK: - Connection Queue Processing (LOCKED)
-
-    private func processConnectQueue_locked() {
-        guard connectInProgress == nil else { return }
-        guard !syncInProgress else { return }
-
-        guard let index = connectQueue.firstIndex(where: { byUuid[$0] != nil }) else { return }
-        let uuid = connectQueue.remove(at: index)
-        guard let state = byUuid[uuid] else { return }
-
-        connectInProgress = uuid
-        print("🔗 Connecting to \(displayAddress(for: state.device))")
-
-        sdkQueue.async {
-            DotConnectionManager.connect(state.device)
+    /// Clear an error state, returning to `idle` so the user can retry.
+    func dismissError() {
+        stateQueue.async {
+            if self.sessionPhase.isError {
+                self.setPhase(.idle)
+            }
         }
     }
 
-    private func advanceConnectQueue_locked() {
-        connectInProgress = nil
-        processConnectQueue_locked()
+    /// Restore the `recording` phase after an app relaunch.
+    ///
+    /// Called from `SyncView.onAppear` when the manager is `idle` but one or
+    /// more dots report `isRecording == true` (the sensors kept recording while
+    /// the app was killed).
+    func resumeRecordingSession() {
+        stateQueue.async {
+            if self.sessionPhase == .idle {
+                self.setPhase(.recording)
+            }
+        }
+    }
+
+    // MARK: - Session Helpers
+
+    /// Single writer for `sessionPhase`. Must be called on `stateQueue`.
+    ///
+    /// Also keeps `registry.syncInProgress` in lockstep — the registry flag is
+    /// read by `dequeueNextConnection` to block new connections during sync, and
+    /// is cheaper to check than dispatching to main for the published property.
+    private func setPhase(_ phase: SessionPhase) {
+        registry.syncInProgress = phase.isSyncActive
+        DispatchQueue.main.async {
+            self.sessionPhase = phase
+        }
+        notify()
+    }
+
+    /// Synchronize sensor clocks via `DotSyncManager`. Must be called on `stateQueue`.
+    ///
+    /// The SDK internally disconnects and reconnects each device during sync;
+    /// delegate methods suppress those events when `isSyncActive` is true.
+    /// Completion is dispatched back to `stateQueue`.
+    private func performSync(dots: [Dot], completion: @escaping (Bool) -> Void) {
+        let devices = dots.map { $0.device }
+        print("🔄 Starting sync with \(devices.count) devices...")
+
+        sdkQueue.async { [weak self] in
+            guard let self else { return }
+
+            DotSyncManager.startSync(devices) { results in
+                self.stateQueue.async {
+                    guard let results = results as? [[String: Any]] else {
+                        print("❌ Sync failed - no results")
+                        dots.forEach { $0.setSessionSynced(false) }
+                        completion(false)
+                        return
+                    }
+
+                    let allSuccess = results.allSatisfy { ($0["success"] as? Bool) ?? false }
+                    dots.forEach { $0.setSessionSynced(allSuccess) }
+                    print(allSuccess ? "✅ Sync completed" : "❌ Sync failed")
+
+                    self.refreshStorage(dots: dots)
+                    completion(allSuccess)
+                }
+            }
+        }
+    }
+
+    /// Issue start-recording to each dot sequentially. Must be called on `stateQueue`.
+    /// `0xFFFF` tells the sensor to record indefinitely until explicitly stopped.
+    private func performStartRecording(dots: [Dot]) {
+        setPhase(.startingRecording)
+
+        operations.runAll(
+            dots: dots,
+            operation: { dot, done in dot.startRecording(seconds: 0xFFFF, completion: done) }
+        ) { [weak self] success in
+            guard let self else { return }
+            self.stateQueue.async {
+                if success {
+                    self.setPhase(.recording)
+                } else {
+                    self.setPhase(.error("Recording failed to start. Please try again."))
+                }
+            }
+        }
+    }
+
+    // MARK: - Flash Storage
+
+    /// Erase recorded data on every connected sensor. Only allowed when idle.
+    func eraseAllFlash(completion: @escaping (Bool) -> Void) {
+        stateQueue.async {
+            guard self.sessionPhase == .idle else {
+                DispatchQueue.main.async { completion(false) }
+                return
+            }
+            let dotsSnapshot = self.registry.connectedDots
+
+            self.operations.runAll(
+                dots: dotsSnapshot,
+                operation: { dot, done in dot.eraseFlash(completion: done) },
+                completion: completion
+            )
+        }
     }
 
     // MARK: - Internal Helpers
-    
-    private func executeSequentially<T>(
-        items: [T],
-        operation: @escaping (T, @escaping (Bool) -> Void) -> Void,
-        completion: @escaping (Bool) -> Void
-    ) {
-        var index = 0
-        var allSuccess = true
 
-        func next() {
-            guard index < items.count else {
-                completion(allSuccess)
-                return
-            }
-            let item = items[index]
-            operation(item) { success in
-                if !success { allSuccess = false }
-                index += 1
-                next()
-            }
+    /// Dequeue the next device and issue a connect call. Must be called on `stateQueue`.
+    private func processConnectQueue() {
+        guard let device = registry.dequeueNextConnection() else { return }
+        print("🔗 Connecting to \(displayAddress(for: device))")
+
+        sdkQueue.async {
+            DotConnectionManager.connect(device)
         }
-        next()
-    }
-    
-    private func recordDiscovery_locked(_ device: DotDevice) {
-        let uuid = device.uuid
-        var state = byUuid[uuid] ?? DotState(device: device, dot: nil, lastSeen: Date())
-        state.device = device
-        state.lastSeen = Date()
-        byUuid[uuid] = state
     }
 
-    private func recordConnection_locked(_ device: DotDevice) {
-        let uuid = device.uuid
-        var state = byUuid[uuid] ?? DotState(device: device, dot: nil, lastSeen: Date())
-        state.device = device
-        
-        if let dot = state.dot {
-            dot.updateDevice(device)
-            dot.setIsConnected(true)
-        } else {
-            let dot = Dot(device: device)
-            dot.setIsConnected(true)
-            state.dot = dot
-        }
-        byUuid[uuid] = state
-        
-        // Mark as initializing
-        initializationInProgress.insert(uuid)
+    /// Fetch flash usage for each dot after sync or connection. Must be called on `stateQueue`.
+    private func refreshStorage(dots: [Dot]) {
+        operations.refreshStorage(dots: dots) { [weak self] dot, _ in
+            self?.stateQueue.async {
+                let uuid = dot.device.uuid
+                self?.registry.initializationInProgress.remove(uuid)
+                self?.registry.setConnectionPhase(uuid, .ready)
+                self?.notify()
+            }
+        } completion: {}
     }
-    
-    private func recordDisconnection_locked(_ uuid: String) {
-        byUuid[uuid]?.dot?.setIsConnected(false)
-        initializationInProgress.remove(uuid)
-    }
-    
+
+    /// Snapshot registry state and push it to `@Published` properties on the main thread.
+    /// Must be called on `stateQueue`.
     private func notify() {
+        let scanning = registry.isScanningInternal
+        let disc = registry.discovered
+        let all = registry.dots
+        let connected = registry.connectedDots
+        let phases = registry.connectionPhases
+
         DispatchQueue.main.async {
-            NotificationCenter.default.post(name: Notification.updated, object: nil)
+            self.isScanning = scanning
+            self.discovered = disc
+            self.dots = all
+            self.connectedDots = connected
+            self.connectionPhases = phases
         }
     }
-    
+
+    // MARK: - Connect Timers
+
+    /// Start a 10-second timeout for a connection attempt.
+    /// If the timer fires, marks the device as failed and cancels the connect.
+    /// Safe to call from any thread — dispatches to main for timer scheduling.
+    private func startConnectTimer(_ uuid: String) {
+        cancelConnectTimer(uuid)
+
+        let work = DispatchWorkItem { [weak self] in
+            self?.cancelConnect(uuid: uuid)
+        }
+        DispatchQueue.main.async {
+            self.connectTimers[uuid] = work
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10, execute: work)
+    }
+
+    /// Cancel a pending connect timer for a specific UUID.
+    /// Safe to call from any thread.
+    private func cancelConnectTimer(_ uuid: String) {
+        DispatchQueue.main.async {
+            self.connectTimers[uuid]?.cancel()
+            self.connectTimers.removeValue(forKey: uuid)
+        }
+    }
+
+    /// Cancel all pending connect timers (e.g. on Bluetooth power-off).
+    private func cancelAllConnectTimers() {
+        DispatchQueue.main.async {
+            for (_, work) in self.connectTimers { work.cancel() }
+            self.connectTimers.removeAll()
+        }
+    }
+
     // MARK: - Debug
-    
+
     func printStatus() {
         stateQueue.sync {
             print("--- DotManager Status ---")
-            print("Dots: \(byUuid.count) | Connected: \(connectedDots.count)")
-            print("Connect Queue: \(connectQueue.count)")
-            print("Init Queue: \(initializationInProgress)")
+            print("Dots: \(registry.byUuid.count) | Connected: \(registry.connectedDots.count)")
+            print("Connect Queue: \(registry.connectQueue.count)")
+            print("Init Queue: \(registry.initializationInProgress)")
         }
     }
-    
+
+    /// Prefer MAC address for display; fall back to UUID.
     func displayAddress(for device: DotDevice) -> String {
         !device.macAddress.isEmpty ? device.macAddress : device.uuid
     }
 }
 
-// MARK: - SDK Delegate
+// MARK: - DotConnectionDelegate (SDK Callbacks)
 
+/// All callbacks fire on an arbitrary SDK thread. Each one hops onto
+/// `stateQueue` immediately to safely mutate the registry, then calls
+/// `notify()` to push changes to the UI.
 extension DotManager: DotConnectionDelegate {
 
     func onDiscover(_ device: DotDevice) {
         guard !device.uuid.isEmpty else { return }
         stateQueue.async {
-            self.recordDiscovery_locked(device)
-            self.processConnectQueue_locked()
+            self.registry.recordDiscovery(device)
+            self.processConnectQueue()
             self.notify()
         }
     }
 
     func onScanCompleted() {
         stateQueue.async {
-            self.isScanningInternal = false
+            self.registry.isScanningInternal = false
             print("🔍 Scan completed")
             self.notify()
-            if !self.connectQueue.isEmpty { self.startScan() }
+
+            // If devices are still waiting to connect, kick off another scan.
+            if !self.registry.connectQueue.isEmpty { self.startScan() }
         }
     }
 
     func onDeviceConnectSucceeded(_ device: DotDevice) {
         stateQueue.async {
             guard !device.uuid.isEmpty else {
-                self.advanceConnectQueue_locked()
+                self.registry.advanceConnectQueue()
+                self.processConnectQueue()
                 return
             }
 
-            self.recordConnection_locked(device)
-            
-            // 1. Bind immediately on SDK queue
+            self.cancelConnectTimer(device.uuid)
+
+            // During sync the SDK internally reconnects each sensor.
+            // Update the device reference but skip the full initialization
+            // path — the dots were never shown as disconnected to the user.
+            if self.sessionPhase.isSyncActive {
+                self.registry.recordReconnection(device)
+                return
+            }
+
+            // recordConnection sets phase to .initializing
+            self.registry.recordConnection(device)
+
             self.sdkQueue.async {
                 DotDevicePool.bindDevice(device)
             }
-            
-            // 2. Queue the "Initialize & Refresh" task on SDK queue
-            //    This replaces the old "wait loop".
-            if let dot = self.byUuid[device.uuid]?.dot {
+
+            if let dot = self.registry.dot(forUuid: device.uuid) {
                 print("⏳ [\(device.uuid)] Queuing initialization & storage refresh...")
-                
-                self.queueStorageRefresh_locked(dots: [dot])
-                
-                // Once that block is submitted to sdkQueue, we can move on to connecting the next device
-                // The refresh will happen in the background when this device is ready.
-                self.advanceConnectQueue_locked()
+
+                // refreshStorage will set phase to .ready on completion
+                self.refreshStorage(dots: [dot])
+
+                self.registry.advanceConnectQueue()
+                self.processConnectQueue()
                 self.notify()
             }
         }
@@ -497,7 +550,12 @@ extension DotManager: DotConnectionDelegate {
     func onDeviceConnectFailed(_ device: DotDevice) {
         print("❌ Connect failed: \(device.uuid)")
         stateQueue.async {
-            self.advanceConnectQueue_locked()
+            // During sync the SDK manages connections itself — don't interfere.
+            if self.sessionPhase.isSyncActive { return }
+            self.cancelConnectTimer(device.uuid)
+            self.registry.setConnectionPhase(device.uuid, .failed("Connection failed"))
+            self.registry.advanceConnectQueue()
+            self.processConnectQueue()
             self.notify()
         }
     }
@@ -506,55 +564,48 @@ extension DotManager: DotConnectionDelegate {
         guard !device.uuid.isEmpty else { return }
         print("⛓️‍💥 Disconnected: \(device.uuid)")
         stateQueue.async {
-            self.recordDisconnection_locked(device.uuid)
+            if self.sessionPhase.isSyncActive {
+                // SDK-managed disconnect during sync — ignore entirely.
+                // The dots remain visually "connected" throughout the sync process.
+                return
+            }
+            self.registry.recordDisconnection(device.uuid)
             self.notify()
         }
     }
-    
+
     func onManagerStateUpdate(_ managerState: XSDotManagerState) {
-            stateQueue.async {
-                switch managerState {
-                case .poweredOn:
-                    print("✅ Bluetooth powered ON")
-                    
-                    // RESTORE STATE:
-                    // If we have devices we want to connect to (queue is not empty),
-                    // we must restart scanning immediately to find them again.
-                    //
-                    // Note: We check !connectQueue.isEmpty. If the user never asked to connect
-                    // to anything, we stay idle to save battery.
-                    if !self.connectQueue.isEmpty {
-                        print("🔄 Resuming connection logic for \(self.connectQueue.count) pending devices...")
-                        
-                        // Force the internal flag to false so startScan() doesn't early-exit
-                        self.isScanningInternal = false
-                        self.startScan()
+        stateQueue.async {
+            switch managerState {
+            case .poweredOn:
+                print("✅ Bluetooth powered ON")
+
+                // Re-queue all previously connected devices for auto-reconnect.
+                for uuid in self.registry.previouslyConnectedUuids {
+                    if !self.registry.connectQueue.contains(uuid) {
+                        self.registry.connectQueue.append(uuid)
                     }
-
-                case .poweredOff, .resetting:
-                    print("⚠️ Bluetooth powered OFF/RESET")
-                    
-                    // 1. CLEAR BUSY FLAGS (But keep the connectQueue!)
-                    // We stop "doing" things, but we remember what we *want* to do.
-                    self.isScanningInternal = false
-                    self.connectInProgress = nil
-                    self.initializationInProgress.removeAll()
-                    self.syncInProgress = false
-
-                    // 2. UPDATE UI
-                    // Mark everyone as disconnected so the UI reflects reality immediately.
-                    // We do NOT remove them from 'byUuid' or 'dots', preserving the list.
-                    for state in self.byUuid.values {
-                        state.dot?.setIsConnected(false)
-                    }
-                    self.notify()
-
-                case .unauthorized, .unsupported:
-                     print("❌ Bluetooth Error: \(managerState.rawValue)")
-                    
-                @unknown default:
-                    break
                 }
+
+                if !self.registry.connectQueue.isEmpty {
+                    print("🔄 Resuming connection logic for \(self.registry.connectQueue.count) pending devices...")
+                    self.registry.isScanningInternal = false
+                    self.startScan()
+                }
+
+            case .poweredOff, .resetting:
+                print("⚠️ Bluetooth powered OFF/RESET")
+                self.cancelAllConnectTimers()
+                self.registry.clearBusyFlags()
+                self.registry.markAllDisconnected()
+                self.setPhase(.error("Bluetooth disconnected."))
+
+            case .unauthorized, .unsupported:
+                print("❌ Bluetooth Error: \(managerState.rawValue)")
+
+            @unknown default:
+                break
             }
         }
+    }
 }
