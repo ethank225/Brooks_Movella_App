@@ -213,10 +213,17 @@ final class DotManager: NSObject, ObservableObject {
     }
 
     /// Unbind and disconnect a connected device.
+    /// Refused if a sync is in progress to prevent corrupting `DotSyncManager` state.
     func disconnect(_ dot: Dot) {
-        sdkQueue.async {
-            DotDevicePool.unbindDevice(dot.device)
-            DotConnectionManager.disconnect(dot.device)
+        stateQueue.async {
+            guard !self.sessionPhase.isSyncActive else {
+                print("⚠️ Disconnect refused — sync in progress")
+                return
+            }
+            self.sdkQueue.async {
+                DotDevicePool.unbindDevice(dot.device)
+                DotConnectionManager.disconnect(dot.device)
+            }
         }
     }
 
@@ -254,13 +261,14 @@ final class DotManager: NSObject, ObservableObject {
             guard !dots.isEmpty else { return }
 
             if dots.count >= 2 {
+                self.registry.syncingUuids = Set(dots.map { $0.device.uuid })
                 self.setPhase(.syncing)
-                self.performSync(dots: dots) { [weak self] success in
+                self.performSync(dots: dots) { [weak self] success, errorMsg in
                     guard let self else { return }
                     if success {
                         self.performStartRecording(dots: dots)
                     } else {
-                        self.setPhase(.error("Sync failed. Please try again."))
+                        self.setPhase(.error(errorMsg ?? "Sync failed. Please try again."))
                     }
                 }
             } else {
@@ -326,6 +334,9 @@ final class DotManager: NSObject, ObservableObject {
     /// is cheaper to check than dispatching to main for the published property.
     private func setPhase(_ phase: SessionPhase) {
         registry.syncInProgress = phase.isSyncActive
+        if !phase.isSyncActive {
+            registry.syncingUuids.removeAll()
+        }
         DispatchQueue.main.async {
             self.sessionPhase = phase
         }
@@ -337,7 +348,9 @@ final class DotManager: NSObject, ObservableObject {
     /// The SDK internally disconnects and reconnects each device during sync;
     /// delegate methods suppress those events when `isSyncActive` is true.
     /// Completion is dispatched back to `stateQueue`.
-    private func performSync(dots: [Dot], completion: @escaping (Bool) -> Void) {
+    private func performSync(dots: [Dot], completion: @escaping (Bool, String?) -> Void) {
+        // Snapshot device references now (on stateQueue) before sync mutates anything.
+        // The registry freezes these references while syncInProgress is true.
         let devices = dots.map { $0.device }
         print("🔄 Starting sync with \(devices.count) devices...")
 
@@ -353,16 +366,36 @@ final class DotManager: NSObject, ObservableObject {
                     guard let results = results as? [[String: Any]] else {
                         print("❌ Sync failed - no results")
                         dots.forEach { $0.setSessionSynced(false) }
-                        completion(false)
+                        completion(false, "Sync failed — no results from SDK.")
                         return
+                    }
+
+                    for result in results {
+                        let addr = (result["address"] as? String) ?? "?"
+                        let status = (result["status"] as? Int) ?? -1
+                        let success = (result["success"] as? Bool) ?? false
+                        let done = (result["doneSuccess"] as? Int) ?? -1
+                        print("🔄 [SYNC RESULT] \(addr): status=\(status) success=\(success) doneSuccess=\(done)")
                     }
 
                     let allSuccess = results.allSatisfy { ($0["success"] as? Bool) ?? false }
                     dots.forEach { $0.setSessionSynced(allSuccess) }
-                    print(allSuccess ? "✅ Sync completed" : "❌ Sync failed")
+
+                    if allSuccess {
+                        print("✅ Sync completed")
+                    } else {
+                        let failCount = results.filter { !(($0["success"] as? Bool) ?? false) }.count
+                        print("❌ Sync failed — \(failCount) of \(results.count) devices")
+                    }
 
                     self.refreshStorage(dots: dots)
-                    completion(allSuccess)
+
+                    if allSuccess {
+                        completion(true, nil)
+                    } else {
+                        let failCount = results.filter { !(($0["success"] as? Bool) ?? false) }.count
+                        completion(false, "\(failCount) of \(results.count) sensors failed to sync. Please try again.")
+                    }
                 }
             }
         }

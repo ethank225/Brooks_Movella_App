@@ -27,6 +27,7 @@ final class DotRegistry {
 
     var initializationInProgress: Set<String> = []
     var syncInProgress: Bool = false
+    var syncingUuids: Set<String> = []
     var isScanningInternal: Bool = false
     var wasRecordingBeforeDisconnect: Bool = false
 
@@ -65,7 +66,9 @@ final class DotRegistry {
     func recordDiscovery(_ device: DotDevice) {
         let uuid = device.uuid
         var state = byUuid[uuid] ?? DotState(device: device, dot: nil, lastSeen: Date())
-        state.device = device
+        if !syncingUuids.contains(uuid) {
+            state.device = device
+        }
         state.lastSeen = Date()
         byUuid[uuid] = state
     }
@@ -87,13 +90,20 @@ final class DotRegistry {
 
     /// Lightweight update for SDK-managed reconnections (e.g. during sync).
     /// Updates device reference but does NOT change the connection phase.
+    /// When sync is in progress, freezes existing device references so
+    /// `DotSyncManager` keeps working with the originals it was given.
     func recordReconnection(_ device: DotDevice) {
         let uuid = device.uuid
         guard var state = byUuid[uuid] else { return }
-        state.device = device
-        if let dot = state.dot {
-            dot.updateDevice(device)
+        if syncingUuids.contains(uuid) {
+            print("🧊 Freeze active for \(uuid), ignoring device ref update")
+        } else {
+            state.device = device
+            if let dot = state.dot {
+                dot.updateDevice(device)
+            }
         }
+        state.lastSeen = Date()
         byUuid[uuid] = state
     }
 
@@ -132,6 +142,7 @@ final class DotRegistry {
         connectInProgress = nil
         initializationInProgress.removeAll()
         syncInProgress = false
+        syncingUuids.removeAll()
         // Note: wasRecordingBeforeDisconnect is intentionally NOT cleared here
         // so it survives the BT power cycle.
     }
