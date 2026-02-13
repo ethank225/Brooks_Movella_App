@@ -148,14 +148,16 @@ struct SyncView: View {
 
     // MARK: - Button State
 
+    private var noSensors: Bool { manager.connectedDots.isEmpty }
+
     private var primaryButtonTitle: String {
         switch phase {
-        case .idle:                return "Start Recording"
+        case .idle:                return noSensors ? "No Sensors Connected" : "Start Recording"
         case .syncing:             return "Syncing Sensors..."
         case .startingRecording:   return "Starting..."
-        case .recording:           return "Stop Recording"
+        case .recording:           return noSensors ? "Sensors Disconnected" : "Stop Recording"
         case .stoppingRecording:   return "Stopping..."
-        case .error:               return "Start Recording"
+        case .error:               return noSensors ? "No Sensors Connected" : "Start Recording"
         }
     }
 
@@ -168,9 +170,9 @@ struct SyncView: View {
 
     private var primaryButtonColor: Color {
         switch phase {
-        case .idle:                return .green
-        case .recording:           return .red
-        case .error:               return .green
+        case .idle:                return noSensors ? .gray : .green
+        case .recording:           return noSensors ? .gray : .red
+        case .error:               return noSensors ? .gray : .green
         default:                   return .gray
         }
     }
@@ -189,7 +191,7 @@ struct SyncView: View {
         case .idle:                        return nil
         case .syncing:                     return "Synchronizing sensor clocks..."
         case .startingRecording:           return "Starting recording on all sensors..."
-        case .recording:                   return "Recording in progress"
+        case .recording:                   return noSensors ? "All sensors disconnected" : "Recording in progress"
         case .stoppingRecording:           return "Stopping recording..."
         case .error:                       return nil // shown in error banner instead
         }
@@ -197,7 +199,7 @@ struct SyncView: View {
 
     private var phaseColor: Color {
         switch phase {
-        case .recording:   return .red
+        case .recording:   return noSensors ? .orange : .red
         case .error:       return .orange
         default:           return .blue
         }
@@ -231,7 +233,7 @@ struct SyncView: View {
 
 // MARK: - Section Card
 
-private struct SectionCard<Content: View>: View {
+struct SectionCard<Content: View>: View {
     let title: String
     let icon: String
     @ViewBuilder let content: Content
@@ -256,6 +258,8 @@ private struct SectionCard<Content: View>: View {
 struct DotStatusRow: View {
     @ObservedObject var dot: Dot
     var sessionPhase: SessionPhase = .idle
+
+    @State private var breathe = false
 
     var body: some View {
         HStack {
@@ -308,22 +312,33 @@ struct DotStatusRow: View {
             Spacer()
         }
         .padding()
-        .background(rowBackground)
+        .background(rowBackgroundView)
         .cornerRadius(10)
         .animation(.easeInOut(duration: 0.3), value: sessionPhase)
+        .onChange(of: sessionPhase) { newPhase in
+            if newPhase != .recording {
+                breathe = false
+            }
+        }
     }
 
-    private var rowBackground: Color {
-        if dot.isErasing {
-            return Color.pink.opacity(0.1)
+    @ViewBuilder
+    private var rowBackgroundView: some View {
+        if sessionPhase == .recording {
+            Color.red
+                .opacity(breathe ? 0.25 : 0.06)
+                .onAppear {
+                    withAnimation(.easeInOut(duration: 1.2).repeatForever(autoreverses: true)) {
+                        breathe = true
+                    }
+                }
+        } else if dot.isErasing {
+            Color.pink.opacity(0.1)
+        } else if sessionPhase.isSyncActive {
+            Color.blue.opacity(0.08)
+        } else {
+            Color.gray.opacity(0.1)
         }
-        if sessionPhase.isSyncActive {
-            return Color.blue.opacity(0.08)
-        }
-        if dot.isRecording {
-            return Color.red.opacity(0.06)
-        }
-        return Color.gray.opacity(0.1)
     }
 
     private func storageColor(for percentage: Double) -> Color {
