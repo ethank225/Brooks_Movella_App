@@ -5,11 +5,16 @@ import MovellaDotSdk
 /// DotManager guards every access with `stateQueue`.
 final class DotRegistry {
 
+    let sdkQueue: DispatchQueue
+
+    init(sdkQueue: DispatchQueue) {
+        self.sdkQueue = sdkQueue
+    }
+
     struct DotState {
         var device: DotDevice
         var dot: Dot?
         var lastSeen: Date
-        var isConnected: Bool = false
         var connectionPhase: ConnectionPhase = .idle
     }
 
@@ -22,7 +27,9 @@ final class DotRegistry {
 
     var initializationInProgress: Set<String> = []
     var syncInProgress: Bool = false
+    var syncingUuids: Set<String> = []
     var isScanningInternal: Bool = false
+    var wasRecordingBeforeDisconnect: Bool = false
 
     // MARK: - Snapshots
 
@@ -37,7 +44,7 @@ final class DotRegistry {
     }
 
     var connectedDots: [Dot] {
-        byUuid.values.filter { $0.isConnected }.compactMap { $0.dot }
+        byUuid.values.filter { $0.connectionPhase.isConnected }.compactMap { $0.dot }
     }
 
     func dot(forUuid uuid: String) -> Dot? {
@@ -49,13 +56,9 @@ final class DotRegistry {
         byUuid.compactMap { $0.value.dot != nil ? $0.key : nil }
     }
 
-    /// Snapshot of connection phases for all known devices.
-    var connectionPhases: [String: ConnectionPhase] {
-        byUuid.mapValues { $0.connectionPhase }
-    }
-
     func setConnectionPhase(_ uuid: String, _ phase: ConnectionPhase) {
         byUuid[uuid]?.connectionPhase = phase
+        byUuid[uuid]?.dot?.setConnectionPhase(phase)
     }
 
     // MARK: - Mutations
@@ -63,7 +66,9 @@ final class DotRegistry {
     func recordDiscovery(_ device: DotDevice) {
         let uuid = device.uuid
         var state = byUuid[uuid] ?? DotState(device: device, dot: nil, lastSeen: Date())
-        state.device = device
+        if !syncingUuids.contains(uuid) {
+            state.device = device
+        }
         state.lastSeen = Date()
         byUuid[uuid] = state
     }
@@ -72,39 +77,38 @@ final class DotRegistry {
         let uuid = device.uuid
         var state = byUuid[uuid] ?? DotState(device: device, dot: nil, lastSeen: Date())
         state.device = device
-        state.isConnected = true
-        state.connectionPhase = .initializing
 
         if let dot = state.dot {
             dot.updateDevice(device)
-            dot.setIsConnected(true)
         } else {
-            let dot = Dot(device: device)
-            dot.setIsConnected(true)
-            state.dot = dot
+            state.dot = Dot(device: device, sdkQueue: sdkQueue)
         }
         byUuid[uuid] = state
         initializationInProgress.insert(uuid)
+        setConnectionPhase(uuid, .initializing)
     }
 
     /// Lightweight update for SDK-managed reconnections (e.g. during sync).
-    /// Updates device reference and marks connected, but does NOT trigger initialization.
+    /// Updates device reference but does NOT change the connection phase.
+    /// When sync is in progress, freezes existing device references so
+    /// `DotSyncManager` keeps working with the originals it was given.
     func recordReconnection(_ device: DotDevice) {
         let uuid = device.uuid
         guard var state = byUuid[uuid] else { return }
-        state.device = device
-        state.isConnected = true
-        if let dot = state.dot {
-            dot.updateDevice(device)
-            dot.setIsConnected(true)
+        if syncingUuids.contains(uuid) {
+            print("🧊 Freeze active for \(uuid), ignoring device ref update")
+        } else {
+            state.device = device
+            if let dot = state.dot {
+                dot.updateDevice(device)
+            }
         }
+        state.lastSeen = Date()
         byUuid[uuid] = state
     }
 
     func recordDisconnection(_ uuid: String) {
-        byUuid[uuid]?.isConnected = false
-        byUuid[uuid]?.connectionPhase = .idle
-        byUuid[uuid]?.dot?.setIsConnected(false)
+        setConnectionPhase(uuid, .idle)
         byUuid[uuid]?.dot?.setSessionSynced(false)
         initializationInProgress.remove(uuid)
     }
@@ -129,9 +133,7 @@ final class DotRegistry {
 
     func markAllDisconnected() {
         for uuid in byUuid.keys {
-            byUuid[uuid]?.isConnected = false
-            byUuid[uuid]?.connectionPhase = .idle
-            byUuid[uuid]?.dot?.setIsConnected(false)
+            setConnectionPhase(uuid, .idle)
         }
     }
 
@@ -140,5 +142,8 @@ final class DotRegistry {
         connectInProgress = nil
         initializationInProgress.removeAll()
         syncInProgress = false
+        syncingUuids.removeAll()
+        // Note: wasRecordingBeforeDisconnect is intentionally NOT cleared here
+        // so it survives the BT power cycle.
     }
 }

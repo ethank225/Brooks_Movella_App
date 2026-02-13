@@ -23,7 +23,9 @@ final class Dot: ObservableObject, Identifiable {
 
     // MARK: - Published State (UI-facing)
 
-    @Published var isConnected = false
+    @Published private(set) var connectionPhase: ConnectionPhase = .idle
+
+    var isConnected: Bool { connectionPhase.isConnected }
     @Published var isRecording = false
     @Published var sessionSynced = false
     @Published var isErasing = false
@@ -47,18 +49,32 @@ final class Dot: ObservableObject, Identifiable {
     /// Whether the SDK considers this device time-synced with the host.
     var isSynced: Bool { device.isSynced() }
 
+    // MARK: - SDK Queue
+
+    /// Serializes all SDK device calls. Shared with `DotManager.sdkQueue`.
+    private let sdkQueue: DispatchQueue
+
+    /// Single-flight guard for `getFlashInfo`. Accessed only on `sdkQueue`.
+    private var flashInfoInFlight = false
+    private var flashInfoWaiters: [(Bool) -> Void] = []
+
     // MARK: - Init
 
-    init(device: DotDevice) {
+    init(device: DotDevice, sdkQueue: DispatchQueue) {
         self.device = device
-        installRecordingStatusHandler()
+        self.sdkQueue = sdkQueue
+        sdkQueue.async {
+            self.installRecordingStatusHandler()
+        }
     }
 
     /// Replace the underlying device reference (e.g. after SDK reconnects during sync).
     /// Re-installs the recording callback since the old device object is stale.
     func updateDevice(_ newDevice: DotDevice) {
         self.device = newDevice
-        installRecordingStatusHandler()
+        sdkQueue.async {
+            self.installRecordingStatusHandler()
+        }
         print("🔄 [\(address)] Device reference updated")
     }
 
@@ -67,7 +83,9 @@ final class Dot: ObservableObject, Identifiable {
     /// Installs a permanent callback on `device.recording` that keeps
     /// `isRecording` in sync with the SDK's push notifications.
     /// Called on init and after every device reference update.
+    /// Must be called on `sdkQueue`.
     private func installRecordingStatusHandler() {
+        let device = self.device
         device.recording.updateRecordingStatus = { [weak self] status in
             guard let self else { return }
             switch status {
@@ -89,8 +107,8 @@ final class Dot: ObservableObject, Identifiable {
         else { DispatchQueue.main.async(execute: work) }
     }
 
-    func setIsConnected(_ value: Bool) {
-        setOnMain { self.isConnected = value }
+    func setConnectionPhase(_ phase: ConnectionPhase) {
+        setOnMain { self.connectionPhase = phase }
     }
 
     func setSessionSynced(_ value: Bool) {
@@ -101,24 +119,29 @@ final class Dot: ObservableObject, Identifiable {
 
     /// Triggers a visual/haptic signal on the physical sensor for identification.
     func identify() {
-        device.startIdentifying()
+        sdkQueue.async { self.device.startIdentifying() }
     }
 
     /// Sets the sensor's output rate and filter profile.
     func configure(outputRate: Int = 120, filterIndex: Int = 0) {
-        device.setOutputRate(Int32(outputRate), filterIndex: Int32(filterIndex))
-        print("⚙️ [\(address)] Configured: \(outputRate)Hz, filter \(filterIndex)")
+        let addr = address
+        sdkQueue.async {
+            self.device.setOutputRate(Int32(outputRate), filterIndex: Int32(filterIndex))
+            print("⚙️ [\(addr)] Configured: \(outputRate)Hz, filter \(filterIndex)")
+        }
     }
 
     /// Reads the device's sync state from the SDK and updates `sessionSynced`.
     func refreshSyncStatus() {
-        let synced = device.isSynced()
-        setOnMain { self.sessionSynced = synced }
+        sdkQueue.async {
+            let synced = self.device.isSynced()
+            self.setOnMain { self.sessionSynced = synced }
+        }
     }
 
     /// Polls the SDK for the current recording state (push isn't always reliable).
     func refreshRecordingStatus() {
-        device.getRecordingStatus()
+        sdkQueue.async { self.device.getRecordingStatus() }
     }
 
     // MARK: - Flash Storage
@@ -129,8 +152,14 @@ final class Dot: ObservableObject, Identifiable {
     /// call sometimes reporting doubled values (e.g. 36% → 72%). A gatekeeper
     /// flag captures only the first result and ignores subsequent callbacks.
     func getFlashInfo(completion: @escaping (Bool) -> Void) {
-        let run = { [weak self] in
+        sdkQueue.async { [weak self] in
             guard let self else { return }
+
+            if self.flashInfoInFlight {
+                self.flashInfoWaiters.append(completion)
+                return
+            }
+            self.flashInfoInFlight = true
 
             var hasCapturedResult = false
 
@@ -143,15 +172,33 @@ final class Dot: ObservableObject, Identifiable {
                 self.setFlashSnapshot(usedBytes: used, totalBytes: total)
 
                 print("💾 [\(self.address)] Snapshot: \(used)/\(total) (\(String(format: "%.1f", self.storagePercentageUsed))%)")
-                self.device.setFlashInfoDoneBlock(nil)
-                completion(true)
+                self.sdkQueue.async {
+                    self.device.setFlashInfoDoneBlock(nil)
+                    let waiters = self.flashInfoWaiters
+                    self.flashInfoWaiters = []
+                    self.flashInfoInFlight = false
+                    completion(true)
+                    waiters.forEach { $0(true) }
+                }
             }
 
             self.device.getFlashInfo()
-        }
 
-        if Thread.isMainThread { run() }
-        else { DispatchQueue.main.async(execute: run) }
+            // Safety timeout — the SDK sometimes doesn't fire the callback after reconnect.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 5.0) { [weak self] in
+                guard !hasCapturedResult else { return }
+                hasCapturedResult = true
+                print("⏰ [\(self?.address ?? "?")] Flash info timed out")
+                self?.sdkQueue.async {
+                    self?.device.setFlashInfoDoneBlock(nil)
+                    let waiters = self?.flashInfoWaiters ?? []
+                    self?.flashInfoWaiters = []
+                    self?.flashInfoInFlight = false
+                    completion(false)
+                    waiters.forEach { $0(false) }
+                }
+            }
+        }
     }
 
     private func setFlashSnapshot(usedBytes: Int, totalBytes: Int) {
@@ -177,11 +224,13 @@ final class Dot: ObservableObject, Identifiable {
             }
 
             print("🎬 [\(self.address)] Starting recording...")
-            self.device.startRecording(seconds)
+            self.sdkQueue.async {
+                self.device.startRecording(seconds)
+            }
 
             // Kick the SDK to report status, then poll until confirmed.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
-                self?.device.getRecordingStatus()
+            self.sdkQueue.asyncAfter(deadline: .now() + 0.3) {
+                self.device.getRecordingStatus()
             }
 
             self.waitForRecordingState(true, timeout: 5.0) { success in
@@ -196,10 +245,10 @@ final class Dot: ObservableObject, Identifiable {
     /// Stops recording and refreshes flash info to capture the new usage.
     func stopRecording(completion: @escaping (Bool) -> Void) {
         print("⏹️ [\(address)] Stopping recording...")
-        device.stopRecording()
+        sdkQueue.async { self.device.stopRecording() }
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
-            self?.device.getRecordingStatus()
+        sdkQueue.asyncAfter(deadline: .now() + 0.3) {
+            self.device.getRecordingStatus()
         }
 
         waitForRecordingState(false, timeout: 5.0) { [weak self] success in
@@ -221,7 +270,9 @@ final class Dot: ObservableObject, Identifiable {
         let start = Date()
 
         func check() {
-            self.device.getRecordingStatus()
+            self.sdkQueue.async {
+                self.device.getRecordingStatus()
+            }
 
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
                 if self.isRecording == target {
@@ -247,15 +298,17 @@ final class Dot: ObservableObject, Identifiable {
         print("🗑️ [\(address)] Erasing flash...")
         setOnMain { self.isErasing = true }
 
-        device.setEraseDataDoneBlock { [weak self] success in
-            let ok = success != 0
-            print("🗑️ [\(self?.address ?? "?")] Erase: \(ok ? "success" : "failed")")
-            self?.setOnMain { self?.isErasing = false }
-            self?.getFlashInfo { _ in }
-            completion(ok)
-        }
+        sdkQueue.async {
+            self.device.setEraseDataDoneBlock { [weak self] success in
+                let ok = success != 0
+                print("🗑️ [\(self?.address ?? "?")] Erase: \(ok ? "success" : "failed")")
+                self?.setOnMain { self?.isErasing = false }
+                self?.getFlashInfo { _ in }
+                completion(ok)
+            }
 
-        device.eraseData()
+            self.device.eraseData()
+        }
     }
 }
 

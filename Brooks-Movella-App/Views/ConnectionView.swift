@@ -21,60 +21,104 @@ struct ConnectionView: View {
         manager.connectedDots.count
     }
 
+    private var sessionBusyLabel: String {
+        switch manager.sessionPhase {
+        case .syncing:           return "Syncing — connections locked"
+        case .startingRecording: return "Starting recording — connections locked"
+        case .stoppingRecording: return "Stopping recording — connections locked"
+        default:                 return "Session busy — connections locked"
+        }
+    }
+
+    private var sessionBusyColor: Color {
+        switch manager.sessionPhase {
+        case .syncing:                               return .blue
+        case .startingRecording, .stoppingRecording: return .red
+        default:                                     return .orange
+        }
+    }
+
     var body: some View {
         NavigationView {
-            VStack(spacing: 0) {
+            ScrollView {
+                VStack(spacing: 16) {
 
-                if connectedCount > 0 {
-                    HStack {
-                        Image(systemName: "sensor.tag.radiowaves.forward.fill")
-                        Text("\(connectedCount) connected")
-                            .font(.subheadline.weight(.medium))
-                        Spacer()
-                    }
-                    .padding(.horizontal)
-                    .padding(.vertical, 8)
-                    .background(Color.green.opacity(0.1))
-                }
+                    // MARK: - Session Busy Banner
 
-                List {
-                    if discoveredList.isEmpty && manager.isScanning {
-                        HStack {
+                    if manager.sessionPhase.isBusy {
+                        HStack(spacing: 8) {
                             ProgressView()
-                                .padding(.trailing, 8)
-                            Text("Scanning for sensors...")
-                                .foregroundColor(.secondary)
+                                .progressViewStyle(CircularProgressViewStyle(tint: sessionBusyColor))
+                                .scaleEffect(0.8)
+                            Text(sessionBusyLabel)
+                                .font(.subheadline)
+                                .foregroundColor(sessionBusyColor)
+                            Spacer()
                         }
-                    } else if discoveredList.isEmpty {
-                        Text("No sensors found. Pull to scan.")
-                            .foregroundColor(.secondary)
+                        .padding()
+                        .background(sessionBusyColor.opacity(0.1))
+                        .cornerRadius(8)
+                        .padding(.horizontal)
                     }
 
-                    ForEach(discoveredList, id: \.uuid) { device in
-                        let uuid = device.uuid
-                        let phase = manager.connectionPhases[uuid] ?? .idle
+                    // MARK: - Sensors
 
-                        DeviceRow(
-                            title: "DOT \(uuid)",
-                            subtitle: manager.displayAddress(for: device),
-                            phase: phase,
-                            isIdentifying: identifyingUuid == uuid,
-                            batteryLevel: manager.dot(forUuid: uuid)?.device.battery?.value as? Int,
-                            onToggle: { toggleConnection(device) }
-                        )
-                        .contentShape(Rectangle())
-                        .onTapGesture {
-                            if phase == .ready {
-                                triggerIdentify(uuid: uuid)
+                    SectionCard(
+                        title: connectedCount > 0
+                            ? "Sensors — \(connectedCount) connected"
+                            : "Sensors",
+                        icon: "sensor.tag.radiowaves.forward"
+                    ) {
+                        if discoveredList.isEmpty && manager.isScanning {
+                            VStack(spacing: 8) {
+                                ProgressView()
+                                Text("Scanning for sensors...")
+                                    .font(.subheadline)
+                                    .foregroundColor(.secondary)
+                            }
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 20)
+                        } else if discoveredList.isEmpty {
+                            VStack(spacing: 8) {
+                                Image(systemName: "sensor.tag.radiowaves.forward")
+                                    .font(.largeTitle)
+                                    .foregroundColor(.secondary)
+                                Text("No sensors found")
+                                    .font(.headline)
+                                    .foregroundColor(.secondary)
+                                Text("Pull down or tap refresh to scan")
+                                    .font(.subheadline)
+                                    .foregroundColor(.secondary)
+                            }
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 20)
+                        } else {
+                            ForEach(discoveredList, id: \.uuid) { device in
+                                let uuid = device.uuid
+                                let phase = manager.connectionPhase(forUuid: uuid)
+
+                                DeviceRow(
+                                    title: "DOT \(uuid)",
+                                    subtitle: manager.displayAddress(for: device),
+                                    phase: phase,
+                                    isIdentifying: identifyingUuid == uuid,
+                                    batteryLevel: manager.dot(forUuid: uuid)?.device.battery?.value as? Int,
+                                    sessionBusy: manager.sessionPhase.isBusy,
+                                    onToggle: { toggleConnection(device) }
+                                )
+                                .contentShape(Rectangle())
+                                .onTapGesture {
+                                    if phase == .ready {
+                                        triggerIdentify(uuid: uuid)
+                                    }
+                                }
                             }
                         }
-                        .listRowBackground(
-                            identifyingUuid == uuid ? Color.orange.opacity(0.08) :
-                            phase.isFailed ? Color.orange.opacity(0.06) : nil
-                        )
                     }
+
+                    Spacer()
                 }
-                .listStyle(.plain)
+                .padding(.top)
             }
             .navigationTitle("Connect")
             .toolbar {
@@ -107,10 +151,11 @@ struct ConnectionView: View {
 
     private func toggleConnection(_ device: DotDevice) {
         let uuid = device.uuid
-        let phase = manager.connectionPhases[uuid] ?? .idle
+        let phase = manager.connectionPhase(forUuid: uuid)
 
         // If currently busy, ignore repeated taps
         if phase.isBusy { return }
+        if manager.sessionPhase.isBusy { return }
 
         if manager.dot(forUuid: uuid)?.isConnected == true {
             if let dot = manager.dot(forUuid: uuid) {
@@ -133,12 +178,15 @@ struct ConnectionView: View {
     }
 }
 
+// MARK: - Device Row
+
 struct DeviceRow: View {
     let title: String
     let subtitle: String
     let phase: ConnectionPhase
     var isIdentifying: Bool = false
     var batteryLevel: Int? = nil
+    var sessionBusy: Bool = false
     let onToggle: () -> Void
 
     private var isBusy: Bool { phase.isBusy }
@@ -163,10 +211,23 @@ struct DeviceRow: View {
         switch phase {
         case .connecting: return "Connecting…"
         case .initializing: return "Initializing…"
-        case .ready: return "Ready"
+        case .ready: return nil
         case .failed(let msg): return msg
         case .idle: return nil
         }
+    }
+
+    private var rowBackground: Color {
+        if isIdentifying {
+            return Color.orange.opacity(0.08)
+        }
+        if phase.isFailed {
+            return Color.orange.opacity(0.06)
+        }
+        if phase.isConnected {
+            return Color.green.opacity(0.06)
+        }
+        return Color.gray.opacity(0.1)
     }
 
     var body: some View {
@@ -183,10 +244,10 @@ struct DeviceRow: View {
             } else {
                 Circle()
                     .fill(phase.isConnected ? Color.green : Color.gray.opacity(0.3))
-                    .frame(width: 10, height: 10)
+                    .frame(width: 12, height: 12)
             }
 
-            VStack(alignment: .leading, spacing: 2) {
+            VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 8) {
                     Text(title)
                         .font(.headline)
@@ -199,40 +260,54 @@ struct DeviceRow: View {
                     }
                 }
 
-                HStack(spacing: 4) {
+                HStack(spacing: 8) {
                     Text(subtitle)
                         .font(.caption)
                         .foregroundColor(.secondary)
                         .lineLimit(1)
 
                     if let batteryLevel {
-                        Image(systemName: batteryIcon(for: batteryLevel))
-                            .font(.caption2)
-                            .foregroundColor(batteryColor(for: batteryLevel))
-                        Text("\(batteryLevel)%")
-                            .font(.caption2)
-                            .foregroundColor(batteryColor(for: batteryLevel))
+                        HStack(spacing: 2) {
+                            Image(systemName: batteryIcon(for: batteryLevel))
+                                .font(.caption2)
+                                .foregroundColor(batteryColor(for: batteryLevel))
+                            Text("\(batteryLevel)%")
+                                .font(.caption2)
+                                .foregroundColor(batteryColor(for: batteryLevel))
+                        }
                     }
                 }
 
-                if let statusText {
-                    Text(statusText)
-                        .font(.caption2)
-                        .foregroundColor(isIdentifying || phase.isFailed ? .orange : .secondary)
+                HStack(spacing: 8) {
+                    StatusTag(
+                        text: "Connected",
+                        isActive: phase.isConnected,
+                        color: .green
+                    )
+
+                    if let statusText {
+                        Text(statusText)
+                            .font(.caption)
+                            .foregroundColor(isIdentifying || phase.isFailed ? .orange : .secondary)
+                    }
                 }
             }
             .layoutPriority(1)
 
             Spacer()
 
-            Toggle("", isOn: Binding(
-                get: { phase.isConnected },
-                set: { _ in onToggle() }
-            ))
-            .labelsHidden()
-            .disabled(isBusy)
+            if !(sessionBusy && phase.isConnected) {
+                Toggle("", isOn: Binding(
+                    get: { phase.isConnected },
+                    set: { _ in onToggle() }
+                ))
+                .labelsHidden()
+                .disabled(isBusy || sessionBusy)
+            }
         }
-        .padding(.vertical, 4)
+        .padding()
+        .background(rowBackground)
+        .cornerRadius(10)
         .animation(.easeInOut(duration: 0.3), value: isIdentifying)
     }
 }
