@@ -113,7 +113,8 @@ final class DotManager: NSObject, ObservableObject {
     private let stateQueue = DispatchQueue(label: "DotManager.stateQueue")
 
     /// Serializes every call into the Movella SDK.
-    private let sdkQueue = DispatchQueue(label: "DotManager.sdkQueue")
+    /// Exposed read-only for `ExportManager` to share the same serial queue.
+    let sdkQueue = DispatchQueue(label: "DotManager.sdkQueue")
 
     // MARK: - Components
 
@@ -142,6 +143,10 @@ final class DotManager: NSObject, ObservableObject {
     @Published private(set) var dots: [Dot] = []
     @Published private(set) var connectedDots: [Dot] = []
     @Published private(set) var sessionPhase: SessionPhase = .idle
+    @Published private(set) var hasPendingConnections: Bool = false
+
+    @Published var selectedOutputRate: Int = 120
+    @Published var selectedFilterIndex: Int = 0
 
     /// Per-device connection timeout timers. Managed on the main thread.
     private var connectTimers: [String: DispatchWorkItem] = [:]
@@ -253,12 +258,30 @@ final class DotManager: NSObject, ObservableObject {
         stateQueue.async {
             guard self.sessionPhase == .idle || self.sessionPhase.isError else { return }
 
+            guard self.registry.connectQueue.isEmpty && self.registry.connectInProgress == nil else {
+                print("⛔ beginSession() blocked — connections still pending (queue=\(self.registry.connectQueue.count), inProgress=\(self.registry.connectInProgress ?? "nil"))")
+                return
+            }
+
             let dots = self.registry.connectedDots.filter { dot in
                 let uuid = dot.address
                 let phase = self.registry.byUuid[uuid]?.connectionPhase ?? .idle
                 return phase == .ready
             }
             guard !dots.isEmpty else { return }
+
+            print("▶️ beginSession(): \(dots.count) dot(s) ready")
+            for dot in dots {
+                let uuid = dot.address
+                let phase = self.registry.byUuid[uuid]?.connectionPhase ?? .idle
+                print("   [\(uuid)] phase=\(phase) isInitialized=\(dot.device.isInitialized()) isRecording=\(dot.isRecording)")
+            }
+
+            let outputRate = self.selectedOutputRate
+            let filterIndex = self.selectedFilterIndex
+            for dot in dots {
+                dot.configure(outputRate: outputRate, filterIndex: filterIndex)
+            }
 
             if dots.count >= 2 {
                 self.registry.syncingUuids = Set(dots.map { $0.device.uuid })
@@ -405,6 +428,7 @@ final class DotManager: NSObject, ObservableObject {
     /// `0xFFFF` tells the sensor to record indefinitely until explicitly stopped.
     private func performStartRecording(dots: [Dot]) {
         setPhase(.startingRecording)
+        print("🎙️ performStartRecording(): \(dots.map { $0.address })")
 
         operations.runAll(
             dots: dots,
@@ -460,6 +484,7 @@ final class DotManager: NSObject, ObservableObject {
                 let uuid = dot.device.uuid
                 self.registry.initializationInProgress.remove(uuid)
                 self.registry.setConnectionPhase(uuid, .ready)
+                print("✅ [\(uuid)] phase now .ready")
                 self.notify()
 
                 // After a BT power cycle, restore the recording session once
@@ -480,12 +505,14 @@ final class DotManager: NSObject, ObservableObject {
         let disc = registry.discovered
         let all = registry.dots
         let connected = registry.connectedDots
+        let pending = !registry.connectQueue.isEmpty || registry.connectInProgress != nil
 
         DispatchQueue.main.async {
             self.isScanning = scanning
             self.discovered = disc
             self.dots = all
             self.connectedDots = connected
+            self.hasPendingConnections = pending
         }
     }
 
@@ -611,6 +638,7 @@ extension DotManager: DotConnectionDelegate {
 
             // recordConnection sets phase to .initializing
             self.registry.recordConnection(device)
+            print("🔗 [\(device.uuid)] phase now .initializing")
 
             self.sdkQueue.async {
                 DotDevicePool.bindDevice(device)
