@@ -516,7 +516,6 @@ private struct ExportTaskRow: View {
     private var progressBarColor: Color {
         switch task.subphase {
         case .transferring: return .blue
-        case .converting:   return .orange
         case .complete:     return .green
         case .idle:         return task.status == .success ? .green : .blue
         }
@@ -524,7 +523,7 @@ private struct ExportTaskRow: View {
 
     private var taskBackground: Color {
         switch task.status {
-        case .running:  return task.subphase == .converting ? Color.orange.opacity(0.08) : Color.blue.opacity(0.08)
+        case .running:  return Color.blue.opacity(0.08)
         case .success:  return Color.green.opacity(0.08)
         case .failed:   return Color.red.opacity(0.08)
         case .canceled: return Color.orange.opacity(0.08)
@@ -555,7 +554,6 @@ private struct ExportSubphaseTag: View {
         case .running:
             switch subphase {
             case .transferring: return "Transferring"
-            case .converting:   return "Converting"
             default:            return "Exporting"
             }
         case .success:  return "Done"
@@ -567,11 +565,7 @@ private struct ExportSubphaseTag: View {
     private var color: Color {
         switch status {
         case .queued:   return .gray
-        case .running:
-            switch subphase {
-            case .converting: return .orange
-            default:          return .blue
-            }
+        case .running:  return .blue
         case .success:  return .green
         case .failed:   return .red
         case .canceled: return .orange

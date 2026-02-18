@@ -16,11 +16,9 @@ enum ExportPhase: Equatable {
 // MARK: - ExportManager
 
 /// Singleton managing the recording-export lifecycle:
-/// file discovery, cart selection, export pipeline, and binary→CSV file writing.
+/// file discovery, cart selection, export pipeline, and CSV file writing.
 ///
-/// **Two-phase pipeline:**
-/// - Phase A (Transfer): BLE data → packed binary `.bin` file (foreground-only)
-/// - Phase B (Convert): `.bin` → `.csv` (can continue in background)
+/// **Pipeline:** BLE data → CSV rows written directly to disk (foreground-only).
 ///
 /// **Threading:**
 /// - SDK calls → `DotManager.shared.sdkQueue`
@@ -87,9 +85,8 @@ final class ExportManager: ObservableObject {
     private var activeWatchdog: ExportWatchdog?
     private var exportFileGeneration: Int = 0
     private var cleanupBackgroundTaskID: UIBackgroundTaskIdentifier = .invalid
-    private var conversionBackgroundTaskID: UIBackgroundTaskIdentifier = .invalid
 
-    /// True while Phase A (BLE transfer) is active. Used by app-state handlers
+    /// True while BLE transfer is active. Used by app-state handlers
     /// to decide whether to cancel on background.
     private var isTransferring = false
 
@@ -98,7 +95,6 @@ final class ExportManager: ObservableObject {
     // MARK: - App State Handling
 
     @objc private func appWillResignActive() {
-        // Only cancel during Phase A (BLE transfer). Phase B (conversion) can continue.
         guard exportPhase == .exporting, isTransferring else { return }
         print("⚠️ App will resign active — canceling transfer with grace period")
         beginCleanupGracePeriod()
@@ -244,7 +240,7 @@ final class ExportManager: ObservableObject {
         let grouped = Dictionary(grouping: newTasks, by: { $0.cartItem.recording.dotAddress })
 
         // Process devices sequentially on a dedicated queue so fileQueue stays
-        // free for binary writing dispatched from SDK callbacks.
+        // free for CSV writes dispatched from SDK callbacks.
         exportSequenceQueue.async { [weak self] in
             guard let self else { return }
 
@@ -302,11 +298,11 @@ final class ExportManager: ObservableObject {
         }
 
         for task in tasks where task.status == .running || task.status == .queued {
-            // Delete incomplete .bin files for tasks that were transferring
+            // Delete incomplete .csv files for tasks that were transferring
             if task.subphase == .transferring {
-                let binPath = binURL(for: task)
+                let csvPath = csvURL(for: task)
                 fileQueue.async {
-                    try? FileManager.default.removeItem(at: binPath)
+                    try? FileManager.default.removeItem(at: csvPath)
                 }
             }
             setTaskStatus(task, .canceled)
@@ -318,7 +314,7 @@ final class ExportManager: ObservableObject {
     }
 
     /// Re-queue failed/canceled tasks for retry. Must be called in foreground.
-    /// Uses resume logic: .csv exists → done, .bin exists → convert-only, else full pipeline.
+    /// Uses resume logic: .csv exists → done immediately; else full pipeline.
     func retryFailed() {
         let retryable = tasks.filter { $0.status == .failed || $0.status == .canceled }
         guard !retryable.isEmpty else { return }
@@ -331,13 +327,10 @@ final class ExportManager: ObservableObject {
         currentExportCanceled = false
         setOnMain { self.exportPhase = .exporting }
 
-        // Check disk state for each task and split into categories
-        var convertOnly: [ExportTask] = []
         var fullPipeline: [ExportTask] = []
 
         for task in retryable {
             let csv = csvURL(for: task)
-            let bin = binURL(for: task)
 
             if FileManager.default.fileExists(atPath: csv.path) {
                 // CSV already exists — mark success immediately
@@ -348,15 +341,6 @@ final class ExportManager: ObservableObject {
                     task.outputURL = csv
                     task.error = nil
                 }
-            } else if FileManager.default.fileExists(atPath: bin.path) {
-                // Binary exists — skip BLE, convert only
-                convertOnly.append(task)
-                setOnMain {
-                    task.status = .running
-                    task.subphase = .converting
-                    task.progress = 0.80
-                    task.error = nil
-                }
             } else {
                 // Neither exists — full pipeline
                 fullPipeline.append(task)
@@ -365,22 +349,10 @@ final class ExportManager: ObservableObject {
             }
         }
 
-        // Dispatch convert-only tasks on fileQueue
-        for task in convertOnly {
-            dispatchConversion(for: task)
-        }
-
-        // Full pipeline tasks grouped by address
         let grouped = Dictionary(grouping: fullPipeline, by: { $0.cartItem.recording.dotAddress })
 
         guard !grouped.isEmpty else {
-            // Only convert-only tasks — wait for them to finish, then mark done
-            fileQueue.async { [weak self] in
-                DispatchQueue.main.async {
-                    // Check if all tasks are now success/failed
-                    self?.checkIfAllDone()
-                }
-            }
+            DispatchQueue.main.async { self.exportPhase = .done }
             return
         }
 
@@ -417,9 +389,9 @@ final class ExportManager: ObservableObject {
         exportPhase = recordings.isEmpty ? .idle : .ready
     }
 
-    // MARK: - Per-Device Export (Phase A: Transfer)
+    // MARK: - Per-Device Export
 
-    /// Export all selected files for a single dot sequentially via binary pipeline.
+    /// Export all selected files for a single dot sequentially, writing CSV rows directly.
     private func exportFilesForDot(dot: Dot, tasks: [ExportTask], completion: @escaping () -> Void) {
         let fileIndices = tasks.map { $0.cartItem.recording.fileIndex }
 
@@ -431,7 +403,6 @@ final class ExportManager: ObservableObject {
             UInt8(XSRecordingData.angularVelocity.rawValue)
         ]
 
-        // We export one file at a time for cleaner separation and progress tracking
         var taskIndex = 0
 
         func exportNextFile() {
@@ -450,23 +421,32 @@ final class ExportManager: ObservableObject {
             var packetsReceived = 0
             var exportCompleted = false
 
-            // Resolve output paths
-            let binPath = binURL(for: task)
             let csvPath = csvURL(for: task)
 
-            // Create writer on fileQueue, then configure SDK + start export on sdkQueue.
+            // Estimate total packets from file size.
+            // Empirical ratio: 647 KB → 7541 packets → ~88 bytes per packet on-device.
+            let estimatedTotalPackets = max(task.cartItem.recording.fileSize / 88, 1)
+
+            // Create CSV file with header on fileQueue, then configure SDK + start export on sdkQueue.
             fileQueue.async { [weak self] in
                 guard let self else { completion(); return }
 
-                let writer = BinaryStreamWriter(url: binPath)
+                let csvHeader = "packet_counter,timestamp,euler_x,euler_y,euler_z,acc_x,acc_y,acc_z,gyr_x,gyr_y,gyr_z\n"
+                FileManager.default.createFile(atPath: csvPath.path, contents: Data(csvHeader.utf8))
+                guard let fileHandle = try? FileHandle(forWritingTo: csvPath) else {
+                    self.setTaskStatus(task, .failed, error: "Failed to open CSV file")
+                    taskIndex += 1
+                    exportNextFile()
+                    return
+                }
+                fileHandle.seekToEndOfFile()
 
                 self.sdkQueue.async { [weak self] in
                     guard let self else { completion(); return }
 
-                    // Pre-allocate scratch buffer and batch — owned and mutated only on sdkQueue
-                    var scratch = Data(count: BinaryStreamWriter.recordSize)
+                    // Batch of CSV row bytes — owned and mutated only on sdkQueue
                     var batch = Data()
-                    batch.reserveCapacity(200 * BinaryStreamWriter.recordSize)
+                    batch.reserveCapacity(200 * 120)  // ~120 bytes per CSV row
 
                     let device = dot.device
 
@@ -501,10 +481,10 @@ final class ExportManager: ObservableObject {
 
                         self.isTransferring = false
 
-                        // Close writer and delete partial .bin
+                        // Close handle and delete partial .csv
                         self.fileQueue.async {
-                            writer.close()
-                            try? FileManager.default.removeItem(at: binPath)
+                            try? fileHandle.close()
+                            try? FileManager.default.removeItem(at: csvPath)
 
                             self.setTaskStatus(task, .failed, error: "Export timed out")
                             taskIndex += 1
@@ -515,14 +495,13 @@ final class ExportManager: ObservableObject {
 
                     // Timing for throughput measurement
                     let exportStartTime = CACurrentMediaTime()
-
                     var lastProgressUpdate = exportStartTime
 
                     // Callback instrumentation
                     var cbTimeTotal: Double = 0
                     var cbTimeMax: Double = 0
 
-                    // Install data callback — pack raw bytes, dispatch batches to fileQueue
+                    // Install data callback — format CSV row, dispatch batches to fileQueue
                     device.setDidParseExportFileDataBlock { [weak self] plotData in
                         let cbStart = CACurrentMediaTime()
                         guard let self, !exportCompleted else { return }
@@ -531,51 +510,28 @@ final class ExportManager: ObservableObject {
                         watchdog.beat()
                         packetsReceived += 1
 
-                        // Pack 11 fields into 44-byte scratch buffer (reuse, no allocation)
-                        scratch.withUnsafeMutableBytes { ptr in
-                            let base = ptr.baseAddress!
-                            var pkg = plotData.packageCounter
-                            var ts  = plotData.timeStamp
-                            var e0  = Float32(plotData.euler0)
-                            var e1  = Float32(plotData.euler1)
-                            var e2  = Float32(plotData.euler2)
-                            var a0  = Float32(plotData.acc0)
-                            var a1  = Float32(plotData.acc1)
-                            var a2  = Float32(plotData.acc2)
-                            var g0  = Float32(plotData.gyr0)
-                            var g1  = Float32(plotData.gyr1)
-                            var g2  = Float32(plotData.gyr2)
-
-                            memcpy(base + 0,  &pkg, 4)
-                            memcpy(base + 4,  &ts,  4)
-                            memcpy(base + 8,  &e0,  4)
-                            memcpy(base + 12, &e1,  4)
-                            memcpy(base + 16, &e2,  4)
-                            memcpy(base + 20, &a0,  4)
-                            memcpy(base + 24, &a1,  4)
-                            memcpy(base + 28, &a2,  4)
-                            memcpy(base + 32, &g0,  4)
-                            memcpy(base + 36, &g1,  4)
-                            memcpy(base + 40, &g2,  4)
-                        }
-                        batch.append(scratch)
+                        let row = String(format: "%u,%u,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n",
+                                         plotData.packageCounter, plotData.timeStamp,
+                                         plotData.euler0, plotData.euler1, plotData.euler2,
+                                         plotData.acc0, plotData.acc1, plotData.acc2,
+                                         plotData.gyr0, plotData.gyr1, plotData.gyr2)
+                        batch.append(Data(row.utf8))
 
                         // Flush batch to fileQueue every 200 packets
-                        if batch.count >= 200 * BinaryStreamWriter.recordSize {
+                        if packetsReceived % 200 == 0 {
                             let captured = batch
                             batch.removeAll(keepingCapacity: true)
                             self.fileQueue.async {
-                                writer.appendData(captured)
+                                fileHandle.write(captured)
                             }
                         }
 
                         // Throttled UI update: every 100 packets or 0.5s
-                        // Asymptotic progress: smoothly approaches 0.80, never exceeds it
+                        // Linear progress capped at 0.99 until exportFileDone sets 1.0
                         let now = CACurrentMediaTime()
                         if packetsReceived % 100 == 0 || (now - lastProgressUpdate) >= 0.5 {
                             lastProgressUpdate = now
-                            let n = Double(packetsReceived)
-                            let progress = 0.80 * n / (n + 1000.0)
+                            let progress = min(Double(packetsReceived) / Double(estimatedTotalPackets), 0.99)
                             self.setOnMain { task.progress = progress }
                         }
 
@@ -612,27 +568,25 @@ final class ExportManager: ObservableObject {
                         let elapsed = CACurrentMediaTime() - exportStartTime
                         let avgCb = finalPackets > 0 ? cbTimeTotal / Double(finalPackets) : 0
 
-                        // Flush remaining + close writer on fileQueue, then start Phase B
+                        // Flush remaining + close on fileQueue, then mark success
                         self.fileQueue.async {
                             if let finalChunk {
-                                writer.appendData(finalChunk)
+                                fileHandle.write(finalChunk)
                             }
-                            writer.close()
+                            try? fileHandle.close()
 
-                            // Log Phase A stats
                             let pps = elapsed > 0 ? Double(finalPackets) / elapsed : 0
-                            let binSize = (try? FileManager.default.attributesOfItem(atPath: binPath.path)[.size] as? Int) ?? 0
-                            print("📡 [\(dot.address)] Transfer: \(finalPackets) pkts in \(String(format: "%.1f", elapsed))s (\(String(format: "%.0f", pps)) pkt/s), .bin = \(binSize / 1024) KB, cb avg \(String(format: "%.2f", avgCb * 1000))ms")
+                            print("📡 [\(dot.address)] Transfer: \(finalPackets) pkts in \(String(format: "%.1f", elapsed))s (\(String(format: "%.0f", pps)) pkt/s), cb avg \(String(format: "%.2f", avgCb * 1000))ms")
 
-                            // Advance to Phase B: conversion
-                            self.setOnMain { task.subphase = .converting }
-
-                            self.beginConversionGracePeriod()
-                            self.runConversion(task: task, binPath: binPath, csvPath: csvPath) {
-                                self.endConversionGracePeriod()
-                                taskIndex += 1
-                                exportNextFile()
+                            self.setOnMain {
+                                task.progress = 1.0
+                                task.outputURL = csvPath
+                                task.subphase = .complete
+                                task.status = .success
+                                print("✅ Exported \(task.cartItem.label) → \(csvPath.lastPathComponent)")
                             }
+                            taskIndex += 1
+                            exportNextFile()
                         }
                     }
 
@@ -646,7 +600,7 @@ final class ExportManager: ObservableObject {
                         }
                     }
 
-                    // Start export — writer is already created on fileQueue
+                    // Start export — CSV file is already created on fileQueue
                     device.startExportFileData()
                     print("📤 [\(dot.address)] Started export for file \(fileIndex)")
                 }
@@ -656,89 +610,9 @@ final class ExportManager: ObservableObject {
         exportNextFile()
     }
 
-    // MARK: - Phase B: Conversion
-
-    /// Run binary→CSV conversion for a single task. Called on fileQueue.
-    private func runConversion(task: ExportTask, binPath: URL, csvPath: URL, completion: @escaping () -> Void) {
-        // Already on fileQueue
-        let convertStart = CACurrentMediaTime()
-
-        do {
-            _ = try BinaryToCsvConverter.convert(
-                binURL: binPath,
-                csvURL: csvPath
-            ) { [weak self] fraction in
-                // Map converter's 0.0–1.0 → task's 0.80–1.0
-                let progress = 0.80 + fraction * 0.20
-                self?.setOnMain { task.progress = progress }
-            }
-
-            // Log Phase B stats
-            let elapsed = CACurrentMediaTime() - convertStart
-            let binSize = (try? FileManager.default.attributesOfItem(atPath: binPath.path)[.size] as? Int) ?? 0
-            let csvSize = (try? FileManager.default.attributesOfItem(atPath: csvPath.path)[.size] as? Int) ?? 0
-            let totalRecords = max((binSize - BinaryStreamWriter.headerSize) / BinaryStreamWriter.recordSize, 0)
-            let rps = elapsed > 0 ? Double(totalRecords) / elapsed : 0
-            print("📄 [\(task.cartItem.recording.dotAddress)] Convert: \(totalRecords) rows in \(String(format: "%.1f", elapsed))s (\(String(format: "%.0f", rps)) rows/s), .csv = \(csvSize / 1024) KB")
-
-            // Delete .bin, mark success
-            try? FileManager.default.removeItem(at: binPath)
-
-            setOnMain {
-                task.progress = 1.0
-                task.outputURL = csvPath
-                task.subphase = .complete
-                task.status = .success
-                print("✅ Exported \(task.cartItem.label) → \(csvPath.lastPathComponent)")
-            }
-        } catch {
-            print("❌ [\(task.cartItem.recording.dotAddress)] Conversion failed: \(error)")
-            // Keep .bin for retry
-            setTaskStatus(task, .failed, error: "Conversion failed: \(error.localizedDescription)")
-        }
-
-        completion()
-    }
-
-    /// Dispatch conversion for a task that already has a .bin file (retry scenario).
-    private func dispatchConversion(for task: ExportTask) {
-        let binPath = binURL(for: task)
-        let csvPath = csvURL(for: task)
-
-        beginConversionGracePeriod()
-
-        fileQueue.async { [weak self] in
-            guard let self else { return }
-            self.runConversion(task: task, binPath: binPath, csvPath: csvPath) { [weak self] in
-                self?.endConversionGracePeriod()
-                self?.checkIfAllDone()
-            }
-        }
-    }
-
-    /// Check if all tasks are terminal and transition to .done if so.
-    private func checkIfAllDone() {
-        let allTerminal = tasks.allSatisfy {
-            $0.status == .success || $0.status == .failed || $0.status == .canceled
-        }
-        if allTerminal {
-            setOnMain { self.exportPhase = .done }
-        }
-    }
-
     // MARK: - URL Helpers
 
-    /// Deterministic .bin path for a task.
-    private func binURL(for task: ExportTask) -> URL {
-        guard let dir = exportDir() else {
-            // Fallback — shouldn't happen in practice
-            return URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("\(task.id).bin")
-        }
-        let filename = uniqueStem(for: task) + ".bin"
-        return dir.appendingPathComponent(filename)
-    }
-
-    /// Deterministic .csv path for a task (same stem as .bin).
+    /// Deterministic .csv path for a task.
     private func csvURL(for task: ExportTask) -> URL {
         guard let dir = exportDir() else {
             return URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("\(task.id).csv")
@@ -756,16 +630,6 @@ final class ExportManager: ObservableObject {
         // Use a hash of the task id for a short stable suffix
         let idHash = abs(task.id.hashValue) % 100000
         return "\(sanitizedLabel)_\(last4)_f\(fileIndex)_\(idHash)"
-    }
-
-    // MARK: - Unique Filenames (legacy, kept for compatibility)
-
-    /// Generate a unique filename to prevent overwrites on retry or same-label exports.
-    private func uniqueFilename(label: String, dotAddress: String, fileIndex: Int) -> String {
-        let sanitizedLabel = sanitize(label)
-        let last4 = String(dotAddress.suffix(4))
-        let ts = Int(Date().timeIntervalSince1970)
-        return "\(sanitizedLabel)_\(last4)_f\(fileIndex)_\(ts).csv"
     }
 
     // MARK: - File Helpers
@@ -796,9 +660,9 @@ final class ExportManager: ObservableObject {
         tasks.compactMap { $0.outputURL }
     }
 
-    // MARK: - Background Grace Periods
+    // MARK: - Background Grace Period
 
-    /// Request a short background task so cancelExport() + writer cleanup
+    /// Request a short background task so cancelExport() + file handle cleanup
     /// can finish before iOS suspends the app. Ends automatically after 3s.
     private func beginCleanupGracePeriod() {
         guard cleanupBackgroundTaskID == .invalid else { return }
@@ -807,7 +671,7 @@ final class ExportManager: ObservableObject {
         }
         print("🔋 Cleanup grace period started (id: \(cleanupBackgroundTaskID.rawValue))")
 
-        // Auto-end after 3 seconds — just enough for stopExportFileData + writer.close
+        // Auto-end after 3 seconds — just enough for stopExportFileData + fileHandle.close
         DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
             self?.endCleanupGracePeriod()
         }
@@ -820,24 +684,6 @@ final class ExportManager: ObservableObject {
         cleanupBackgroundTaskID = .invalid
         UIApplication.shared.endBackgroundTask(taskID)
         print("🔋 Cleanup grace period ended (id: \(taskID.rawValue))")
-    }
-
-    /// Request a background task for Phase B (conversion). iOS gives ~30s.
-    private func beginConversionGracePeriod() {
-        guard conversionBackgroundTaskID == .invalid else { return }
-        conversionBackgroundTaskID = UIApplication.shared.beginBackgroundTask(withName: "DOT Export Conversion") { [weak self] in
-            self?.endConversionGracePeriod()
-        }
-        print("🔋 Conversion grace period started (id: \(conversionBackgroundTaskID.rawValue))")
-    }
-
-    /// End the conversion background task. Safe to call multiple times.
-    private func endConversionGracePeriod() {
-        let taskID = conversionBackgroundTaskID
-        guard taskID != .invalid else { return }
-        conversionBackgroundTaskID = .invalid
-        UIApplication.shared.endBackgroundTask(taskID)
-        print("🔋 Conversion grace period ended (id: \(taskID.rawValue))")
     }
 
     // MARK: - Helpers

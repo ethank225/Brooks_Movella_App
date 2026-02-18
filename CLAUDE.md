@@ -60,21 +60,30 @@ Key details:
 
 ### ExportManager (`Managers/ExportManager.swift`)
 
-Singleton managing the full export lifecycle. Uses a **two-phase pipeline** per file:
+Singleton managing the full export lifecycle. Uses a **single-phase streaming pipeline** per file: BLE packets are formatted into CSV rows and written directly to disk as they arrive. Foreground-only; cancels with a 3-second cleanup grace period if the app backgrounds.
 
-- **Phase A (Transfer):** BLE → packed binary `.bin` via `BinaryStreamWriter`. Foreground-only; cancels with a 3-second cleanup grace period if the app backgrounds.
-- **Phase B (Convert):** `.bin` → `.csv` via `BinaryToCsvConverter`. Can continue in the background (iOS background task).
+> Note: An earlier two-phase design (BLE → `.bin` via `BinaryStreamWriter`, then `.bin` → `.csv` via `BinaryToCsvConverter`) was replaced. Those files no longer exist.
 
 **Threading:**
-- SDK calls → `DotManager.shared.sdkQueue`
+- SDK calls + data callback processing → `DotManager.shared.sdkQueue`
 - File I/O → `fileQueue` (serial, `ExportManager`-private)
 - Device sequencing → `exportSequenceQueue` (serial, keeps `fileQueue` free for write callbacks)
 
-**Export flow:** `fetchRecordings()` → select files → `buildCart()` → `startExport()` → share sheet. `retryFailed()` inspects disk state: if `.csv` exists → done; if `.bin` exists → convert-only; else full pipeline.
+**Export flow:** `fetchRecordings()` → select files → `buildCart()` → `startExport()` → share sheet. `retryFailed()` inspects disk state: if `.csv` exists → done; else full pipeline (no partial binary to resume from).
 
-**Binary file format** (written by `BinaryStreamWriter`):
-- 16-byte header: magic `DOTS`, version UInt16, fields UInt16 (11), bytesPerRecord UInt32 (44), 4 reserved bytes.
-- Per-record (44 bytes, little-endian): `UInt32 packageCounter`, `UInt32 timestamp`, `Float32 euler0..2`, `Float32 acc0..2`, `Float32 gyr0..2`.
+**SDK call sequence per file:**
+1. `device.stopExportFileData()` — reset any prior state
+2. `device.exportDataFormat = Data(...)` — set fields: timestamp, Euler angles, acceleration, angular velocity
+3. `device.recording.exportFileList = [fileIndex]` — single-file array
+4. Install `setDidParseExportFileDataBlock` — fires for every BLE packet; formats CSV row, batches to `fileQueue` every 200 packets
+5. Install `device.recording.exportFileDone` — fires at end; flushes final batch, closes file handle, marks task complete
+6. `device.startExportFileData()` — begins BLE transfer
+
+**Progress estimation:** SDK provides no total packet count. Estimated from file size using empirical ratio (~88 bytes/packet on-device). Progress is capped at 0.99 until `exportFileDone` fires.
+
+**Watchdog:** A per-file `ExportWatchdog` timer runs on `sdkQueue`. If no packets arrive for 10 seconds, it cancels the transfer, deletes the partial CSV, and marks the task failed.
+
+**Generation IDs:** `exportFileGeneration` is incremented before each export. Callbacks check their captured generation against the current value to discard stale calls from prior attempts.
 
 CSV columns: `packet_counter,timestamp,euler_x,euler_y,euler_z,acc_x,acc_y,acc_z,gyr_x,gyr_y,gyr_z`
 
@@ -105,6 +114,8 @@ idle → connecting → initializing → ready
 - Connection attempts have a 10-second timeout managed by `DispatchWorkItem` timers on the main thread.
 - `DotDevicePool.bindDevice()` must be called on `sdkQueue` after every connect/reconnect.
 - `device.exportDataFormat` and `device.recording.exportFileList` must be set before calling `startExportFileData()`.
+- `exportFileDone` can fire twice; guard with `exportCompleted` boolean and bump `exportFileGeneration` immediately on first call.
+- `setDidParseExportFileDataBlock` callback fires on `sdkQueue`; do not dispatch back to `sdkQueue` from inside it (deadlock). Dispatch file writes to `fileQueue` instead.
 
 ## No Test Suite
 

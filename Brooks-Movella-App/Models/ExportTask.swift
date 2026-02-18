@@ -29,6 +29,5 @@ nonisolated enum ExportStatus: Equatable, Sendable {
 nonisolated enum ExportSubphase: Equatable, Sendable {
     case idle
     case transferring
-    case converting
     case complete
 }
