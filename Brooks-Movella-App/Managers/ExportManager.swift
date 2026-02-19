@@ -41,6 +41,15 @@ final class ExportManager: ObservableObject {
             name: UIApplication.didEnterBackgroundNotification,
             object: nil
         )
+
+        // Prune recordings and cart items when sensors disconnect.
+        DotManager.shared.$connectedDots
+            .dropFirst()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] connected in
+                self?.pruneDisconnectedDots(connected: connected)
+            }
+            .store(in: &cancellables)
     }
 
     // MARK: - Queues
@@ -75,6 +84,7 @@ final class ExportManager: ObservableObject {
     private var activeWatchdog: ExportWatchdog?
     private var exportFileGeneration: Int = 0
     private var cleanupBackgroundTaskID: UIBackgroundTaskIdentifier = .invalid
+    private var cancellables = Set<AnyCancellable>()
 
     /// True while BLE transfer is active.
     private var isTransferring = false
@@ -89,6 +99,36 @@ final class ExportManager: ObservableObject {
 
     @objc private func appDidEnterBackground() {
         // bluetooth-central background mode keeps BLE callbacks alive — no action needed
+    }
+
+    // MARK: - Disconnection Pruning
+
+    /// Called on the main thread whenever the connected-dots list changes.
+    /// Removes recordings, selections, and cart items for any dot that is no
+    /// longer connected. Safe to call during export — skipped while exporting
+    /// so in-flight tasks are not disturbed.
+    private func pruneDisconnectedDots(connected: [Dot]) {
+        guard exportPhase != .exporting else { return }
+
+        let connectedAddresses = Set(connected.map { $0.address })
+        let disconnectedAddresses = Set(recordings.keys).subtracting(connectedAddresses)
+        guard !disconnectedAddresses.isEmpty else { return }
+
+        for address in disconnectedAddresses {
+            recordings.removeValue(forKey: address)
+        }
+
+        // Remove selections whose file no longer appears in any recording list.
+        let remainingIDs = Set(recordings.values.flatMap { $0 }.map { $0.id })
+        selectedIDs = selectedIDs.intersection(remainingIDs)
+
+        // Remove cart items whose sensor is gone.
+        cartItems.removeAll { disconnectedAddresses.contains($0.recording.dotAddress) }
+
+        // If recordings are now empty and we were in the ready state, go back to idle.
+        if recordings.isEmpty && exportPhase == .ready {
+            exportPhase = .idle
+        }
     }
 
     // MARK: - File Discovery
@@ -133,6 +173,12 @@ final class ExportManager: ObservableObject {
             guard let self else { return }
             self.isFetching = false
             self.exportPhase = .ready
+
+            // Remove cart items and selections for files that no longer exist
+            // on the sensor (e.g. erased while in the cart).
+            let availableIDs = Set(self.recordings.values.flatMap { $0 }.map { $0.id })
+            self.selectedIDs = self.selectedIDs.intersection(availableIDs)
+            self.cartItems.removeAll { !availableIDs.contains($0.recording.id) }
         }
     }
 

@@ -258,6 +258,7 @@ struct CartView: View {
 
     @State private var showShareSheet = false
     @State private var showCloseBlockedAlert = false
+    @State private var showingTemplatePicker = false
 
     // Run Details state
     @State private var selectedProfile: Profile?
@@ -508,19 +509,72 @@ struct CartView: View {
                 // Template picker (only if past workouts exist)
                 if !supabaseManager.workoutTemplates.isEmpty {
                     Divider()
-                    VStack(alignment: .leading, spacing: 4) {
+                    VStack(alignment: .leading, spacing: 6) {
                         Text("Load Template")
                             .font(.subheadline)
                             .foregroundColor(.secondary)
-                        Picker("Template", selection: $selectedTemplate) {
-                            Text("New template").tag(Optional<WorkoutTemplate>(nil))
-                            ForEach(supabaseManager.workoutTemplates) { template in
-                                Text(template.displayName).tag(Optional(template))
+                        Button {
+                            showingTemplatePicker = true
+                        } label: {
+                            HStack(spacing: 6) {
+                                Text(selectedTemplate?.displayName ?? "New template")
+                                    .font(.subheadline)
+                                    .foregroundColor(.blue)
+                                    .multilineTextAlignment(.leading)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                Image(systemName: "chevron.up.chevron.down")
+                                    .font(.caption)
+                                    .foregroundColor(.blue)
+                            }
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 8)
+                            .background(Color(.systemGray6))
+                            .cornerRadius(8)
+                        }
+                        .buttonStyle(.plain)
+                        .sheet(isPresented: $showingTemplatePicker) {
+                            NavigationView {
+                                List {
+                                    Button {
+                                        selectedTemplate = nil
+                                        showingTemplatePicker = false
+                                    } label: {
+                                        HStack {
+                                            Text("New template")
+                                                .foregroundColor(.primary)
+                                            Spacer()
+                                            if selectedTemplate == nil {
+                                                Image(systemName: "checkmark")
+                                                    .foregroundColor(.blue)
+                                            }
+                                        }
+                                    }
+                                    ForEach(supabaseManager.workoutTemplates) { template in
+                                        Button {
+                                            selectedTemplate = template
+                                            showingTemplatePicker = false
+                                        } label: {
+                                            HStack {
+                                                Text(template.displayName)
+                                                    .foregroundColor(.primary)
+                                                Spacer()
+                                                if selectedTemplate == template {
+                                                    Image(systemName: "checkmark")
+                                                        .foregroundColor(.blue)
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                .navigationTitle("Load Template")
+                                .navigationBarTitleDisplayMode(.inline)
+                                .toolbar {
+                                    ToolbarItem(placement: .cancellationAction) {
+                                        Button("Cancel") { showingTemplatePicker = false }
+                                    }
+                                }
                             }
                         }
-                        .pickerStyle(.menu)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .labelsHidden()
                         .onChange(of: selectedTemplate) { template in
                             if let t = template {
                                 shoeBrand      = t.shoeBrand
