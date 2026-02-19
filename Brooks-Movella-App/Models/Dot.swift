@@ -29,6 +29,7 @@ final class Dot: ObservableObject, Identifiable {
     @Published var isRecording = false
     @Published var sessionSynced = false
     @Published var isErasing = false
+    @Published private(set) var recordingFiles: [DotRecordingFile] = []
 
     /// Flash storage snapshot. Updated after connection, recording, and erase.
     /// We store our own copy because reading `device.usedSpace` / `device.totalSpace`
@@ -57,6 +58,9 @@ final class Dot: ObservableObject, Identifiable {
     /// Single-flight guard for `getFlashInfo`. Accessed only on `sdkQueue`.
     private var flashInfoInFlight = false
     private var flashInfoWaiters: [(Bool) -> Void] = []
+
+    /// Single-flight guard for `getExportFileInfo`. Accessed only on `sdkQueue`.
+    private var exportFileInfoInFlight = false
 
     // MARK: - Init
 
@@ -288,6 +292,59 @@ final class Dot: ObservableObject, Identifiable {
             }
         }
         check()
+    }
+
+    // MARK: - Export File Discovery
+
+    /// Fetches the list of recorded files from the sensor's flash storage.
+    ///
+    /// Uses the same gatekeeper pattern as `getFlashInfo` to handle the SDK's
+    /// double-firing callback. Populates `recordingFiles` on success.
+    func getExportFileInfo(completion: @escaping (Bool) -> Void) {
+        sdkQueue.async { [weak self] in
+            guard let self else { return }
+
+            if self.exportFileInfoInFlight {
+                completion(false)
+                return
+            }
+            self.exportFileInfoInFlight = true
+
+            var hasCapturedResult = false
+
+            self.device.setExportFileInfoDone { [weak self] _ in
+                guard let self, !hasCapturedResult else { return }
+                hasCapturedResult = true
+
+                let files: [DotRecordingFile] = (self.device.recording.files as? [DotRecordingFile]) ?? []
+
+                print("📁 [\(self.address)] Found \(files.count) recording files")
+                for (i, f) in files.enumerated() {
+                    print("   📄 [\(self.address)] listPos=\(i) size=\(f.fileSize) ts=\(f.timeStamap)")
+                }
+                
+                self.setOnMain { self.recordingFiles = files }
+                self.sdkQueue.async {
+                    self.device.setExportFileInfoDone(nil)
+                    self.exportFileInfoInFlight = false
+                    completion(true)
+                }
+            }
+
+            self.device.getExportFileInfo()
+
+            // Safety timeout
+            DispatchQueue.main.asyncAfter(deadline: .now() + 10.0) { [weak self] in
+                guard !hasCapturedResult else { return }
+                hasCapturedResult = true
+                print("⏰ [\(self?.address ?? "?")] Export file info timed out")
+                self?.sdkQueue.async {
+                    self?.device.setExportFileInfoDone(nil)
+                    self?.exportFileInfoInFlight = false
+                    completion(false)
+                }
+            }
+        }
     }
 
     // MARK: - Erase

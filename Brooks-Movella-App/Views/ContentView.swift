@@ -20,6 +20,12 @@ struct ContentView: View {
                     Image(systemName: "square.and.arrow.up")
                     Text("Export")
                 }
+
+            ProfilesView()
+                .tabItem {
+                    Image(systemName: "person.2")
+                    Text("Profiles")
+                }
         }
     }
 }

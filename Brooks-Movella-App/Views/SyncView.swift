@@ -150,14 +150,25 @@ struct SyncView: View {
 
     private var noSensors: Bool { manager.connectedDots.isEmpty }
 
+    private var sensorsInitializing: Bool {
+        !manager.connectedDots.isEmpty
+            && manager.connectedDots.contains { $0.connectionPhase != .ready }
+    }
+
     private var primaryButtonTitle: String {
         switch phase {
-        case .idle:                return noSensors ? "No Sensors Connected" : "Start Recording"
+        case .idle:                return noSensors ? "No Sensors Connected"
+                                          : sensorsInitializing ? "Sensors Initializing..."
+                                          : manager.hasPendingConnections ? "Connecting..."
+                                          : "Start Recording"
         case .syncing:             return "Syncing Sensors..."
         case .startingRecording:   return "Starting..."
         case .recording:           return noSensors ? "Sensors Disconnected" : "Stop Recording"
         case .stoppingRecording:   return "Stopping..."
-        case .error:               return noSensors ? "No Sensors Connected" : "Start Recording"
+        case .error:               return noSensors ? "No Sensors Connected"
+                                          : sensorsInitializing ? "Sensors Initializing..."
+                                          : manager.hasPendingConnections ? "Connecting..."
+                                          : "Start Recording"
         }
     }
 
@@ -170,18 +181,18 @@ struct SyncView: View {
 
     private var primaryButtonColor: Color {
         switch phase {
-        case .idle:                return noSensors ? .gray : .green
+        case .idle:                return (noSensors || sensorsInitializing || manager.hasPendingConnections) ? .gray : .green
         case .recording:           return noSensors ? .gray : .red
-        case .error:               return noSensors ? .gray : .green
+        case .error:               return (noSensors || sensorsInitializing || manager.hasPendingConnections) ? .gray : .green
         default:                   return .gray
         }
     }
 
     private var primaryButtonDisabled: Bool {
         switch phase {
-        case .idle:    return manager.connectedDots.isEmpty
+        case .idle:    return noSensors || sensorsInitializing || manager.hasPendingConnections
         case .recording: return false
-        case .error:   return manager.connectedDots.isEmpty
+        case .error:   return noSensors || sensorsInitializing || manager.hasPendingConnections
         default:       return true
         }
     }
@@ -260,6 +271,7 @@ struct DotStatusRow: View {
     var sessionPhase: SessionPhase = .idle
 
     @State private var breathe = false
+    @State private var eraseBreathe = false
 
     var body: some View {
         HStack {
@@ -270,7 +282,7 @@ struct DotStatusRow: View {
                     .symbolEffect(.rotate)
             } else {
                 Circle()
-                    .fill(dot.isConnected ? (dot.isRecording ? Color.red : Color.green) : Color.gray)
+                    .fill(dot.isConnected ? (sessionPhase == .recording ? Color.red : Color.green) : Color.gray)
                     .frame(width: 12, height: 12)
             }
 
@@ -280,7 +292,7 @@ struct DotStatusRow: View {
 
                 HStack(spacing: 8) {
                     StatusTag(text: "Connected", isActive: dot.isConnected, color: .green)
-                    StatusTag(text: "Recording", isActive: dot.isRecording, color: .red)
+                    StatusTag(text: "Recording", isActive: sessionPhase == .recording, color: .red)
                 }
 
                 // Storage bar
@@ -320,6 +332,11 @@ struct DotStatusRow: View {
                 breathe = false
             }
         }
+        .onChange(of: dot.isErasing) { erasing in
+            if !erasing {
+                eraseBreathe = false
+            }
+        }
     }
 
     @ViewBuilder
@@ -333,7 +350,13 @@ struct DotStatusRow: View {
                     }
                 }
         } else if dot.isErasing {
-            Color.pink.opacity(0.1)
+            Color.pink
+                .opacity(eraseBreathe ? 0.25 : 0.06)
+                .onAppear {
+                    withAnimation(.easeInOut(duration: 1.2).repeatForever(autoreverses: true)) {
+                        eraseBreathe = true
+                    }
+                }
         } else if sessionPhase.isSyncActive {
             Color.blue.opacity(0.08)
         } else {
