@@ -78,24 +78,13 @@ struct ExportView: View {
                             .padding(.horizontal)
                         }
 
-                        // Refresh button
-                        Button {
-                            exportManager.fetchRecordings(for: connectedDots)
-                        } label: {
-                            HStack {
-                                Image(systemName: "arrow.clockwise")
-                                Text("Refresh")
-                            }
-                            .font(.subheadline)
-                            .foregroundColor(.blue)
-                        }
-                        .padding(.top, 4)
                     }
 
                     Spacer()
                 }
                 .padding(.top)
             }
+            .refreshable { exportManager.fetchRecordings(for: connectedDots) }
             .onAppear {
                 // Auto-refresh recordings whenever the Export tab becomes visible,
                 // but only when it's safe: sensors connected, not mid-export, not
@@ -495,16 +484,21 @@ struct CartView: View {
                         .font(.subheadline)
                         .foregroundColor(.secondary)
                         .frame(width: 130, alignment: .leading)
-                    Picker("Runner Profile", selection: $selectedProfile) {
-                        Text("Select…").tag(Optional<Profile>(nil))
+                    Menu {
+                        Button("Select…") { selectedProfile = nil }
                         ForEach(supabaseManager.profiles) { profile in
-                            Text(profile.displayName).tag(Optional(profile))
+                            Button(profile.displayName) { selectedProfile = profile }
                         }
+                    } label: {
+                        Text(selectedProfile?.displayName ?? "Select…")
+                            .font(.subheadline)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                            .foregroundColor(.blue)
+                            .frame(maxWidth: .infinity, alignment: .leading)
                     }
-                    .pickerStyle(.menu)
-                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                .padding(.vertical, 6)
+                .padding(.vertical, 8)
 
                 // Template picker (only if past workouts exist)
                 if !supabaseManager.workoutTemplates.isEmpty {
