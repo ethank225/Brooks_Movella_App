@@ -56,7 +56,8 @@ final class ExportManager: ObservableObject {
 
     private var sdkQueue: DispatchQueue { DotManager.shared.sdkQueue }
     private let fileQueue = DispatchQueue(label: "ExportManager.fileQueue")
-    private let exportSequenceQueue = DispatchQueue(label: "ExportManager.exportSequenceQueue")
+    private let exportSequenceQueue = DispatchQueue(
+        label: "ExportManager.exportSequenceQueue")
 
     // MARK: - Published State
 
@@ -83,6 +84,8 @@ final class ExportManager: ObservableObject {
     private var currentExportCanceled = false
     private var activeWatchdog: ExportWatchdog?
     private var exportFileGeneration: Int = 0
+    private var exportSequenceGeneration: Int = 0
+    private var currentExportSemaphore: DispatchSemaphore?
     private var cleanupBackgroundTaskID: UIBackgroundTaskIdentifier = .invalid
     private var cancellables = Set<AnyCancellable>()
 
@@ -281,12 +284,16 @@ final class ExportManager: ObservableObject {
         // Group tasks by dot address
         let grouped = Dictionary(grouping: newTasks, by: { $0.cartItem.recording.dotAddress })
 
+        // Capture generation so only this export sequence can finalize the phase.
+        exportSequenceGeneration += 1
+        let myGen = exportSequenceGeneration
+        let semaphore = DispatchSemaphore(value: 0)
+        currentExportSemaphore = semaphore
+
         // Process devices sequentially on a dedicated queue so fileQueue stays
         // free for CSV writes dispatched from SDK callbacks.
         exportSequenceQueue.async { [weak self] in
             guard let self else { return }
-
-            let semaphore = DispatchSemaphore(value: 0)
 
             let dotAddresses = Array(grouped.keys).sorted()
             for address in dotAddresses {
@@ -314,6 +321,7 @@ final class ExportManager: ObservableObject {
             }
 
             DispatchQueue.main.async {
+                guard self.exportSequenceGeneration == myGen else { return }
                 self.exportPhase = .done
                 self.endExportBackgroundTask()
             }
@@ -322,8 +330,14 @@ final class ExportManager: ObservableObject {
 
     /// Cancel the active export.
     func cancelExport() {
-        currentExportCanceled = true
-        isTransferring = false
+        // Invalidate the current export generation so the sequence block's final
+        // DispatchQueue.main.async doesn't overwrite state after a new export starts.
+        exportSequenceGeneration += 1
+
+        sdkQueue.async {
+            self.currentExportCanceled = true
+            self.isTransferring = false
+        }
         activeWatchdog?.stop()
         activeWatchdog = nil
 
@@ -350,6 +364,13 @@ final class ExportManager: ObservableObject {
             }
             setTaskStatus(task, .canceled)
         }
+
+        // Unblock the exportSequenceQueue if it's blocked in semaphore.wait().
+        // The SDK does NOT call exportFileDone when stopExportFileData() is called
+        // during an active transfer, so the semaphore would never be signaled otherwise,
+        // leaving the sequence queue hung and preventing any subsequent export.
+        currentExportSemaphore?.signal()
+        currentExportSemaphore = nil
 
         setOnMain {
             self.exportPhase = .done
@@ -399,10 +420,13 @@ final class ExportManager: ObservableObject {
             return
         }
 
+        exportSequenceGeneration += 1
+        let myGen = exportSequenceGeneration
+        let semaphore = DispatchSemaphore(value: 0)
+        currentExportSemaphore = semaphore
+
         exportSequenceQueue.async { [weak self] in
             guard let self else { return }
-
-            let semaphore = DispatchSemaphore(value: 0)
 
             for (address, tasksForDot) in grouped {
                 guard !self.currentExportCanceled else { break }
@@ -421,6 +445,7 @@ final class ExportManager: ObservableObject {
             }
 
             DispatchQueue.main.async {
+                guard self.exportSequenceGeneration == myGen else { return }
                 self.exportPhase = .done
                 self.endExportBackgroundTask()
             }
@@ -432,6 +457,27 @@ final class ExportManager: ObservableObject {
         tasks.removeAll()
         exportPhase = recordings.isEmpty ? .idle : .ready
     }
+    
+    private func validatePacketSequence(csvURL: URL) -> Bool {
+        guard let content = try? String(contentsOf: csvURL, encoding: .utf8) else { return false }
+        let lines = content.components(separatedBy: "\n").dropFirst() // skip header
+        
+        var lastCounter: UInt32? = nil
+        for line in lines {
+            guard !line.isEmpty else { continue }
+            let cols = line.components(separatedBy: ",")
+            guard let counterStr = cols.first, let counter = UInt32(counterStr) else { return false }
+            
+            if let last = lastCounter {
+                if counter != last + 1 {
+                    print("⚠️ Packet gap detected: expected \(last + 1), got \(counter)")
+                    return false
+                }
+            }
+            lastCounter = counter
+        }
+        return true
+    }
 
     // MARK: - Per-Device Export
 
@@ -439,7 +485,6 @@ final class ExportManager: ObservableObject {
     private func exportFilesForDot(dot: Dot, tasks: [ExportTask], completion: @escaping () -> Void) {
         let fileIndices = tasks.map { $0.cartItem.recording.fileIndex }
 
-        // Configure export data format: timestamp + euler + acceleration + angular velocity
         let formatBytes: [UInt8] = [
             UInt8(XSRecordingData.timestamp.rawValue),
             UInt8(XSRecordingData.eulerAngles.rawValue),
@@ -460,18 +505,13 @@ final class ExportManager: ObservableObject {
 
             setTaskStatus(task, .running)
             setOnMain { task.subphase = .transferring }
-            isTransferring = true
 
             var packetsReceived = 0
             var exportCompleted = false
 
             let csvPath = csvURL(for: task)
-
-            // Estimate total packets from file size.
-            // Empirical ratio: 647 KB → 7541 packets → ~88 bytes per packet on-device.
             let estimatedTotalPackets = max(task.cartItem.recording.fileSize / 88, 1)
 
-            // Create CSV file with header on fileQueue, then configure SDK + start export on sdkQueue.
             fileQueue.async { [weak self] in
                 guard let self else { completion(); return }
 
@@ -479,8 +519,10 @@ final class ExportManager: ObservableObject {
                 FileManager.default.createFile(atPath: csvPath.path, contents: Data(csvHeader.utf8))
                 guard let fileHandle = try? FileHandle(forWritingTo: csvPath) else {
                     self.setTaskStatus(task, .failed, error: "Failed to open CSV file")
-                    taskIndex += 1
-                    exportNextFile()
+                    self.sdkQueue.async {
+                        taskIndex += 1
+                        exportNextFile()
+                    }
                     return
                 }
                 fileHandle.seekToEndOfFile()
@@ -488,64 +530,51 @@ final class ExportManager: ObservableObject {
                 self.sdkQueue.async { [weak self] in
                     guard let self else { completion(); return }
 
-                    // Batch of CSV row bytes — owned and mutated only on sdkQueue
                     var batch = Data()
-                    batch.reserveCapacity(200 * 120)  // ~120 bytes per CSV row
+                    batch.reserveCapacity(200 * 120)
 
                     let device = dot.device
-
-                    // Reset SDK export state from previous file (no-op on first file)
                     device.stopExportFileData()
+                    self.isTransferring = true
 
-                    // Bump generation to invalidate any stale callbacks
                     self.exportFileGeneration += 1
                     let generation = self.exportFileGeneration
 
-                    // Set export format
                     device.exportDataFormat = Data(formatBytes)
-
-                    // Set file list (single file)
                     device.recording.exportFileList = [NSNumber(value: fileIndex)]
 
-                    // Create watchdog for this file
+                    // MARK: Watchdog — timeout just fails, no validation needed here
                     let watchdog = ExportWatchdog(
                         timeout: self.dataTimeoutInterval,
                         queue: self.sdkQueue
                     ) { [weak self] in
-                        // Timeout handler — runs on sdkQueue
                         guard let self, !exportCompleted else { return }
                         exportCompleted = true
 
                         print("⏰ [\(dot.address)] Export data timeout for \(task.cartItem.label)")
 
-                        // Clear callbacks to prevent late packets leaking
                         device.setDidParseExportFileDataBlock(nil)
                         device.recording.exportFileDone = { _, _ in }
                         device.stopExportFileData()
-
                         self.isTransferring = false
 
-                        // Close handle and delete partial .csv
                         self.fileQueue.async {
                             try? fileHandle.close()
                             try? FileManager.default.removeItem(at: csvPath)
-
                             self.setTaskStatus(task, .failed, error: "Export timed out")
-                            taskIndex += 1
-                            exportNextFile()
+                            self.sdkQueue.async {
+                                taskIndex += 1
+                                exportNextFile()
+                            }
                         }
                     }
                     self.activeWatchdog = watchdog
 
-                    // Timing for throughput measurement
                     let exportStartTime = CACurrentMediaTime()
                     var lastProgressUpdate = exportStartTime
-
-                    // Callback instrumentation
                     var cbTimeTotal: Double = 0
                     var cbTimeMax: Double = 0
 
-                    // Install data callback — format CSV row, dispatch batches to fileQueue
                     device.setDidParseExportFileDataBlock { [weak self] plotData in
                         let cbStart = CACurrentMediaTime()
                         guard let self, !exportCompleted else { return }
@@ -561,17 +590,12 @@ final class ExportManager: ObservableObject {
                                          plotData.gyr0, plotData.gyr1, plotData.gyr2)
                         batch.append(Data(row.utf8))
 
-                        // Flush batch to fileQueue every 200 packets
                         if packetsReceived % 200 == 0 {
                             let captured = batch
                             batch.removeAll(keepingCapacity: true)
-                            self.fileQueue.async {
-                                fileHandle.write(captured)
-                            }
+                            self.fileQueue.async { fileHandle.write(captured) }
                         }
 
-                        // Throttled UI update: every 100 packets or 0.5s
-                        // Linear progress capped at 0.99 until exportFileDone sets 1.0
                         let now = CACurrentMediaTime()
                         if packetsReceived % 100 == 0 || (now - lastProgressUpdate) >= 0.5 {
                             lastProgressUpdate = now
@@ -579,7 +603,6 @@ final class ExportManager: ObservableObject {
                             self.setOnMain { task.progress = progress }
                         }
 
-                        // Instrumentation
                         let cbDuration = CACurrentMediaTime() - cbStart
                         cbTimeTotal += cbDuration
                         if cbDuration > cbTimeMax { cbTimeMax = cbDuration }
@@ -589,7 +612,7 @@ final class ExportManager: ObservableObject {
                         }
                     }
 
-                    // Install file-done callback
+                    // MARK: exportFileDone — validate here, log gaps and continue
                     device.recording.exportFileDone = { [weak self] _, result in
                         guard let self, !exportCompleted else { return }
                         guard self.exportFileGeneration == generation else { return }
@@ -598,30 +621,30 @@ final class ExportManager: ObservableObject {
                         watchdog.stop()
                         self.activeWatchdog = nil
                         self.isTransferring = false
-
-                        // Bump generation again to invalidate any double-fire
                         self.exportFileGeneration += 1
 
                         device.setDidParseExportFileDataBlock(nil)
                         device.recording.exportFileDone = { _, _ in }
 
-                        // Capture remaining batch on sdkQueue — no shared mutable Data crosses queues
                         let finalChunk: Data? = batch.isEmpty ? nil : batch
                         batch.removeAll(keepingCapacity: true)
                         let finalPackets = packetsReceived
                         let elapsed = CACurrentMediaTime() - exportStartTime
                         let avgCb = finalPackets > 0 ? cbTimeTotal / Double(finalPackets) : 0
 
-                        // Flush remaining + close on fileQueue, then mark success
                         self.fileQueue.async {
-                            if let finalChunk {
-                                fileHandle.write(finalChunk)
-                            }
+                            if let finalChunk { fileHandle.write(finalChunk) }
                             try? fileHandle.close()
 
                             let pps = elapsed > 0 ? Double(finalPackets) / elapsed : 0
                             print("📡 [\(dot.address)] Transfer: \(finalPackets) pkts in \(String(format: "%.1f", elapsed))s (\(String(format: "%.0f", pps)) pkt/s), cb avg \(String(format: "%.2f", avgCb * 1000))ms")
 
+                            // MARK: Packet gap validation
+                            let isValid = self.validatePacketSequence(csvURL: csvPath)
+
+                            if !isValid {
+                                print("⚠️ [\(dot.address)] Packet loss detected in \(task.cartItem.label)")
+                            }
                             self.setOnMain {
                                 task.progress = 1.0
                                 task.outputURL = csvPath
@@ -629,12 +652,14 @@ final class ExportManager: ObservableObject {
                                 task.status = .success
                                 print("✅ Exported \(task.cartItem.label) → \(csvPath.lastPathComponent)")
                             }
-                            taskIndex += 1
-                            exportNextFile()
+
+                            self.sdkQueue.async {
+                                taskIndex += 1
+                                exportNextFile()
+                            }
                         }
                     }
 
-                    // Install status callback
                     device.recording.updateExportingStatus = { status in
                         switch status {
                         case .isStopExportingData:
@@ -644,7 +669,6 @@ final class ExportManager: ObservableObject {
                         }
                     }
 
-                    // Start export — CSV file is already created on fileQueue
                     device.startExportFileData()
                     print("📤 [\(dot.address)] Started export for file \(fileIndex)")
                 }

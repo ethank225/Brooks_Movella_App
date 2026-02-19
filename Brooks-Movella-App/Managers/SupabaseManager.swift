@@ -83,12 +83,11 @@ final class SupabaseManager: ObservableObject {
     }
 
     // MARK: - Workout Templates
-
-    /// Fetches distinct workout metadata combos from the workouts table, most recent first.
+    // Now fetches from sessions instead of workouts
     func fetchWorkoutTemplates() async {
         do {
             let rows: [WorkoutTemplateRow] = try await client
-                .from("workouts")
+                .from("sessions")
                 .select("shoe_brand,shoe_model,shoe_generation,study,test,product,condition_type")
                 .order("created_at", ascending: false)
                 .execute()
@@ -115,9 +114,8 @@ final class SupabaseManager: ObservableObject {
     }
 
     // MARK: - Upload Workout
-
-    /// Uploads a CSV to Supabase Storage and inserts a row in the workouts table.
-    func uploadWorkout(csvURL: URL, userId: UUID, sessionId: UUID, template: WorkoutTemplate) async throws {
+    // Creates session once with metadata, then inserts one workout row per file
+    func uploadWorkout(csvURL: URL, userId: UUID, sessionId: UUID, template: WorkoutTemplate, conditionType: String) async throws {
         let csvData = try Data(contentsOf: csvURL)
         let storagePath = "\(userId.uuidString)/\(sessionId.uuidString)/\(csvURL.lastPathComponent)"
 
@@ -126,6 +124,15 @@ final class SupabaseManager: ObservableObject {
             .upload(storagePath, data: csvData, options: FileOptions(contentType: "text/csv"))
 
         let payload = WorkoutPayload(
+            sessionId:     sessionId,
+            blobAddress:   storagePath
+        )
+        try await client.from("workouts").insert(payload).execute()
+    }
+
+    // Call this once per export batch before uploading individual files
+    func createSession(userId: UUID, template: WorkoutTemplate) async throws -> UUID {
+        let payload = SessionPayload(
             userId:         userId,
             shoeBrand:      template.shoeBrand,
             shoeModel:      template.shoeModel,
@@ -133,32 +140,15 @@ final class SupabaseManager: ObservableObject {
             study:          template.study,
             test:           template.test,
             product:        template.product,
-            conditionType:  template.conditionType,
-            blobAddress:    storagePath,
-            sessionId:      sessionId
+            conditionType: template.conditionType
         )
-        try await client.from("workouts").insert(payload).execute()
-    }
-}
-
-// MARK: - Private helpers
-
-private struct WorkoutTemplateRow: Codable {
-    let shoeBrand: String
-    let shoeModel: String
-    let shoeGeneration: String
-    let study: String
-    let test: String
-    let product: String
-    let conditionType: String
-
-    enum CodingKeys: String, CodingKey {
-        case shoeBrand      = "shoe_brand"
-        case shoeModel      = "shoe_model"
-        case shoeGeneration = "shoe_generation"
-        case study
-        case test
-        case product
-        case conditionType  = "condition_type"
+        let session: Session = try await client
+            .from("sessions")
+            .insert(payload)
+            .select()
+            .single()
+            .execute()
+            .value
+        return session.id
     }
 }

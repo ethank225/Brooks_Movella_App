@@ -533,47 +533,7 @@ struct CartView: View {
                         }
                         .buttonStyle(.plain)
                         .sheet(isPresented: $showingTemplatePicker) {
-                            NavigationView {
-                                List {
-                                    Button {
-                                        selectedTemplate = nil
-                                        showingTemplatePicker = false
-                                    } label: {
-                                        HStack {
-                                            Text("New template")
-                                                .foregroundColor(.primary)
-                                            Spacer()
-                                            if selectedTemplate == nil {
-                                                Image(systemName: "checkmark")
-                                                    .foregroundColor(.blue)
-                                            }
-                                        }
-                                    }
-                                    ForEach(supabaseManager.workoutTemplates) { template in
-                                        Button {
-                                            selectedTemplate = template
-                                            showingTemplatePicker = false
-                                        } label: {
-                                            HStack {
-                                                Text(template.displayName)
-                                                    .foregroundColor(.primary)
-                                                Spacer()
-                                                if selectedTemplate == template {
-                                                    Image(systemName: "checkmark")
-                                                        .foregroundColor(.blue)
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                .navigationTitle("Load Template")
-                                .navigationBarTitleDisplayMode(.inline)
-                                .toolbar {
-                                    ToolbarItem(placement: .cancellationAction) {
-                                        Button("Cancel") { showingTemplatePicker = false }
-                                    }
-                                }
-                            }
+                            TemplatePickerView(selectedTemplate: $selectedTemplate)
                         }
                         .onChange(of: selectedTemplate) { template in
                             if let t = template {
@@ -698,22 +658,44 @@ struct CartView: View {
     private func triggerPendingUploads() {
         guard let profile = selectedProfile else { return }
         let template = currentTemplate()
+        let pendingTasks = exportManager.tasks.filter { $0.status == .success && $0.uploadStatus == .pending }
+        guard !pendingTasks.isEmpty else { return }
 
-        for task in exportManager.tasks where task.status == .success && task.uploadStatus == .pending {
-            guard let url = task.outputURL else { continue }
-            let sessionId = task.cartItem.sessionId
-            task.uploadStatus = .uploading
-            Task {
-                do {
-                    try await SupabaseManager.shared.uploadWorkout(
-                        csvURL: url, userId: profile.id,
-                        sessionId: sessionId, template: template
+        Task {
+            do {
+                // Group by sessionId and create one DB session per group
+                let sessionGroups = Dictionary(grouping: pendingTasks) { $0.cartItem.sessionId }
+                var sessionIdMap: [UUID: UUID] = [:]  // cartSessionId → DB session_id
+
+                for cartSessionId in sessionGroups.keys {
+                    let dbSessionId = try await SupabaseManager.shared.createSession(
+                        userId: profile.id,
+                        template: template
                     )
-                    task.uploadStatus = .uploaded
-                } catch {
-                    task.uploadError = error.localizedDescription
-                    task.uploadStatus = .failed
+                    sessionIdMap[cartSessionId] = dbSessionId
                 }
+
+                // Now upload each file
+                for task in pendingTasks {
+                    guard let url = task.outputURL,
+                          let dbSessionId = sessionIdMap[task.cartItem.sessionId] else { continue }
+                    task.uploadStatus = .uploading
+                    do {
+                        try await SupabaseManager.shared.uploadWorkout(
+                            csvURL: url,
+                            userId: profile.id,
+                            sessionId: dbSessionId,
+                            template: template,
+                            conditionType: conditionType
+                        )
+                        task.uploadStatus = .uploaded
+                    } catch {
+                        task.uploadError = error.localizedDescription
+                        task.uploadStatus = .failed
+                    }
+                }
+            } catch {
+                print("⚠️ Session creation failed: \(error)")
             }
         }
     }
@@ -721,14 +703,18 @@ struct CartView: View {
     private func retryUpload(for task: ExportTask) {
         guard let profile = selectedProfile, let url = task.outputURL else { return }
         let template = currentTemplate()
-        let sessionId = task.cartItem.sessionId
         task.uploadStatus = .uploading
         task.uploadError = nil
         Task {
             do {
+                let sessionId = try await SupabaseManager.shared.createSession(
+                    userId: profile.id, template: template
+                )
                 try await SupabaseManager.shared.uploadWorkout(
                     csvURL: url, userId: profile.id,
-                    sessionId: sessionId, template: template
+                    sessionId: sessionId,
+                    template: template,
+                    conditionType: conditionType
                 )
                 task.uploadStatus = .uploaded
             } catch {
