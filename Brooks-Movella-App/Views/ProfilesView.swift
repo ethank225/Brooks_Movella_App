@@ -155,21 +155,12 @@ struct ProfilesView: View {
 private struct ProfileRow: View {
     let profile: Profile
 
-    private var birthYear: String {
-        profile.birthDateAsDate.map { date in
-            date.formatted(.dateTime.year())
-        } ?? "—"
-    }
-
     var body: some View {
         HStack {
             Text(profile.displayName)
                 .font(.body)
-            Spacer()
-            Text(birthYear)
-                .font(.body)
-                .foregroundColor(.secondary)
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.vertical, 4)
     }
 

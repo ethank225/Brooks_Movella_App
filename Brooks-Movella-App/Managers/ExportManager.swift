@@ -162,19 +162,42 @@ final class ExportManager: ObservableObject {
 
     // MARK: - Cart
 
-    /// Move selected files into the cart. Clears selection.
+    /// Returns distinct session UUIDs in the order they first appear in cartItems.
+    var cartSessions: [UUID] {
+        var seen = Set<UUID>()
+        return cartItems.compactMap { seen.insert($0.sessionId).inserted ? $0.sessionId : nil }
+    }
+
+    /// Move selected files into the cart, auto-grouping into sessions by timestamp proximity.
+    /// Files recorded within 60 seconds of an existing session item are assigned to that session.
     func buildCart() {
         let allFiles = recordings.values.flatMap { $0 }
         let selected = allFiles.filter { selectedIDs.contains($0.id) }
 
         // Don't add duplicates already in cart
         let existingIDs = Set(cartItems.map { $0.id })
-        let newItems = selected
-            .filter { !existingIDs.contains($0.id) }
-            .map { CartItem(recording: $0) }
+
+        var newItems: [CartItem] = []
+        for file in selected
+                .filter({ !existingIDs.contains($0.id) })
+                .sorted(by: { $0.timestamp < $1.timestamp }) {
+            let sid = sessionForFile(file, considering: cartItems + newItems) ?? UUID()
+            var item = CartItem(recording: file)
+            item.sessionId = sid
+            newItems.append(item)
+        }
 
         cartItems.append(contentsOf: newItems)
         selectedIDs.removeAll()
+    }
+
+    private func sessionForFile(_ file: RecordingFile, considering items: [CartItem]) -> UUID? {
+        items.first(where: { abs(Int(file.timestamp) - Int($0.recording.timestamp)) <= 60 })?.sessionId
+    }
+
+    func reassignSession(itemId: String, to sessionId: UUID) {
+        guard let idx = cartItems.firstIndex(where: { $0.id == itemId }) else { return }
+        cartItems[idx].sessionId = sessionId
     }
 
     func removeFromCart(_ item: CartItem) {

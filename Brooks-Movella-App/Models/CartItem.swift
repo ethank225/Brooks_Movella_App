@@ -5,6 +5,7 @@ struct CartItem: Identifiable {
     let id: String
     let recording: RecordingFile
     var label: String
+    var sessionId: UUID = UUID()
 
     init(recording: RecordingFile) {
         self.id = recording.id

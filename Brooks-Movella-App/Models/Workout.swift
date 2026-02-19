@@ -77,7 +77,7 @@ struct WorkoutTemplate: Identifiable, Hashable {
             .joined(separator: "§")
     }
 
-    var displayName: String { "\(shoeBrand) \(shoeModel) \(shoeGeneration)" }
+    var displayName: String { "\(shoeBrand) \(shoeModel) \(shoeGeneration) \(study) \(product)" }
 
     static func == (lhs: WorkoutTemplate, rhs: WorkoutTemplate) -> Bool { lhs.id == rhs.id }
     func hash(into hasher: inout Hasher) { hasher.combine(id) }

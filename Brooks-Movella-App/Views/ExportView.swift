@@ -96,6 +96,17 @@ struct ExportView: View {
                 }
                 .padding(.top)
             }
+            .onAppear {
+                // Auto-refresh recordings whenever the Export tab becomes visible,
+                // but only when it's safe: sensors connected, not mid-export, not
+                // in the post-export done state (user may be about to share).
+                let safeToRefresh = !connectedDots.isEmpty
+                    && exportManager.exportPhase != .exporting
+                    && exportManager.exportPhase != .done
+                if safeToRefresh {
+                    exportManager.fetchRecordings(for: connectedDots)
+                }
+            }
             .navigationTitle("Export")
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
@@ -246,7 +257,7 @@ struct CartView: View {
     @Environment(\.dismiss) private var dismiss
 
     @State private var showShareSheet = false
-    @State private var lastSessionId: UUID?
+    @State private var showCloseBlockedAlert = false
 
     // Run Details state
     @State private var selectedProfile: Profile?
@@ -254,7 +265,8 @@ struct CartView: View {
     @State private var shoeBrand      = ""
     @State private var shoeModel      = ""
     @State private var shoeGeneration = ""
-    @State private var conditionType  = ""
+    @State private var conditionTags: [String] = []
+    private var conditionType: String { conditionTags.joined(separator: ",") }
     @State private var study          = ""
     @State private var test           = ""
     @State private var product        = ""
@@ -268,7 +280,7 @@ struct CartView: View {
         if shoeBrand.trimmingCharacters(in: .whitespaces).isEmpty      { missing.append("Shoe Brand") }
         if shoeModel.trimmingCharacters(in: .whitespaces).isEmpty      { missing.append("Shoe Model") }
         if shoeGeneration.trimmingCharacters(in: .whitespaces).isEmpty { missing.append("Shoe Generation") }
-        if conditionType.trimmingCharacters(in: .whitespaces).isEmpty  { missing.append("Condition Type") }
+        if conditionTags.isEmpty                                         { missing.append("Condition Type") }
         if study.trimmingCharacters(in: .whitespaces).isEmpty          { missing.append("Study") }
         if test.trimmingCharacters(in: .whitespaces).isEmpty           { missing.append("Test") }
         if product.trimmingCharacters(in: .whitespaces).isEmpty        { missing.append("Product") }
@@ -294,11 +306,17 @@ struct CartView: View {
                     } else if !isDone || exportManager.tasks.isEmpty {
                         // Cart items
                         SectionCard(title: "Cart — \(exportManager.cartItems.count) item\(exportManager.cartItems.count == 1 ? "" : "s")", icon: "cart") {
+                            let sessions = exportManager.cartSessions
                             ForEach(exportManager.cartItems) { item in
+                                let sessionNumber = (sessions.firstIndex(of: item.sessionId) ?? 0) + 1
                                 CartItemRow(
                                     item: item,
-                                    onLabelChange: { exportManager.updateLabel(for: item.id, label: $0) },
-                                    onRemove: { exportManager.removeFromCart(item) },
+                                    sessionNumber: sessionNumber,
+                                    sessions: sessions,
+                                    onLabelChange:   { exportManager.updateLabel(for: item.id, label: $0) },
+                                    onRemove:        { exportManager.removeFromCart(item) },
+                                    onSessionChange: { exportManager.reassignSession(itemId: item.id, to: $0) },
+                                    onNewSession:    { exportManager.reassignSession(itemId: item.id, to: UUID()) },
                                     disabled: isExporting
                                 )
                             }
@@ -331,10 +349,14 @@ struct CartView: View {
                                 Text("Select a runner profile to enable export")
                                     .font(.caption)
                                     .foregroundColor(.secondary)
+                                    .frame(maxWidth: .infinity, alignment: .center)
+                                    .padding(.horizontal)
                             } else if !emptyMetadataFields.isEmpty {
                                 Text("Fill in: \(emptyMetadataFields.joined(separator: ", "))")
                                     .font(.caption)
                                     .foregroundColor(.secondary)
+                                    .frame(maxWidth: .infinity, alignment: .center)
+                                    .padding(.horizontal)
                             }
                         }
                     }
@@ -430,8 +452,20 @@ struct CartView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .navigationBarLeading) {
-                    Button("Close") { dismiss() }
+                    Button("Close") {
+                        if isExporting {
+                            showCloseBlockedAlert = true
+                        } else {
+                            dismiss()
+                        }
+                    }
                 }
+            }
+            .interactiveDismissDisabled(isExporting)
+            .alert("Export in Progress", isPresented: $showCloseBlockedAlert) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text("Please wait for the export to finish before closing.")
             }
             .sheet(isPresented: $showShareSheet) {
                 if !exportManager.exportedFileURLs.isEmpty {
@@ -452,15 +486,16 @@ struct CartView: View {
 
     private var runDetailsSection: some View {
         SectionCard(title: "Run Details", icon: "figure.run") {
-            VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 0) {
 
                 // Profile picker
-                VStack(alignment: .leading, spacing: 4) {
+                HStack {
                     Text("Runner Profile")
-                        .font(.caption)
+                        .font(.subheadline)
                         .foregroundColor(.secondary)
+                        .frame(width: 130, alignment: .leading)
                     Picker("Runner Profile", selection: $selectedProfile) {
-                        Text("Select a profile…").tag(Optional<Profile>(nil))
+                        Text("Select…").tag(Optional<Profile>(nil))
                         ForEach(supabaseManager.profiles) { profile in
                             Text(profile.displayName).tag(Optional(profile))
                         }
@@ -468,14 +503,14 @@ struct CartView: View {
                     .pickerStyle(.menu)
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
-
-                Divider()
+                .padding(.vertical, 6)
 
                 // Template picker (only if past workouts exist)
                 if !supabaseManager.workoutTemplates.isEmpty {
+                    Divider()
                     VStack(alignment: .leading, spacing: 4) {
                         Text("Load Template")
-                            .font(.caption)
+                            .font(.subheadline)
                             .foregroundColor(.secondary)
                         Picker("Template", selection: $selectedTemplate) {
                             Text("New template").tag(Optional<WorkoutTemplate>(nil))
@@ -485,42 +520,108 @@ struct CartView: View {
                         }
                         .pickerStyle(.menu)
                         .frame(maxWidth: .infinity, alignment: .leading)
+                        .labelsHidden()
                         .onChange(of: selectedTemplate) { template in
-                            guard let t = template else { return }
-                            shoeBrand      = t.shoeBrand
-                            shoeModel      = t.shoeModel
-                            shoeGeneration = t.shoeGeneration
-                            conditionType  = t.conditionType
-                            study          = t.study
-                            test           = t.test
-                            product        = t.product
+                            if let t = template {
+                                shoeBrand      = t.shoeBrand
+                                shoeModel      = t.shoeModel
+                                shoeGeneration = t.shoeGeneration
+                                conditionTags  = t.conditionType
+                                    .split(separator: ",")
+                                    .map { $0.trimmingCharacters(in: .whitespaces).uppercased() }
+                                    .filter { tag in CartView.conditionOptions.contains { $0.label == tag } }
+                                study          = t.study
+                                test           = t.test
+                                product        = t.product
+                            } else {
+                                shoeBrand      = ""
+                                shoeModel      = ""
+                                shoeGeneration = ""
+                                conditionTags  = []
+                                study          = ""
+                                test           = ""
+                                product        = ""
+                            }
                         }
                     }
-
-                    Divider()
+                    .padding(.vertical, 6)
                 }
 
-                // Metadata fields
-                Group {
-                    metadataField("Shoe Brand",      text: $shoeBrand)
-                    metadataField("Shoe Model",      text: $shoeModel)
-                    metadataField("Shoe Generation", text: $shoeGeneration)
-                    metadataField("Condition Type",  text: $conditionType)
-                    metadataField("Study",           text: $study)
-                    metadataField("Test",            text: $test)
-                    metadataField("Product",         text: $product)
+                Divider()
+
+                // Shoe fields
+                VStack(spacing: 10) {
+                    metadataField("Shoe Brand",      placeholder: "Brooks",         text: $shoeBrand)
+                    metadataField("Shoe Model",      placeholder: "Adrenaline GTS", text: $shoeModel)
+                    metadataField("Shoe Generation", placeholder: "25",             text: $shoeGeneration)
+                }
+                .padding(.vertical, 10)
+
+                Divider()
+
+                // Condition type selector
+                conditionTypeField
+                    .padding(.vertical, 10)
+
+                Divider()
+
+                // Study / Test / Product
+                VStack(spacing: 10) {
+                    metadataField("Study",   placeholder: "2000 Validation Research", text: $study)
+                    metadataField("Test",    placeholder: "R1",                        text: $test)
+                    metadataField("Product", placeholder: "Runner Unlock",             text: $product)
+                }
+                .padding(.vertical, 10)
+            }
+        }
+    }
+
+    private static let conditionOptions: [(label: String, color: Color)] = [
+        ("RUN",   .blue),
+        ("SQUAT", .orange),
+        ("LUNGE", .green),
+        ("WALK",  .indigo),
+    ]
+
+    private var conditionTypeField: some View {
+        VStack(spacing: 8) {
+            Text("Select")
+                .font(.subheadline)
+                .foregroundColor(.secondary)
+                .frame(maxWidth: .infinity, alignment: .center)
+
+            HStack(spacing: 6) {
+                ForEach(Self.conditionOptions, id: \.label) { option in
+                    let selected = conditionTags.contains(option.label)
+                    Button {
+                        if selected {
+                            conditionTags.removeAll { $0 == option.label }
+                        } else {
+                            conditionTags.append(option.label)
+                        }
+                    } label: {
+                        Text(option.label)
+                            .font(.subheadline.bold())
+                            .lineLimit(1)
+                            .foregroundColor(selected ? .white : .primary)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 8)
+                            .background(selected ? option.color : Color(.systemGray5))
+                            .cornerRadius(10)
+                    }
+                    .buttonStyle(.plain)
                 }
             }
         }
     }
 
-    private func metadataField(_ label: String, text: Binding<String>) -> some View {
+    private func metadataField(_ label: String, placeholder: String, text: Binding<String>) -> some View {
         HStack {
             Text(label)
                 .font(.subheadline)
                 .foregroundColor(.secondary)
                 .frame(width: 130, alignment: .leading)
-            TextField(label, text: text)
+            TextField(placeholder, text: text)
                 .font(.subheadline)
                 .textFieldStyle(.roundedBorder)
         }
@@ -543,16 +644,10 @@ struct CartView: View {
     private func triggerPendingUploads() {
         guard let profile = selectedProfile else { return }
         let template = currentTemplate()
-        let sessionId: UUID
-        if let existing = lastSessionId {
-            sessionId = existing
-        } else {
-            sessionId = UUID()
-            lastSessionId = sessionId
-        }
 
         for task in exportManager.tasks where task.status == .success && task.uploadStatus == .pending {
             guard let url = task.outputURL else { continue }
+            let sessionId = task.cartItem.sessionId
             task.uploadStatus = .uploading
             Task {
                 do {
@@ -572,7 +667,7 @@ struct CartView: View {
     private func retryUpload(for task: ExportTask) {
         guard let profile = selectedProfile, let url = task.outputURL else { return }
         let template = currentTemplate()
-        let sessionId = lastSessionId ?? UUID()
+        let sessionId = task.cartItem.sessionId
         task.uploadStatus = .uploading
         task.uploadError = nil
         Task {
@@ -594,14 +689,45 @@ struct CartView: View {
 
 private struct CartItemRow: View {
     let item: CartItem
-    let onLabelChange: (String) -> Void
-    let onRemove: () -> Void
+    let sessionNumber: Int
+    let sessions: [UUID]
+    let onLabelChange:   (String) -> Void
+    let onRemove:        () -> Void
+    let onSessionChange: (UUID) -> Void
+    let onNewSession:    () -> Void
     var disabled: Bool = false
 
     @State private var editedLabel: String = ""
 
     var body: some View {
         HStack(spacing: 12) {
+            // Session badge / picker
+            if !disabled {
+                Menu {
+                    ForEach(sessions.indices, id: \.self) { i in
+                        Button("Session \(i + 1)") { onSessionChange(sessions[i]) }
+                    }
+                    Divider()
+                    Button("New Session") { onNewSession() }
+                } label: {
+                    Text("S\(sessionNumber)")
+                        .font(.caption2.bold())
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 3)
+                        .background(sessionColor(sessionNumber))
+                        .clipShape(Capsule())
+                }
+            } else {
+                Text("S\(sessionNumber)")
+                    .font(.caption2.bold())
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 3)
+                    .background(sessionColor(sessionNumber))
+                    .clipShape(Capsule())
+            }
+
             VStack(alignment: .leading, spacing: 4) {
                 TextField("File label", text: $editedLabel)
                     .font(.subheadline.weight(.medium))
@@ -634,6 +760,11 @@ private struct CartItemRow: View {
         .background(Color.gray.opacity(0.1))
         .cornerRadius(10)
         .onAppear { editedLabel = item.label }
+    }
+
+    private func sessionColor(_ n: Int) -> Color {
+        let colors: [Color] = [.purple, .blue, .green, .orange, .pink]
+        return colors[(n - 1) % colors.count]
     }
 }
 

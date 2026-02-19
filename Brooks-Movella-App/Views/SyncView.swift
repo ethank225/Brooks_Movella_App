@@ -10,6 +10,7 @@ struct SyncView: View {
     private var phase: SessionPhase { manager.sessionPhase }
 
     var body: some View {
+        NavigationView {
         ScrollView {
             VStack(spacing: 16) {
 
@@ -143,6 +144,7 @@ struct SyncView: View {
             Button("Cancel", role: .cancel) {}
         } message: {
             Text("This will permanently delete all recorded data on every connected sensor.")
+        }
         }
     }
 
