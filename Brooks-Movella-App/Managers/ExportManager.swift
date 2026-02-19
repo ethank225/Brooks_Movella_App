@@ -18,7 +18,7 @@ enum ExportPhase: Equatable {
 /// Singleton managing the recording-export lifecycle:
 /// file discovery, cart selection, export pipeline, and CSV file writing.
 ///
-/// **Pipeline:** BLE data → CSV rows written directly to disk (foreground-only).
+/// **Pipeline:** BLE data → CSV rows written directly to disk.
 ///
 /// **Threading:**
 /// - SDK calls → `DotManager.shared.sdkQueue`
@@ -39,12 +39,6 @@ final class ExportManager: ObservableObject {
             self,
             selector: #selector(appDidEnterBackground),
             name: UIApplication.didEnterBackgroundNotification,
-            object: nil
-        )
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(appDidBecomeActive),
-            name: UIApplication.didBecomeActiveNotification,
             object: nil
         )
     }
@@ -75,10 +69,6 @@ final class ExportManager: ObservableObject {
     /// Set to true while file info is being fetched.
     @Published private(set) var isFetching: Bool = false
 
-    /// True when an export was interrupted by leaving foreground.
-    /// UI should show a prompt; user must tap Retry to resume.
-    @Published private(set) var requiresForeground: Bool = false
-
     // MARK: - Export State (internal)
 
     private var currentExportCanceled = false
@@ -86,8 +76,7 @@ final class ExportManager: ObservableObject {
     private var exportFileGeneration: Int = 0
     private var cleanupBackgroundTaskID: UIBackgroundTaskIdentifier = .invalid
 
-    /// True while BLE transfer is active. Used by app-state handlers
-    /// to decide whether to cancel on background.
+    /// True while BLE transfer is active.
     private var isTransferring = false
 
     private let dataTimeoutInterval: TimeInterval = 10.0
@@ -95,23 +84,11 @@ final class ExportManager: ObservableObject {
     // MARK: - App State Handling
 
     @objc private func appWillResignActive() {
-        guard exportPhase == .exporting, isTransferring else { return }
-        print("⚠️ App will resign active — canceling transfer with grace period")
-        beginCleanupGracePeriod()
-        cancelExport()
-        setOnMain { self.requiresForeground = true }
+        // bluetooth-central background mode keeps BLE callbacks alive — no action needed
     }
 
     @objc private func appDidEnterBackground() {
-        guard exportPhase == .exporting, isTransferring else { return }
-        print("⚠️ App entered background — canceling transfer with grace period")
-        beginCleanupGracePeriod()
-        cancelExport()
-        setOnMain { self.requiresForeground = true }
-    }
-
-    @objc private func appDidBecomeActive() {
-        setOnMain { self.requiresForeground = false }
+        // bluetooth-central background mode keeps BLE callbacks alive — no action needed
     }
 
     // MARK: - File Discovery
@@ -141,7 +118,7 @@ final class ExportManager: ObservableObject {
                         dotAddress: dot.address,
                         fileIndex: i,
                         fileSize: Int(file.fileSize),
-                        timestamp: file.timeStamap
+                        timestamp: file.timeStamap,
                     ))
                 }
 
@@ -222,11 +199,7 @@ final class ExportManager: ObservableObject {
         guard !cartItems.isEmpty else { return }
         guard exportPhase != .exporting else { return }
 
-        guard UIApplication.shared.applicationState == .active else {
-            setOnMain { self.requiresForeground = true }
-            return
-        }
-
+        beginExportBackgroundTask()
         currentExportCanceled = false
 
         // Create tasks
@@ -273,6 +246,7 @@ final class ExportManager: ObservableObject {
 
             DispatchQueue.main.async {
                 self.exportPhase = .done
+                self.endExportBackgroundTask()
             }
         }
     }
@@ -310,6 +284,7 @@ final class ExportManager: ObservableObject {
 
         setOnMain {
             self.exportPhase = .done
+            self.endExportBackgroundTask()
         }
     }
 
@@ -319,11 +294,7 @@ final class ExportManager: ObservableObject {
         let retryable = tasks.filter { $0.status == .failed || $0.status == .canceled }
         guard !retryable.isEmpty else { return }
 
-        guard UIApplication.shared.applicationState == .active else {
-            setOnMain { self.requiresForeground = true }
-            return
-        }
-
+        beginExportBackgroundTask()
         currentExportCanceled = false
         setOnMain { self.exportPhase = .exporting }
 
@@ -352,7 +323,10 @@ final class ExportManager: ObservableObject {
         let grouped = Dictionary(grouping: fullPipeline, by: { $0.cartItem.recording.dotAddress })
 
         guard !grouped.isEmpty else {
-            DispatchQueue.main.async { self.exportPhase = .done }
+            DispatchQueue.main.async {
+                self.exportPhase = .done
+                self.endExportBackgroundTask()
+            }
             return
         }
 
@@ -379,6 +353,7 @@ final class ExportManager: ObservableObject {
 
             DispatchQueue.main.async {
                 self.exportPhase = .done
+                self.endExportBackgroundTask()
             }
         }
     }
@@ -660,30 +635,30 @@ final class ExportManager: ObservableObject {
         tasks.compactMap { $0.outputURL }
     }
 
-    // MARK: - Background Grace Period
+    // MARK: - Background Task
 
-    /// Request a short background task so cancelExport() + file handle cleanup
-    /// can finish before iOS suspends the app. Ends automatically after 3s.
-    private func beginCleanupGracePeriod() {
+    /// Begin a UIBackgroundTask spanning the full export so iOS doesn't suspend
+    /// the app while BLE transfers are in progress. The `bluetooth-central`
+    /// background mode keeps SDK callbacks alive; this provides the formal
+    /// signal to iOS that background work is ongoing.
+    private func beginExportBackgroundTask() {
         guard cleanupBackgroundTaskID == .invalid else { return }
-        cleanupBackgroundTaskID = UIApplication.shared.beginBackgroundTask(withName: "DOT Export Cleanup") { [weak self] in
-            self?.endCleanupGracePeriod()
+        UIApplication.shared.isIdleTimerDisabled = true
+        cleanupBackgroundTaskID = UIApplication.shared.beginBackgroundTask(withName: "DOT Export") { [weak self] in
+            // Expiration handler — iOS is about to force-suspend; end gracefully.
+            self?.endExportBackgroundTask()
         }
-        print("🔋 Cleanup grace period started (id: \(cleanupBackgroundTaskID.rawValue))")
-
-        // Auto-end after 3 seconds — just enough for stopExportFileData + fileHandle.close
-        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
-            self?.endCleanupGracePeriod()
-        }
+        print("🔋 Export background task started (id: \(cleanupBackgroundTaskID.rawValue))")
     }
 
-    /// End the cleanup background task. Safe to call multiple times.
-    private func endCleanupGracePeriod() {
+    /// End the export background task. Safe to call multiple times.
+    private func endExportBackgroundTask() {
         let taskID = cleanupBackgroundTaskID
         guard taskID != .invalid else { return }
         cleanupBackgroundTaskID = .invalid
+        UIApplication.shared.isIdleTimerDisabled = false
         UIApplication.shared.endBackgroundTask(taskID)
-        print("🔋 Cleanup grace period ended (id: \(taskID.rawValue))")
+        print("🔋 Export background task ended (id: \(taskID.rawValue))")
     }
 
     // MARK: - Helpers

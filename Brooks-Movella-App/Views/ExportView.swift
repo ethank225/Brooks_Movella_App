@@ -240,35 +240,49 @@ private struct RecordingRow: View {
 // MARK: - Cart View
 
 struct CartView: View {
-    @ObservedObject private var exportManager = ExportManager.shared
-    @ObservedObject private var dotManager = DotManager.shared
+    @ObservedObject private var exportManager   = ExportManager.shared
+    @ObservedObject private var supabaseManager = SupabaseManager.shared
+    @ObservedObject private var dotManager      = DotManager.shared
     @Environment(\.dismiss) private var dismiss
 
     @State private var showShareSheet = false
+    @State private var lastSessionId: UUID?
+
+    // Run Details state
+    @State private var selectedProfile: Profile?
+    @State private var selectedTemplate: WorkoutTemplate?
+    @State private var shoeBrand      = ""
+    @State private var shoeModel      = ""
+    @State private var shoeGeneration = ""
+    @State private var conditionType  = ""
+    @State private var study          = ""
+    @State private var test           = ""
+    @State private var product        = ""
 
     private var isExporting: Bool { exportManager.exportPhase == .exporting }
     private var isDone: Bool { exportManager.exportPhase == .done }
     private var hasFailed: Bool { exportManager.tasks.contains { $0.status == .failed } }
 
+    private var emptyMetadataFields: [String] {
+        var missing: [String] = []
+        if shoeBrand.trimmingCharacters(in: .whitespaces).isEmpty      { missing.append("Shoe Brand") }
+        if shoeModel.trimmingCharacters(in: .whitespaces).isEmpty      { missing.append("Shoe Model") }
+        if shoeGeneration.trimmingCharacters(in: .whitespaces).isEmpty { missing.append("Shoe Generation") }
+        if conditionType.trimmingCharacters(in: .whitespaces).isEmpty  { missing.append("Condition Type") }
+        if study.trimmingCharacters(in: .whitespaces).isEmpty          { missing.append("Study") }
+        if test.trimmingCharacters(in: .whitespaces).isEmpty           { missing.append("Test") }
+        if product.trimmingCharacters(in: .whitespaces).isEmpty        { missing.append("Product") }
+        return missing
+    }
+
+    private var canExport: Bool {
+        !exportManager.cartItems.isEmpty && selectedProfile != nil && emptyMetadataFields.isEmpty
+    }
+
     var body: some View {
         NavigationView {
             ScrollView {
                 VStack(spacing: 16) {
-                    // Foreground-required banner
-                    if exportManager.requiresForeground {
-                        HStack {
-                            Image(systemName: "exclamationmark.triangle.fill")
-                            Text("Export interrupted — keep app in foreground and tap Retry")
-                        }
-                        .font(.caption)
-                        .foregroundColor(.orange)
-                        .padding()
-                        .frame(maxWidth: .infinity)
-                        .background(Color.orange.opacity(0.1))
-                        .cornerRadius(10)
-                        .padding(.horizontal)
-                    }
-
                     if exportManager.cartItems.isEmpty && exportManager.tasks.isEmpty {
                         SectionCard(title: "Cart", icon: "cart") {
                             EmptyStateView(
@@ -278,20 +292,21 @@ struct CartView: View {
                             )
                         }
                     } else if !isDone || exportManager.tasks.isEmpty {
-                        // Cart items section
+                        // Cart items
                         SectionCard(title: "Cart — \(exportManager.cartItems.count) item\(exportManager.cartItems.count == 1 ? "" : "s")", icon: "cart") {
                             ForEach(exportManager.cartItems) { item in
                                 CartItemRow(
                                     item: item,
-                                    onLabelChange: { newLabel in
-                                        exportManager.updateLabel(for: item.id, label: newLabel)
-                                    },
-                                    onRemove: {
-                                        exportManager.removeFromCart(item)
-                                    },
+                                    onLabelChange: { exportManager.updateLabel(for: item.id, label: $0) },
+                                    onRemove: { exportManager.removeFromCart(item) },
                                     disabled: isExporting
                                 )
                             }
+                        }
+
+                        // Run Details (profile + template + metadata)
+                        if !isExporting {
+                            runDetailsSection
                         }
 
                         // Export button
@@ -305,22 +320,35 @@ struct CartView: View {
                                 }
                                 .frame(maxWidth: .infinity)
                                 .padding()
-                                .background(Color.purple)
+                                .background(canExport ? Color.purple : Color.gray)
                                 .foregroundColor(.white)
                                 .cornerRadius(10)
                             }
+                            .disabled(!canExport)
                             .padding(.horizontal)
+
+                            if selectedProfile == nil {
+                                Text("Select a runner profile to enable export")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            } else if !emptyMetadataFields.isEmpty {
+                                Text("Fill in: \(emptyMetadataFields.joined(separator: ", "))")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
                         }
                     }
 
-                    // Export progress/results section
+                    // Export progress / results
                     if !exportManager.tasks.isEmpty {
                         SectionCard(
                             title: isDone ? "Export Results" : "Exporting...",
                             icon: isDone ? "checkmark.circle" : "arrow.up.circle"
                         ) {
                             ForEach(exportManager.tasks) { task in
-                                ExportTaskRow(task: task)
+                                ExportTaskRow(task: task, onRetryUpload: {
+                                    retryUpload(for: task)
+                                })
                             }
                         }
 
@@ -342,7 +370,6 @@ struct CartView: View {
                         }
 
                         if isDone {
-                            // Action buttons for completed export
                             VStack(spacing: 12) {
                                 if hasFailed {
                                     Button {
@@ -411,6 +438,154 @@ struct CartView: View {
                     ShareSheet(urls: exportManager.exportedFileURLs)
                 }
             }
+            .task {
+                await supabaseManager.fetchProfiles()
+                await supabaseManager.fetchWorkoutTemplates()
+            }
+            .onChange(of: exportManager.exportPhase) { phase in
+                if phase == .done { triggerPendingUploads() }
+            }
+        }
+    }
+
+    // MARK: - Run Details Section
+
+    private var runDetailsSection: some View {
+        SectionCard(title: "Run Details", icon: "figure.run") {
+            VStack(alignment: .leading, spacing: 12) {
+
+                // Profile picker
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Runner Profile")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    Picker("Runner Profile", selection: $selectedProfile) {
+                        Text("Select a profile…").tag(Optional<Profile>(nil))
+                        ForEach(supabaseManager.profiles) { profile in
+                            Text(profile.displayName).tag(Optional(profile))
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+
+                Divider()
+
+                // Template picker (only if past workouts exist)
+                if !supabaseManager.workoutTemplates.isEmpty {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Load Template")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        Picker("Template", selection: $selectedTemplate) {
+                            Text("New template").tag(Optional<WorkoutTemplate>(nil))
+                            ForEach(supabaseManager.workoutTemplates) { template in
+                                Text(template.displayName).tag(Optional(template))
+                            }
+                        }
+                        .pickerStyle(.menu)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .onChange(of: selectedTemplate) { template in
+                            guard let t = template else { return }
+                            shoeBrand      = t.shoeBrand
+                            shoeModel      = t.shoeModel
+                            shoeGeneration = t.shoeGeneration
+                            conditionType  = t.conditionType
+                            study          = t.study
+                            test           = t.test
+                            product        = t.product
+                        }
+                    }
+
+                    Divider()
+                }
+
+                // Metadata fields
+                Group {
+                    metadataField("Shoe Brand",      text: $shoeBrand)
+                    metadataField("Shoe Model",      text: $shoeModel)
+                    metadataField("Shoe Generation", text: $shoeGeneration)
+                    metadataField("Condition Type",  text: $conditionType)
+                    metadataField("Study",           text: $study)
+                    metadataField("Test",            text: $test)
+                    metadataField("Product",         text: $product)
+                }
+            }
+        }
+    }
+
+    private func metadataField(_ label: String, text: Binding<String>) -> some View {
+        HStack {
+            Text(label)
+                .font(.subheadline)
+                .foregroundColor(.secondary)
+                .frame(width: 130, alignment: .leading)
+            TextField(label, text: text)
+                .font(.subheadline)
+                .textFieldStyle(.roundedBorder)
+        }
+    }
+
+    // MARK: - Upload Helpers
+
+    private func currentTemplate() -> WorkoutTemplate {
+        WorkoutTemplate(
+            shoeBrand:      shoeBrand,
+            shoeModel:      shoeModel,
+            shoeGeneration: shoeGeneration,
+            study:          study,
+            test:           test,
+            product:        product,
+            conditionType:  conditionType
+        )
+    }
+
+    private func triggerPendingUploads() {
+        guard let profile = selectedProfile else { return }
+        let template = currentTemplate()
+        let sessionId: UUID
+        if let existing = lastSessionId {
+            sessionId = existing
+        } else {
+            sessionId = UUID()
+            lastSessionId = sessionId
+        }
+
+        for task in exportManager.tasks where task.status == .success && task.uploadStatus == .pending {
+            guard let url = task.outputURL else { continue }
+            task.uploadStatus = .uploading
+            Task {
+                do {
+                    try await SupabaseManager.shared.uploadWorkout(
+                        csvURL: url, userId: profile.id,
+                        sessionId: sessionId, template: template
+                    )
+                    task.uploadStatus = .uploaded
+                } catch {
+                    task.uploadError = error.localizedDescription
+                    task.uploadStatus = .failed
+                }
+            }
+        }
+    }
+
+    private func retryUpload(for task: ExportTask) {
+        guard let profile = selectedProfile, let url = task.outputURL else { return }
+        let template = currentTemplate()
+        let sessionId = lastSessionId ?? UUID()
+        task.uploadStatus = .uploading
+        task.uploadError = nil
+        Task {
+            do {
+                try await SupabaseManager.shared.uploadWorkout(
+                    csvURL: url, userId: profile.id,
+                    sessionId: sessionId, template: template
+                )
+                task.uploadStatus = .uploaded
+            } catch {
+                task.uploadError = error.localizedDescription
+                task.uploadStatus = .failed
+            }
         }
     }
 }
@@ -466,6 +641,7 @@ private struct CartItemRow: View {
 
 private struct ExportTaskRow: View {
     @ObservedObject var task: ExportTask
+    var onRetryUpload: (() -> Void)? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -493,24 +669,60 @@ private struct ExportTaskRow: View {
                 .frame(height: 6)
             }
 
-            // Error message
+            // BLE export error
             if let error = task.error {
                 Text(error)
                     .font(.caption)
                     .foregroundColor(.red)
             }
 
-            // File path for successful exports
+            // File path
             if let url = task.outputURL {
                 Text(url.lastPathComponent)
                     .font(.caption)
                     .foregroundColor(.secondary)
+            }
+
+            // Upload status
+            if task.status == .success {
+                uploadStatusRow
             }
         }
         .padding(10)
         .background(taskBackground)
         .cornerRadius(10)
         .animation(.easeInOut(duration: 0.3), value: task.status)
+        .animation(.easeInOut(duration: 0.3), value: task.uploadStatus)
+    }
+
+    @ViewBuilder
+    private var uploadStatusRow: some View {
+        switch task.uploadStatus {
+        case .pending:
+            EmptyView()
+        case .uploading:
+            HStack(spacing: 6) {
+                ProgressView().scaleEffect(0.7)
+                Text("Uploading to Supabase…")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+        case .uploaded:
+            Label("Uploaded", systemImage: "checkmark.icloud.fill")
+                .font(.caption)
+                .foregroundColor(.green)
+        case .failed:
+            VStack(alignment: .leading, spacing: 4) {
+                if let uploadError = task.uploadError {
+                    Text("Upload failed: \(uploadError)")
+                        .font(.caption)
+                        .foregroundColor(.red)
+                }
+                Button("Retry Upload") { onRetryUpload?() }
+                    .font(.caption)
+                    .foregroundColor(.blue)
+            }
+        }
     }
 
     private var progressBarColor: Color {

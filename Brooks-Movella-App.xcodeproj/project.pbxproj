@@ -6,6 +6,11 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		AA316F222F46863000AF15AB /* Secrets.xconfig in Resources */ = {isa = PBXBuildFile; fileRef = AA316F212F46862300AF15AB /* Secrets.xconfig */; };
+		AA316F2D2F468BE200AF15AB /* Supabase in Frameworks */ = {isa = PBXBuildFile; productRef = AA316F2C2F468BE200AF15AB /* Supabase */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXCopyFilesBuildPhase section */
 		AA4A47332F3054DB00CA4F7C /* Embed Frameworks */ = {
 			isa = PBXCopyFilesBuildPhase;
@@ -20,8 +25,19 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		AA316F212F46862300AF15AB /* Secrets.xconfig */ = {isa = PBXFileReference; lastKnownFileType = text; path = Secrets.xconfig; sourceTree = "<group>"; };
 		AA4A46D42F2D48F800CA4F7C /* Brooks-Movella-App.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Brooks-Movella-App.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
+
+/* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
+		AA316F242F4687F700AF15AB /* Exceptions for "Brooks-Movella-App" folder in "Brooks-Movella-App" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Info.plist,
+			);
+			target = AA4A46D32F2D48F800CA4F7C /* Brooks-Movella-App */;
+		};
+/* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
 
 /* Begin PBXFileSystemSynchronizedGroupBuildPhaseMembershipExceptionSet section */
 		AA4A47342F3054DB00CA4F7C /* Exceptions for "Brooks-Movella-App" folder in "Embed Frameworks" phase from "Brooks-Movella-App" target */ = {
@@ -40,6 +56,7 @@
 		AA4A46D62F2D48F800CA4F7C /* Brooks-Movella-App */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			exceptions = (
+				AA316F242F4687F700AF15AB /* Exceptions for "Brooks-Movella-App" folder in "Brooks-Movella-App" target */,
 				AA4A47342F3054DB00CA4F7C /* Exceptions for "Brooks-Movella-App" folder in "Embed Frameworks" phase from "Brooks-Movella-App" target */,
 			);
 			path = "Brooks-Movella-App";
@@ -52,6 +69,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				AA316F2D2F468BE200AF15AB /* Supabase in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -61,6 +79,7 @@
 		AA4A46CB2F2D48F800CA4F7C = {
 			isa = PBXGroup;
 			children = (
+				AA316F212F46862300AF15AB /* Secrets.xconfig */,
 				AA4A46D62F2D48F800CA4F7C /* Brooks-Movella-App */,
 				AA4A47302F3054C600CA4F7C /* Frameworks */,
 				AA4A46D52F2D48F800CA4F7C /* Products */,
@@ -103,6 +122,7 @@
 			);
 			name = "Brooks-Movella-App";
 			packageProductDependencies = (
+				AA316F2C2F468BE200AF15AB /* Supabase */,
 			);
 			productName = "Brooks-Movella-App";
 			productReference = AA4A46D42F2D48F800CA4F7C /* Brooks-Movella-App.app */;
@@ -132,6 +152,9 @@
 			);
 			mainGroup = AA4A46CB2F2D48F800CA4F7C;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				AA316F2B2F468B9600AF15AB /* XCRemoteSwiftPackageReference "supabase-swift" */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = AA4A46D52F2D48F800CA4F7C /* Products */;
 			projectDirPath = "";
@@ -147,6 +170,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				AA316F222F46863000AF15AB /* Secrets.xconfig in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -298,6 +322,7 @@
 					"$(PROJECT_DIR)/Brooks-Movella-App",
 				);
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = "Brooks-Movella-App/Info.plist";
 				INFOPLIST_KEY_NSBluetoothAlwaysUsageDescription = "This app uses Bluetooth to connect to DOT sensors";
 				INFOPLIST_KEY_NSBluetoothPeripheralUsageDescription = "This app uses Bluetooth to connect to DOT sensors";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
@@ -306,6 +331,7 @@
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
@@ -337,6 +363,7 @@
 					"$(PROJECT_DIR)/Brooks-Movella-App",
 				);
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = "Brooks-Movella-App/Info.plist";
 				INFOPLIST_KEY_NSBluetoothAlwaysUsageDescription = "This app uses Bluetooth to connect to DOT sensors";
 				INFOPLIST_KEY_NSBluetoothPeripheralUsageDescription = "This app uses Bluetooth to connect to DOT sensors";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
@@ -345,6 +372,7 @@
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
@@ -384,6 +412,25 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		AA316F2B2F468B9600AF15AB /* XCRemoteSwiftPackageReference "supabase-swift" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/supabase/supabase-swift";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 2.5.1;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		AA316F2C2F468BE200AF15AB /* Supabase */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = AA316F2B2F468B9600AF15AB /* XCRemoteSwiftPackageReference "supabase-swift" */;
+			productName = Supabase;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = AA4A46CC2F2D48F800CA4F7C /* Project object */;
 }

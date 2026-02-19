@@ -11,6 +11,8 @@ final class ExportTask: ObservableObject, Identifiable {
     @Published var error: String?
     @Published var outputURL: URL?
     @Published var subphase: ExportSubphase = .idle
+    @Published var uploadStatus: UploadStatus = .pending
+    @Published var uploadError: String?
 
     init(cartItem: CartItem) {
         self.id = cartItem.id
@@ -24,6 +26,13 @@ nonisolated enum ExportStatus: Equatable, Sendable {
     case success
     case failed
     case canceled
+}
+
+nonisolated enum UploadStatus: Equatable, Sendable {
+    case pending
+    case uploading
+    case uploaded
+    case failed
 }
 
 nonisolated enum ExportSubphase: Equatable, Sendable {
