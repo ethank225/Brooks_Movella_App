@@ -248,6 +248,7 @@ struct CartView: View {
     @State private var showShareSheet = false
     @State private var showCloseBlockedAlert = false
     @State private var showingTemplatePicker = false
+    @State private var dbSessionMap: [UUID: UUID] = [:]  // cartSessionId → DB session UUID
 
     // Run Details state
     @State private var selectedProfile: Profile?
@@ -320,7 +321,7 @@ struct CartView: View {
                         // Export button
                         if !isExporting && !exportManager.cartItems.isEmpty {
                             Button {
-                                exportManager.startExport()
+                                Task { await prepareAndStartExport() }
                             } label: {
                                 HStack {
                                     Image(systemName: "square.and.arrow.up")
@@ -467,7 +468,10 @@ struct CartView: View {
                 await supabaseManager.fetchWorkoutTemplates()
             }
             .onChange(of: exportManager.exportPhase) { phase in
-                if phase == .done { triggerPendingUploads() }
+                if phase == .idle {
+                    dbSessionMap = [:]
+                    exportManager.onTaskCompleted = nil
+                }
             }
         }
     }
@@ -649,61 +653,74 @@ struct CartView: View {
         )
     }
 
-    private func triggerPendingUploads() {
+    /// Pre-creates one DB session per cart session group, wires per-task upload callback,
+    /// then kicks off the BLE export. Uploads begin as each file finishes transferring.
+    private func prepareAndStartExport() async {
         guard let profile = selectedProfile else { return }
         let template = currentTemplate()
-        let pendingTasks = exportManager.tasks.filter { $0.status == .success && $0.uploadStatus == .pending }
-        guard !pendingTasks.isEmpty else { return }
 
-        Task {
-            do {
-                // Group by sessionId and create one DB session per group
-                let sessionGroups = Dictionary(grouping: pendingTasks) { $0.cartItem.sessionId }
-                var sessionIdMap: [UUID: UUID] = [:]  // cartSessionId → DB session_id
-
-                for cartSessionId in sessionGroups.keys {
-                    let dbSessionId = try await SupabaseManager.shared.createSession(
-                        userId: profile.id,
-                        template: template
-                    )
-                    sessionIdMap[cartSessionId] = dbSessionId
-                }
-
-                // Now upload each file
-                for task in pendingTasks {
-                    guard let url = task.outputURL,
-                          let dbSessionId = sessionIdMap[task.cartItem.sessionId] else { continue }
-                    task.uploadStatus = .uploading
-                    do {
-                        try await SupabaseManager.shared.uploadWorkout(
-                            csvURL: url,
-                            userId: profile.id,
-                            sessionId: dbSessionId,
-                            template: template,
-                            conditionType: conditionType
-                        )
-                        task.uploadStatus = .uploaded
-                    } catch {
-                        task.uploadError = error.localizedDescription
-                        task.uploadStatus = .failed
-                    }
-                }
-            } catch {
-                print("⚠️ Session creation failed: \(error)")
+        let sessionGroups = Dictionary(grouping: exportManager.cartItems) { $0.sessionId }
+        var map: [UUID: UUID] = [:]
+        do {
+            for cartSessionId in sessionGroups.keys {
+                let dbId = try await SupabaseManager.shared.createSession(
+                    userId: profile.id, template: template
+                )
+                map[cartSessionId] = dbId
             }
+        } catch {
+            print("⚠️ Session creation failed: \(error)")
+            return
+        }
+        dbSessionMap = map
+
+        exportManager.onTaskCompleted = { [self] task in
+            Task { await uploadTask(task) }
+        }
+
+        exportManager.startExport()
+    }
+
+    /// Upload a single completed task to Supabase using the pre-created DB session.
+    private func uploadTask(_ task: ExportTask) async {
+        guard let profile = selectedProfile,
+              let url = task.outputURL,
+              let dbSessionId = dbSessionMap[task.cartItem.sessionId] else { return }
+        let template = currentTemplate()
+        task.uploadStatus = .uploading
+        do {
+            try await SupabaseManager.shared.uploadWorkout(
+                csvURL: url,
+                userId: profile.id,
+                sessionId: dbSessionId,
+                template: template,
+                conditionType: conditionType
+            )
+            task.uploadStatus = .uploaded
+        } catch {
+            task.uploadError = error.localizedDescription
+            task.uploadStatus = .failed
         }
     }
 
     private func retryUpload(for task: ExportTask) {
         guard let profile = selectedProfile, let url = task.outputURL else { return }
         let template = currentTemplate()
+        let cartSessionId = task.cartItem.sessionId
         task.uploadStatus = .uploading
         task.uploadError = nil
         Task {
             do {
-                let sessionId = try await SupabaseManager.shared.createSession(
-                    userId: profile.id, template: template
-                )
+                // Reuse the existing DB session if still available; only create a new
+                // one if the map has been cleared (e.g. after "Clear & Start Over").
+                let sessionId: UUID
+                if let existing = dbSessionMap[cartSessionId] {
+                    sessionId = existing
+                } else {
+                    sessionId = try await SupabaseManager.shared.createSession(
+                        userId: profile.id, template: template
+                    )
+                }
                 try await SupabaseManager.shared.uploadWorkout(
                     csvURL: url, userId: profile.id,
                     sessionId: sessionId,

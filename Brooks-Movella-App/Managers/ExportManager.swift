@@ -89,6 +89,9 @@ final class ExportManager: ObservableObject {
     private var cleanupBackgroundTaskID: UIBackgroundTaskIdentifier = .invalid
     private var cancellables = Set<AnyCancellable>()
 
+    /// Called on the main thread immediately after each file's BLE transfer succeeds.
+    var onTaskCompleted: ((ExportTask) -> Void)?
+
     /// True while BLE transfer is active.
     private var isTransferring = false
 
@@ -651,6 +654,7 @@ final class ExportManager: ObservableObject {
                                 task.subphase = .complete
                                 task.status = .success
                                 print("✅ Exported \(task.cartItem.label) → \(csvPath.lastPathComponent)")
+                                self.onTaskCompleted?(task)
                             }
 
                             self.sdkQueue.async {
