@@ -1,6 +1,18 @@
 import Foundation
 import Combine
 
+// MARK: - Export Phase
+
+enum ExportPhase: Equatable {
+    case idle
+    case fetching
+    case ready
+    case exporting
+    case done
+}
+
+// MARK: - ExportTask
+
 /// Tracks the status and progress of exporting a single recording file.
 final class ExportTask: ObservableObject, Identifiable {
     let id: String
@@ -13,6 +25,7 @@ final class ExportTask: ObservableObject, Identifiable {
     @Published var subphase: ExportSubphase = .idle
     @Published var uploadStatus: UploadStatus = .pending
     @Published var uploadError: String?
+    @Published var hasPacketLoss: Bool = false
 
     init(cartItem: CartItem) {
         self.id = cartItem.id
