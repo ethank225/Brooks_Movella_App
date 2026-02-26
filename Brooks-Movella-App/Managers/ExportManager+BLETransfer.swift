@@ -174,15 +174,19 @@ extension ExportManager {
                             print("📡 [\(dot.address)] \(finalPackets) pkts in \(String(format: "%.1f", elapsed))s (\(String(format: "%.0f", pps)) pkt/s), cb avg \(String(format: "%.2f", avgCb * 1000))ms")
 
                             let isValid = self.validatePacketCount(csvURL: csvPath)
-
-                            self.setOnMain {
-                                task.hasPacketLoss = !isValid
-                                task.progress = 1.0
-                                task.outputURL = csvPath
-                                task.subphase = .complete
-                                task.status = .success
-                                print("✅ Exported \(task.cartItem.label) → \(csvPath.lastPathComponent)")
-                                self.onTaskCompleted?(task)
+                            if !isValid {
+                                try? FileManager.default.removeItem(at: csvPath)
+                                self.setOnMain { task.hasPacketLoss = true }
+                                self.setTaskStatus(task, .failed, error: "Packet loss detected")
+                            } else {
+                                self.setOnMain {
+                                    task.progress = 1.0
+                                    task.outputURL = csvPath
+                                    task.subphase = .complete
+                                    task.status = .success
+                                    print("✅ Exported \(task.cartItem.label) → \(csvPath.lastPathComponent)")
+                                    self.onTaskCompleted?(task)
+                                }
                             }
 
                             self.sdkQueue.async { taskIndex += 1; exportNextFile() }

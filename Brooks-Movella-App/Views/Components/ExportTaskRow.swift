@@ -3,6 +3,7 @@ import SwiftUI
 struct ExportTaskRow: View {
     @ObservedObject var task: ExportTask
     var onRetryUpload: (() -> Void)? = nil
+    var onRetryTransfer: (() -> Void)? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -45,11 +46,25 @@ struct ExportTaskRow: View {
                     .foregroundColor(.orange)
             }
 
-            // BLE export error
-            if let error = task.error {
+            // BLE export error (suppressed when hasPacketLoss — the symbol label below covers it)
+            if let error = task.error, !task.hasPacketLoss {
                 Text(error)
                     .font(.caption)
                     .foregroundColor(.red)
+            }
+
+            // Retry transfer button for failed BLE transfers
+            if task.status == .failed {
+                Button(action: { onRetryTransfer?() }) {
+                    Label("Retry Transfer", systemImage: "arrow.clockwise")
+                        .font(.caption.weight(.medium))
+                        .foregroundColor(.white)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 7)
+                        .background(Color.orange)
+                        .clipShape(Capsule())
+                }
+                .buttonStyle(.plain)
             }
 
             // File path

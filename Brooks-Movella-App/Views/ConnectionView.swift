@@ -252,12 +252,11 @@ struct DeviceRow: View {
                     Text(title)
                         .font(.headline)
                         .lineLimit(1)
-                        .minimumScaleFactor(0.7)
+                        .truncationMode(.tail)
 
-                    if isBusy {
-                        ProgressView()
-                            .scaleEffect(0.85)
-                    }
+                    ProgressView()
+                        .scaleEffect(0.85)
+                        .opacity(isBusy ? 1 : 0)
                 }
 
                 HStack(spacing: 8) {
@@ -285,12 +284,12 @@ struct DeviceRow: View {
                         color: .green
                     )
 
-                    if let statusText {
-                        Text(statusText)
-                            .font(.caption)
-                            .foregroundColor(isIdentifying || phase.isFailed ? .orange : .secondary)
-                    }
+                    Text(statusText ?? "Identifying…")
+                        .font(.caption)
+                        .foregroundColor(isIdentifying || phase.isFailed ? .orange : .secondary)
+                        .opacity(statusText != nil ? 1 : 0)
                 }
+                .lineLimit(1)
             }
             .layoutPriority(1)
 

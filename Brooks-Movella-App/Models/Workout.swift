@@ -6,11 +6,15 @@ struct Workout: Codable, Identifiable {
     let id: UUID
     let sessionId: UUID
     var blobAddress: String
+    var sensorAddress: String
+    var recordedTime: String
 
     enum CodingKeys: String, CodingKey {
         case id            = "workout_id"
         case sessionId     = "session_id"
         case blobAddress   = "blob_address"
+        case sensorAddress = "sensor_address"
+        case recordedTime  = "recorded_time"
     }
 }
 
@@ -19,10 +23,14 @@ struct Workout: Codable, Identifiable {
 struct WorkoutPayload: Codable {
     let sessionId:     UUID
     let blobAddress:   String
+    let sensorAddress: String
+    let recordedTime:  String
 
     enum CodingKeys: String, CodingKey {
         case sessionId     = "session_id"
         case blobAddress   = "blob_address"
+        case sensorAddress = "sensor_address"
+        case recordedTime  = "recorded_time"
     }
 }
 
@@ -83,7 +91,8 @@ struct Session: Codable, Identifiable {
     let study: String
     let test: String
     let product: String
-    let conditionType: String   // ← add this
+    let conditionType: String
+    let recordedDate: String
     let createdAt: Date
 
     enum CodingKeys: String, CodingKey {
@@ -95,7 +104,8 @@ struct Session: Codable, Identifiable {
         case study
         case test
         case product
-        case conditionType  = "condition_type"  // ← add this
+        case conditionType  = "condition_type"
+        case recordedDate   = "recorded_date"
         case createdAt      = "created_at"
     }
 }
@@ -110,7 +120,8 @@ struct SessionPayload: Codable {
     let study:          String
     let test:           String
     let product:        String
-    let conditionType:  String   // ← add this
+    let conditionType:  String
+    let recordedDate:   String
 
     enum CodingKeys: String, CodingKey {
         case userId         = "user_id"
@@ -120,6 +131,7 @@ struct SessionPayload: Codable {
         case study
         case test
         case product
-        case conditionType  = "condition_type"  // ← add this
+        case conditionType  = "condition_type"
+        case recordedDate   = "recorded_date"
     }
 }

@@ -3,12 +3,15 @@ import SwiftUI
 struct ExportResultsSection: View {
     @ObservedObject var exportManager: ExportManager
     let onRetryUpload: (ExportTask) -> Void
+    let onRetryFailed: () -> Void
 
     @State private var showShareSheet = false
 
     private var isExporting: Bool { exportManager.exportPhase == .exporting }
     private var isDone: Bool { exportManager.exportPhase == .done }
-    private var hasFailed: Bool { exportManager.tasks.contains { $0.status == .failed } }
+    private var hasFailed: Bool {
+        exportManager.tasks.contains { $0.status == .failed || $0.uploadStatus == .failed }
+    }
 
     var body: some View {
         VStack(spacing: 16) {
@@ -19,6 +22,8 @@ struct ExportResultsSection: View {
                 ForEach(exportManager.tasks) { task in
                     ExportTaskRow(task: task, onRetryUpload: {
                         onRetryUpload(task)
+                    }, onRetryTransfer: {
+                        exportManager.retryFailed()
                     })
                 }
             }
@@ -34,7 +39,7 @@ struct ExportResultsSection: View {
                 VStack(spacing: 12) {
                     if hasFailed {
                         FullWidthButton(icon: "arrow.clockwise", label: "Retry Failed", color: .orange) {
-                            exportManager.retryFailed()
+                            onRetryFailed()
                         }
                     }
 

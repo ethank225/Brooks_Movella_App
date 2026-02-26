@@ -25,12 +25,12 @@ final class ExportManager: ObservableObject {
             name: UIApplication.willResignActiveNotification,
             object: nil
         )
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(appDidEnterBackground),
-            name: UIApplication.didEnterBackgroundNotification,
-            object: nil
-        )
+//        NotificationCenter.default.addObserver(
+//            self,
+//            selector: #selector(appDidEnterBackground),
+//            name: UIApplication.didEnterBackgroundNotification,
+//            object: nil
+//        )
 
         // Prune recordings and cart items when sensors disconnect.
         DotManager.shared.$connectedDots
@@ -46,8 +46,8 @@ final class ExportManager: ObservableObject {
 
     // Internal so ExportManager+BLETransfer.swift can access them.
     var sdkQueue: DispatchQueue { DotManager.shared.sdkQueue }
-    let fileQueue = DispatchQueue(label: "ExportManager.fileQueue")
-    private let exportSequenceQueue = DispatchQueue(label: "ExportManager.exportSequenceQueue")
+    let fileQueue = DispatchQueue(label: "ExportManager.fileQueue", qos: .userInitiated)
+    private let exportSequenceQueue = DispatchQueue(label: "ExportManager.exportSequenceQueue", qos: .userInitiated)
 
     // MARK: - Published State
 
@@ -80,8 +80,8 @@ final class ExportManager: ObservableObject {
 
     private var exportSequenceGeneration: Int = 0
     private var currentExportSemaphore: DispatchSemaphore?
-    private var cleanupBackgroundTaskID: UIBackgroundTaskIdentifier = .invalid
     private var cancellables = Set<AnyCancellable>()
+    private var bgTaskID: UIBackgroundTaskIdentifier = .invalid
 
     /// Called on the main thread immediately after each file's BLE transfer succeeds.
     var onTaskCompleted: ((ExportTask) -> Void)?
@@ -92,9 +92,12 @@ final class ExportManager: ObservableObject {
         // bluetooth-central background mode keeps BLE callbacks alive — no action needed.
     }
 
-    @objc private func appDidEnterBackground() {
-        // bluetooth-central background mode keeps BLE callbacks alive — no action needed.
-    }
+//    @objc private func appDidEnterBackground() {
+//        guard exportPhase == .exporting else { return }
+//        // The Movella SDK's export packet callbacks stop firing when the app is backgrounded.
+//        // Cancel immediately so tasks show .canceled rather than hanging until the 10s watchdog.
+//        cancelExport()
+//    }
 
     // MARK: - Disconnection Pruning
 
@@ -144,6 +147,7 @@ final class ExportManager: ObservableObject {
                 for (i, file) in dot.recordingFiles.enumerated() {
                     result.append(RecordingFile(
                         dotAddress: dot.address,
+                        macAddress: dot.device.macAddress.isEmpty ? "None" : dot.device.macAddress,
                         fileIndex: i,
                         fileSize: Int(file.fileSize),
                         timestamp: file.timeStamap
@@ -196,7 +200,7 @@ final class ExportManager: ObservableObject {
     }
 
     /// Move selected files into the cart, auto-grouping by timestamp proximity.
-    /// Files recorded within 60 seconds of an existing session are assigned to that session.
+    /// Files recorded within 20 minutes of an existing session are assigned to that session.
     func buildCart() {
         let allFiles = recordings.values.flatMap { $0 }
         let selected = allFiles.filter { selectedIDs.contains($0.id) }
@@ -217,7 +221,7 @@ final class ExportManager: ObservableObject {
     }
 
     private func sessionForFile(_ file: RecordingFile, considering items: [CartItem]) -> UUID? {
-        items.first(where: { abs(Int(file.timestamp) - Int($0.recording.timestamp)) <= 60 })?.sessionId
+        items.first(where: { abs(Int(file.timestamp) - Int($0.recording.timestamp)) <= 1200 })?.sessionId
     }
 
     func reassignSession(itemId: String, to sessionId: UUID) {
@@ -355,7 +359,7 @@ final class ExportManager: ObservableObject {
             } else {
                 fullPipeline.append(task)
                 setTaskStatus(task, .queued)
-                setOnMain { task.progress = 0; task.error = nil; task.subphase = .idle }
+                setOnMain { task.progress = 0; task.error = nil; task.subphase = .idle; task.hasPacketLoss = false }
             }
         }
 
@@ -451,24 +455,24 @@ final class ExportManager: ObservableObject {
 
     // MARK: - Background Task
 
-    /// Prevents iOS from suspending the app during a BLE transfer.
+    /// Disables the idle timer and registers a UIBackgroundTask so iOS grants extra time
+    /// to finish or cleanly cancel an in-progress export if the app is backgrounded.
     private func beginExportBackgroundTask() {
-        guard cleanupBackgroundTaskID == .invalid else { return }
         UIApplication.shared.isIdleTimerDisabled = true
-        cleanupBackgroundTaskID = UIApplication.shared.beginBackgroundTask(withName: "DOT Export") { [weak self] in
-            self?.endExportBackgroundTask()
+        bgTaskID = UIApplication.shared.beginBackgroundTask(withName: "BLEExport") {
+            // Expiration handler — iOS is forcing us to stop.
+            self.cancelExport()
+            self.endExportBackgroundTask()
         }
-        print("🔋 Export background task started (id: \(cleanupBackgroundTaskID.rawValue))")
     }
 
-    /// End the background task. Safe to call multiple times.
+    /// Re-enables the idle timer and ends the UIBackgroundTask. Safe to call multiple times.
     func endExportBackgroundTask() {
-        let taskID = cleanupBackgroundTaskID
-        guard taskID != .invalid else { return }
-        cleanupBackgroundTaskID = .invalid
         UIApplication.shared.isIdleTimerDisabled = false
-        UIApplication.shared.endBackgroundTask(taskID)
-        print("🔋 Export background task ended (id: \(taskID.rawValue))")
+        if bgTaskID != .invalid {
+            UIApplication.shared.endBackgroundTask(bgTaskID)
+            bgTaskID = .invalid
+        }
     }
 
     // MARK: - Helpers

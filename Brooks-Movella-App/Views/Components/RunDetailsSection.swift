@@ -26,8 +26,10 @@ struct RunDetailsSection: View {
             VStack(alignment: .leading, spacing: 0) {
                 profilePickerRow
 
-                if !supabaseManager.workoutTemplates.isEmpty {
-                    Divider()
+                Divider()
+                if !supabaseManager.hasFetchedTemplates || supabaseManager.isLoadingTemplates {
+                    templateSkeletonRow
+                } else if !supabaseManager.workoutTemplates.isEmpty {
                     templatePickerRow
                 }
 
@@ -80,28 +82,44 @@ struct RunDetailsSection: View {
         .padding(.vertical, 8)
     }
 
-    private var templatePickerRow: some View {
-        VStack(alignment: .leading, spacing: 6) {
+    private var templateSkeletonRow: some View {
+        HStack {
             Text("Load Template")
                 .font(.subheadline)
                 .foregroundColor(.secondary)
+                .frame(width: 130, alignment: .leading)
+            HStack(spacing: 8) {
+                ProgressView()
+                    .scaleEffect(0.8)
+                Text("Loading templates…")
+                    .font(.subheadline)
+                    .foregroundColor(.secondary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(.vertical, 8)
+    }
+
+    private var templatePickerRow: some View {
+        HStack {
+            Text("Load Template")
+                .font(.subheadline)
+                .foregroundColor(.secondary)
+                .frame(width: 130, alignment: .leading)
             Button {
                 showingTemplatePicker = true
             } label: {
                 HStack(spacing: 6) {
                     Text(selectedTemplate?.displayName ?? "New template")
                         .font(.subheadline)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
                         .foregroundColor(.blue)
-                        .multilineTextAlignment(.leading)
                         .frame(maxWidth: .infinity, alignment: .leading)
                     Image(systemName: "chevron.up.chevron.down")
                         .font(.caption)
                         .foregroundColor(.blue)
                 }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 8)
-                .background(Color(.systemGray6))
-                .cornerRadius(8)
             }
             .buttonStyle(.plain)
             .sheet(isPresented: $showingTemplatePicker) {
@@ -130,7 +148,7 @@ struct RunDetailsSection: View {
                 }
             }
         }
-        .padding(.vertical, 6)
+        .padding(.vertical, 8)
     }
 
     private var conditionTypeField: some View {

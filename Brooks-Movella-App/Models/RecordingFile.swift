@@ -2,7 +2,8 @@ import Foundation
 
 /// Identifies a single recorded file on a Movella DOT sensor's flash storage.
 struct RecordingFile: Identifiable, Hashable {
-    let dotAddress: String
+    let dotAddress: String   // UUID — used for keying/grouping throughout the app
+    let macAddress: String   // Bluetooth MAC address — e.g. "D4:22:CD:07:A8:15"
     let fileIndex: Int
     let fileSize: Int
     let timestamp: UInt32

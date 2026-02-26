@@ -249,12 +249,27 @@ struct SyncView: View {
 struct SectionCard<Content: View>: View {
     let title: String
     let icon: String
+    var onHeaderTap: (() -> Void)? = nil
     @ViewBuilder let content: Content
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Label(title, systemImage: icon)
-                .font(.headline)
+            if let onHeaderTap {
+                Button(action: onHeaderTap) {
+                    Label(title, systemImage: icon)
+                        .font(.headline)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .foregroundColor(.primary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .buttonStyle(.plain)
+            } else {
+                Label(title, systemImage: icon)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .font(.headline)
+            }
 
             content
         }
@@ -289,8 +304,10 @@ struct DotStatusRow: View {
             }
 
             VStack(alignment: .leading, spacing: 4) {
-                Text(dot.address)
+                Text("DOT " + dot.address)
                     .font(.headline)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
 
                 HStack(spacing: 8) {
                     StatusTag(text: "Connected", isActive: dot.isConnected, color: .green)

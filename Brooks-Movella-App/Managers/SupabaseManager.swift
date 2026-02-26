@@ -10,9 +10,23 @@ final class SupabaseManager: ObservableObject {
     @Published var profiles: [Profile] = []
     @Published var workoutTemplates: [WorkoutTemplate] = []
     @Published var isLoading = false
+    @Published var isLoadingTemplates = false
+    @Published var hasFetchedTemplates = false
     @Published var errorMessage: String?
 
     private let client: SupabaseClient
+
+    private static let dateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd"
+        return f
+    }()
+
+    private static let timeFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm:ss"
+        return f
+    }()
 
     private init() {
         let info = Bundle.main.infoDictionary
@@ -85,6 +99,11 @@ final class SupabaseManager: ObservableObject {
     // MARK: - Workout Templates
     // Now fetches from sessions instead of workouts
     func fetchWorkoutTemplates() async {
+        isLoadingTemplates = true
+        defer {
+            isLoadingTemplates = false
+            hasFetchedTemplates = true
+        }
         do {
             let rows: [WorkoutTemplateRow] = try await client
                 .from("sessions")
@@ -115,7 +134,7 @@ final class SupabaseManager: ObservableObject {
 
     // MARK: - Upload Workout
     // Creates session once with metadata, then inserts one workout row per file
-    func uploadWorkout(csvURL: URL, userId: UUID, sessionId: UUID, template: WorkoutTemplate, conditionType: String) async throws {
+    func uploadWorkout(csvURL: URL, userId: UUID, sessionId: UUID, template: WorkoutTemplate, conditionType: String, sensorAddress: String, recordedAt: Date) async throws {
         let csvData = try Data(contentsOf: csvURL)
         let storagePath = "\(userId.uuidString)/\(sessionId.uuidString)/\(csvURL.lastPathComponent)"
 
@@ -125,13 +144,15 @@ final class SupabaseManager: ObservableObject {
 
         let payload = WorkoutPayload(
             sessionId:     sessionId,
-            blobAddress:   storagePath
+            blobAddress:   storagePath,
+            sensorAddress: sensorAddress,
+            recordedTime:  Self.timeFormatter.string(from: recordedAt)
         )
         try await client.from("workouts").insert(payload).execute()
     }
 
     // Call this once per export batch before uploading individual files
-    func createSession(userId: UUID, template: WorkoutTemplate) async throws -> UUID {
+    func createSession(userId: UUID, template: WorkoutTemplate, recordedDate: Date) async throws -> UUID {
         let payload = SessionPayload(
             userId:         userId,
             shoeBrand:      template.shoeBrand,
@@ -140,7 +161,8 @@ final class SupabaseManager: ObservableObject {
             study:          template.study,
             test:           template.test,
             product:        template.product,
-            conditionType: template.conditionType
+            conditionType:  template.conditionType,
+            recordedDate:   Self.dateFormatter.string(from: recordedDate)
         )
         let session: Session = try await client
             .from("sessions")

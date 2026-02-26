@@ -114,7 +114,7 @@ final class DotManager: NSObject, ObservableObject {
 
     /// Serializes every call into the Movella SDK.
     /// Exposed read-only for `ExportManager` to share the same serial queue.
-    let sdkQueue = DispatchQueue(label: "DotManager.sdkQueue")
+    let sdkQueue = DispatchQueue(label: "DotManager.sdkQueue", qos: .userInitiated)
 
     // MARK: - Components
 

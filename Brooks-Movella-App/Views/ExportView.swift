@@ -36,6 +36,9 @@ struct ExportView: View {
             .navigationTitle("Export")
             .toolbar {
                 #if DEBUG
+                
+                //If you just want to sample the export, then uncomment this
+                
                 ToolbarItem(placement: .navigationBarLeading) {
                     Button {
                         showMockTest = true
@@ -75,21 +78,26 @@ struct ExportView: View {
                     exportManager.fetchRecordings(for: connectedDots)
                 }
             }
-        } else if exportManager.exportPhase == .fetching {
-            SectionCard(title: "Recordings", icon: "doc.on.doc") {
-                FetchingStateView(dots: connectedDots, loadedAddresses: Set(exportManager.recordings.keys))
-            }
         } else {
-            ForEach(connectedDots, id: \.address) { dot in
-                let files = exportManager.recordings[dot.address] ?? []
-                RecordingListSection(
-                    dot: dot,
-                    files: files,
-                    selectedIDs: $exportManager.selectedIDs,
-                    onToggle: { file in exportManager.toggleSelection(file) },
-                    onSelectAll: { exportManager.selectAll(for: dot.address) },
-                    onDeselectAll: { exportManager.deselectAll(for: dot.address) }
-                )
+            SectionCard(
+                title: connectedDots.count > 0
+                    ? "Recordings — \(connectedDots.count) sensor\(connectedDots.count == 1 ? "" : "s")"
+                    : "Recordings",
+                icon: "doc.on.doc"
+            ) {
+                ForEach(connectedDots, id: \.address) { dot in
+                    let files = exportManager.recordings[dot.address]
+                    RecordingListSection(
+                        dot: dot,
+                        files: files ?? [],
+                        isLoading: files == nil && exportManager.isFetching,
+                        selectedIDs: $exportManager.selectedIDs,
+                        onToggle: { file in exportManager.toggleSelection(file) },
+                        onSelectAll: { exportManager.selectAll(for: dot.address) },
+                        onDeselectAll: { exportManager.deselectAll(for: dot.address) }
+                    )
+                    .animation(.easeInOut(duration: 0.25), value: files == nil)
+                }
             }
 
             if !exportManager.selectedIDs.isEmpty {
@@ -206,7 +214,8 @@ struct CartView: View {
                     if !exportManager.tasks.isEmpty {
                         ExportResultsSection(
                             exportManager: exportManager,
-                            onRetryUpload: { task in retryUpload(for: task) }
+                            onRetryUpload: { task in retryUpload(for: task) },
+                            onRetryFailed: retryAll
                         )
                     }
 
@@ -318,9 +327,11 @@ struct CartView: View {
         let sessionGroups = Dictionary(grouping: exportManager.cartItems) { $0.sessionId }
         var map: [UUID: UUID] = [:]
         do {
-            for cartSessionId in sessionGroups.keys {
+            for (cartSessionId, items) in sessionGroups {
+                let minTimestamp = items.map { $0.recording.timestamp }.min() ?? UInt32(Date().timeIntervalSince1970)
+                let recordedDate = Date(timeIntervalSince1970: TimeInterval(minTimestamp))
                 let dbId = try await SupabaseManager.shared.createSession(
-                    userId: profile.id, template: template
+                    userId: profile.id, template: template, recordedDate: recordedDate
                 )
                 map[cartSessionId] = dbId
             }
@@ -350,12 +361,24 @@ struct CartView: View {
                 userId: profile.id,
                 sessionId: dbSessionId,
                 template: template,
-                conditionType: conditionType
+                conditionType: conditionType,
+                sensorAddress: task.cartItem.recording.macAddress,
+                recordedAt: Date(timeIntervalSince1970: TimeInterval(task.cartItem.recording.timestamp))
             )
             task.uploadStatus = .uploaded
         } catch {
             task.uploadError = error.localizedDescription
             task.uploadStatus = .failed
+        }
+    }
+
+    private func retryAll() {
+        let hasBLEFailures = exportManager.tasks.contains { $0.status == .failed || $0.status == .canceled }
+        if hasBLEFailures {
+            exportManager.retryFailed()
+        }
+        for task in exportManager.tasks where task.uploadStatus == .failed {
+            retryUpload(for: task)
         }
     }
 
@@ -373,15 +396,18 @@ struct CartView: View {
                 if let existing = dbSessionMap[cartSessionId] {
                     sessionId = existing
                 } else {
+                    let recordedDate = Date(timeIntervalSince1970: TimeInterval(task.cartItem.recording.timestamp))
                     sessionId = try await SupabaseManager.shared.createSession(
-                        userId: profile.id, template: template
+                        userId: profile.id, template: template, recordedDate: recordedDate
                     )
                 }
                 try await SupabaseManager.shared.uploadWorkout(
                     csvURL: url, userId: profile.id,
                     sessionId: sessionId,
                     template: template,
-                    conditionType: conditionType
+                    conditionType: conditionType,
+                    sensorAddress: task.cartItem.recording.macAddress,
+                    recordedAt: Date(timeIntervalSince1970: TimeInterval(task.cartItem.recording.timestamp))
                 )
                 task.uploadStatus = .uploaded
             } catch {

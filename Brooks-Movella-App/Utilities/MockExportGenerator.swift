@@ -59,6 +59,7 @@ struct MockExportGenerator {
 
         let recording = RecordingFile(
             dotAddress: "MOCK_\(label)",
+            macAddress: "00:00:00:00:00:00",
             fileIndex: 0,
             fileSize: packetCount * 88,
             timestamp: UInt32(Date().timeIntervalSince1970)
@@ -67,13 +68,20 @@ struct MockExportGenerator {
         item.label = label
 
         let task = ExportTask(cartItem: item)
-        task.status = .success
-        task.progress = 1.0
-        task.subphase = .complete
-        task.outputURL = url
-
         let isValid = ExportManager.shared.validatePacketCount(csvURL: url)
-        task.hasPacketLoss = !isValid
+
+        if isValid {
+            task.status = .success
+            task.progress = 1.0
+            task.subphase = .complete
+            task.outputURL = url
+        } else {
+            // Mirror real pipeline: delete the partial CSV and mark failed.
+            try? FileManager.default.removeItem(at: url)
+            task.status = .failed
+            task.hasPacketLoss = true
+            task.error = "Packet loss detected"
+        }
 
         return task
     }

@@ -110,14 +110,17 @@ struct MockUploadTestView: View {
             do {
                 let sessionId = try await SupabaseManager.shared.createSession(
                     userId: profile.id,
-                    template: template
+                    template: template,
+                    recordedDate: Date()
                 )
                 try await SupabaseManager.shared.uploadWorkout(
                     csvURL: url,
                     userId: profile.id,
                     sessionId: sessionId,
                     template: template,
-                    conditionType: template.conditionType
+                    conditionType: template.conditionType,
+                    sensorAddress: "mock-sensor",
+                    recordedAt: Date()
                 )
                 task.uploadStatus = .uploaded
             } catch {
