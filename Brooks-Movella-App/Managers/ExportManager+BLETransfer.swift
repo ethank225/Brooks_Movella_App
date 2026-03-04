@@ -23,9 +23,23 @@ extension ExportManager {
 
         var taskIndex = 0
 
+        // Install the GATT explorer for the entire device export window so write ACKs
+        // and ready-to-send events are visible. keepDelegateInstalled prevents it from
+        // stepping down after discovery; finish() tears it down when all files are done.
+        let explorer = DotGATTExplorer(dot: dot)
+        explorer.keepDelegateInstalled = true
+        activeExplorer = explorer
+        explorer.start()
+
+        let finish: () -> Void = { [weak self] in
+            explorer.stop()
+            self?.activeExplorer = nil
+            completion()
+        }
+
         func exportNextFile() {
             guard taskIndex < tasks.count, !currentExportCanceled else {
-                completion()
+                finish()
                 return
             }
 
@@ -43,7 +57,7 @@ extension ExportManager {
 
             // Open the CSV file on fileQueue, then begin the BLE transfer on sdkQueue.
             fileQueue.async { [weak self] in
-                guard let self else { completion(); return }
+                guard let self else { finish(); return }
 
                 // Write the header row and open the file handle.
                 let csvHeader = "packet_counter,timestamp,euler_x,euler_y,euler_z,acc_x,acc_y,acc_z,gyr_x,gyr_y,gyr_z\n"
@@ -57,13 +71,17 @@ extension ExportManager {
 
                 // Begin the BLE transfer.
                 self.sdkQueue.async { [weak self] in
-                    guard let self else { completion(); return }
+                    guard let self else { finish(); return }
 
                     var batch = Data()
                     batch.reserveCapacity(200 * 120)
 
                     let device = dot.device
                     device.stopExportFileData()
+                    
+                    // Log negotiated MTU
+                    let mtu = dot.device.peripheral.maximumWriteValueLength(for: .withoutResponse)
+                    print("📶 [\(dot.address)] Negotiated MTU: \(mtu) bytes")
                     self.isTransferring = true
 
                     // Bump the generation so stale callbacks from prior attempts are ignored.

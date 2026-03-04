@@ -74,6 +74,7 @@ final class ExportManager: ObservableObject {
     // Internal so ExportManager+BLETransfer.swift can access them.
     var currentExportCanceled = false
     var activeWatchdog: ExportWatchdog?
+    var activeExplorer: DotGATTExplorer?
     var exportFileGeneration: Int = 0
     var isTransferring = false
     let dataTimeoutInterval: TimeInterval = 10.0
@@ -302,6 +303,8 @@ final class ExportManager: ObservableObject {
         }
         activeWatchdog?.stop()
         activeWatchdog = nil
+        activeExplorer?.stop()
+        activeExplorer = nil
 
         // Tell any actively-transferring devices to stop.
         let runningAddresses = Set(
@@ -344,9 +347,14 @@ final class ExportManager: ObservableObject {
         currentExportCanceled = false
         setOnMain { self.exportPhase = .exporting }
 
+        // fullPipeline is written in two phases (see below) and read only after both
+        // phases complete, so no lock is needed.
         var fullPipeline: [ExportTask] = []
 
-        for task in retryable {
+        // --- Pass 1: tasks without packet loss ------------------------------------------
+        // The CSV was never partially written, so disk state is stable. Check existence
+        // synchronously on main — no deletion means no race.
+        for task in retryable where !task.hasPacketLoss {
             let csv = csvURL(for: task)
             if FileManager.default.fileExists(atPath: csv.path) {
                 setOnMain {
@@ -363,40 +371,211 @@ final class ExportManager: ObservableObject {
             }
         }
 
-        let grouped = Dictionary(grouping: fullPipeline, by: { $0.cartItem.recording.dotAddress })
+        // --- Pass 2: tasks with packet loss ---------------------------------------------
+        // The partial CSV must be deleted before we can decide whether a re-transfer is
+        // needed. Run delete + existence check together inside fileQueue.async so the
+        // check always sees the post-deletion state. Never call .sync on fileQueue from
+        // the main thread — that deadlocks if fileQueue already has work queued.
+        // All Pass-1 appends to fullPipeline are complete before any fileQueue.async
+        // block is dispatched, so there is no concurrent write from two threads.
+        let packetLossTasks = retryable.filter { $0.hasPacketLoss }
+        let group = DispatchGroup()
 
-        guard !grouped.isEmpty else {
-            DispatchQueue.main.async {
-                self.exportPhase = .done
-                self.endExportBackgroundTask()
+        for task in packetLossTasks {
+            let csv = csvURL(for: task)
+            group.enter()
+            fileQueue.async { [weak self] in
+                guard let self else { group.leave(); return }
+
+                try? FileManager.default.removeItem(at: csv)
+
+                if FileManager.default.fileExists(atPath: csv.path) {
+                    // Deletion failed but file is intact — treat as successfully exported.
+                    self.setOnMain {
+                        task.status = .success
+                        task.subphase = .complete
+                        task.progress = 1.0
+                        task.outputURL = csv
+                        task.error = nil
+                    }
+                } else {
+                    // File is gone — needs a full BLE re-transfer.
+                    // fileQueue is serial so these appends never race with each other,
+                    // and group.notify fires on main only after all blocks call leave().
+                    fullPipeline.append(task)
+                    self.setTaskStatus(task, .queued)
+                    self.setOnMain { task.progress = 0; task.error = nil; task.subphase = .idle; task.hasPacketLoss = false }
+                }
+                group.leave()
             }
-            return
         }
 
-        exportSequenceGeneration += 1
-        let myGen = exportSequenceGeneration
-        let semaphore = DispatchSemaphore(value: 0)
-        currentExportSemaphore = semaphore
-
-        exportSequenceQueue.async { [weak self] in
+        // --- After all file operations complete, start the BLE pipeline -----------------
+        // group.notify fires on main once every fileQueue.async block has left the group
+        // (or immediately if packetLossTasks was empty). By that point fullPipeline is
+        // fully populated from both passes and safe to read.
+        group.notify(queue: .main) { [weak self] in
             guard let self else { return }
 
-            for (address, tasksForDot) in grouped {
-                guard !self.currentExportCanceled else { break }
+            let grouped = Dictionary(grouping: fullPipeline, by: { $0.cartItem.recording.dotAddress })
 
-                guard let dot = DotManager.shared.dot(forUuid: address), dot.isConnected else {
-                    tasksForDot.forEach { self.setTaskStatus($0, .failed, error: "Sensor disconnected") }
-                    continue
-                }
-
-                self.exportFilesForDot(dot: dot, tasks: tasksForDot) { semaphore.signal() }
-                semaphore.wait()
-            }
-
-            DispatchQueue.main.async {
-                guard self.exportSequenceGeneration == myGen else { return }
+            guard !grouped.isEmpty else {
                 self.exportPhase = .done
                 self.endExportBackgroundTask()
+                return
+            }
+
+            self.exportSequenceGeneration += 1
+            let myGen = self.exportSequenceGeneration
+            let semaphore = DispatchSemaphore(value: 0)
+            self.currentExportSemaphore = semaphore
+
+            self.exportSequenceQueue.async { [weak self] in
+                guard let self else { return }
+
+                for (address, tasksForDot) in grouped {
+                    guard !self.currentExportCanceled else { break }
+
+                    guard let dot = DotManager.shared.dot(forUuid: address), dot.isConnected else {
+                        tasksForDot.forEach { self.setTaskStatus($0, .failed, error: "Sensor disconnected") }
+                        continue
+                    }
+
+                    self.exportFilesForDot(dot: dot, tasks: tasksForDot) { semaphore.signal() }
+                    semaphore.wait()
+                }
+
+                DispatchQueue.main.async {
+                    guard self.exportSequenceGeneration == myGen else { return }
+                    self.exportPhase = .done
+                    self.endExportBackgroundTask()
+                }
+            }
+        }
+    }
+
+    /// Re-queue a single failed/canceled task for retry.
+    /// If the CSV already exists on disk it is marked done immediately; otherwise the full
+    /// BLE pipeline reruns for that one task.
+    func retrySingleTask(_ task: ExportTask) {
+        guard task.status == .failed || task.status == .canceled else { return }
+
+        beginExportBackgroundTask()
+        currentExportCanceled = false
+        setOnMain { self.exportPhase = .exporting }
+
+        let csv = csvURL(for: task)
+
+        if task.hasPacketLoss {
+            // The partial CSV must be deleted before we check whether re-transfer is needed.
+            // Run delete + existence check together inside fileQueue.async so the check
+            // always sees the post-deletion state (no race). Never .sync from the main
+            // thread — that deadlocks if fileQueue already has work queued.
+            // After the file op, dispatch back to main to mutate @Published/sequence state,
+            // which must remain main-thread-only.
+            fileQueue.async { [weak self] in
+                guard let self else { return }
+
+                try? FileManager.default.removeItem(at: csv)
+                let stillExists = FileManager.default.fileExists(atPath: csv.path)
+
+                DispatchQueue.main.async {
+                    if stillExists {
+                        // Deletion failed but file is intact — mark done without re-transferring.
+                        task.status = .success
+                        task.subphase = .complete
+                        task.progress = 1.0
+                        task.outputURL = csv
+                        task.error = nil
+                        self.exportPhase = .done
+                        self.endExportBackgroundTask()
+                    } else {
+                        // File is gone — run the full BLE pipeline.
+                        // Sequence state mutations happen here on main, matching the contract.
+                        self.setTaskStatus(task, .queued)
+                        task.progress = 0; task.error = nil; task.subphase = .idle; task.hasPacketLoss = false
+
+                        self.exportSequenceGeneration += 1
+                        let myGen = self.exportSequenceGeneration
+                        let semaphore = DispatchSemaphore(value: 0)
+                        self.currentExportSemaphore = semaphore
+
+                        self.exportSequenceQueue.async { [weak self] in
+                            guard let self else { return }
+
+                            let address = task.cartItem.recording.dotAddress
+                            guard !self.currentExportCanceled,
+                                  let dot = DotManager.shared.dot(forUuid: address), dot.isConnected else {
+                                self.setTaskStatus(task, .failed, error: "Sensor disconnected")
+                                DispatchQueue.main.async {
+                                    guard self.exportSequenceGeneration == myGen else { return }
+                                    self.exportPhase = .done
+                                    self.endExportBackgroundTask()
+                                }
+                                return
+                            }
+
+                            self.exportFilesForDot(dot: dot, tasks: [task]) { semaphore.signal() }
+                            semaphore.wait()
+
+                            DispatchQueue.main.async {
+                                guard self.exportSequenceGeneration == myGen else { return }
+                                self.exportPhase = .done
+                                self.endExportBackgroundTask()
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            // No deletion needed — file state is stable. Synchronous check is safe on
+            // main because the file was never touched by a partial transfer.
+            if FileManager.default.fileExists(atPath: csv.path) {
+                setOnMain {
+                    task.status = .success
+                    task.subphase = .complete
+                    task.progress = 1.0
+                    task.outputURL = csv
+                    task.error = nil
+                }
+                DispatchQueue.main.async {
+                    self.exportPhase = .done
+                    self.endExportBackgroundTask()
+                }
+                return
+            }
+
+            setTaskStatus(task, .queued)
+            setOnMain { task.progress = 0; task.error = nil; task.subphase = .idle; task.hasPacketLoss = false }
+
+            exportSequenceGeneration += 1
+            let myGen = exportSequenceGeneration
+            let semaphore = DispatchSemaphore(value: 0)
+            currentExportSemaphore = semaphore
+
+            exportSequenceQueue.async { [weak self] in
+                guard let self else { return }
+
+                let address = task.cartItem.recording.dotAddress
+                guard !self.currentExportCanceled,
+                      let dot = DotManager.shared.dot(forUuid: address), dot.isConnected else {
+                    self.setTaskStatus(task, .failed, error: "Sensor disconnected")
+                    DispatchQueue.main.async {
+                        guard self.exportSequenceGeneration == myGen else { return }
+                        self.exportPhase = .done
+                        self.endExportBackgroundTask()
+                    }
+                    return
+                }
+
+                self.exportFilesForDot(dot: dot, tasks: [task]) { semaphore.signal() }
+                semaphore.wait()
+
+                DispatchQueue.main.async {
+                    guard self.exportSequenceGeneration == myGen else { return }
+                    self.exportPhase = .done
+                    self.endExportBackgroundTask()
+                }
             }
         }
     }

@@ -147,6 +147,7 @@ final class DotManager: NSObject, ObservableObject {
 
     @Published var selectedOutputRate: Int = 120
     @Published var selectedFilterIndex: Int = 0
+    
 
     /// Per-device connection timeout timers. Managed on the main thread.
     private var connectTimers: [String: DispatchWorkItem] = [:]
@@ -486,7 +487,7 @@ final class DotManager: NSObject, ObservableObject {
                 self.registry.setConnectionPhase(uuid, .ready)
                 print("✅ [\(uuid)] phase now .ready")
                 self.notify()
-
+                
                 // After a BT power cycle, restore the recording session once
                 // at least one device is back and ready.
                 if self.registry.wasRecordingBeforeDisconnect {

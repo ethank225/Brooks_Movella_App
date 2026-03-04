@@ -110,9 +110,16 @@ struct ExportTaskRow: View {
                         .font(.caption)
                         .foregroundColor(.red)
                 }
-                Button("Retry Upload") { onRetryUpload?() }
-                    .font(.caption)
-                    .foregroundColor(.blue)
+                Button(action: { onRetryUpload?() }) {
+                    Label("Retry Upload", systemImage: "arrow.clockwise")
+                        .font(.caption.weight(.medium))
+                        .foregroundColor(.white)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 7)
+                        .background(Color.orange)
+                        .clipShape(Capsule())
+                }
+                .buttonStyle(.plain)
             }
         }
     }

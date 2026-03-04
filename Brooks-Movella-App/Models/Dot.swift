@@ -41,6 +41,10 @@ final class Dot: ObservableObject, Identifiable {
         guard flashTotalBytes > 0 else { return 0 }
         return (Double(flashUsedBytes) / Double(flashTotalBytes)) * 100.0
     }
+    
+    var negotiatedMTU: Int {
+        device.peripheral.maximumWriteValueLength(for: .withoutResponse)
+    }
 
     // MARK: - SDK-Derived State (read-through to device)
 

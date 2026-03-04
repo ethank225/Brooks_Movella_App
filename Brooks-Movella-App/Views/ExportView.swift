@@ -214,8 +214,7 @@ struct CartView: View {
                     if !exportManager.tasks.isEmpty {
                         ExportResultsSection(
                             exportManager: exportManager,
-                            onRetryUpload: { task in retryUpload(for: task) },
-                            onRetryFailed: retryAll
+                            onRetryUpload: { task in retryUpload(for: task) }
                         )
                     }
 
@@ -369,16 +368,6 @@ struct CartView: View {
         } catch {
             task.uploadError = error.localizedDescription
             task.uploadStatus = .failed
-        }
-    }
-
-    private func retryAll() {
-        let hasBLEFailures = exportManager.tasks.contains { $0.status == .failed || $0.status == .canceled }
-        if hasBLEFailures {
-            exportManager.retryFailed()
-        }
-        for task in exportManager.tasks where task.uploadStatus == .failed {
-            retryUpload(for: task)
         }
     }
 
