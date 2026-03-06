@@ -51,6 +51,7 @@ extension ExportManager {
 
             var packetsReceived = 0
             var exportCompleted = false
+            var doneFired = false
 
             let csvPath = csvURL(for: task)
             let estimatedTotalPackets = max(task.cartItem.recording.fileSize / 88, 1)
@@ -68,6 +69,7 @@ extension ExportManager {
                     return
                 }
                 fileHandle.seekToEndOfFile()
+                self.activeFileHandle = fileHandle
 
                 // Begin the BLE transfer.
                 self.sdkQueue.async { [weak self] in
@@ -91,33 +93,74 @@ extension ExportManager {
                     device.exportDataFormat = Data(formatBytes)
                     device.recording.exportFileList = [NSNumber(value: fileIndex)]
 
-                    // MARK: Watchdog — fail the file if no packets arrive for `dataTimeoutInterval`.
+                    let exportStartTime = CACurrentMediaTime()
+                    var lastProgressUpdate = exportStartTime
+                    var cbTimeTotal: Double = 0
+                    var cbTimeMax: Double = 0
+
+                    // MARK: Watchdog — fires `dataTimeoutInterval` seconds after the last packet.
+                    // If `doneFired == true` the stream is fully drained → success path.
+                    // If `doneFired == false` no done signal received → genuine stall → fail path.
                     let watchdog = ExportWatchdog(
                         timeout: self.dataTimeoutInterval,
                         queue: self.sdkQueue
                     ) { [weak self] in
                         guard let self, !exportCompleted else { return }
                         exportCompleted = true
-                        print("⏰ [\(dot.address)] Export timeout for \(task.cartItem.label)")
 
+                        self.activeWatchdog = nil
+                        self.isTransferring = false
+                        self.exportFileGeneration += 1
                         device.setDidParseExportFileDataBlock(nil)
                         device.recording.exportFileDone = { _, _ in }
-                        device.stopExportFileData()
-                        self.isTransferring = false
 
-                        self.fileQueue.async {
-                            try? fileHandle.close()
-                            try? FileManager.default.removeItem(at: csvPath)
-                            self.setTaskStatus(task, .failed, error: "Export timed out")
-                            self.sdkQueue.async { taskIndex += 1; exportNextFile() }
+                        if doneFired {
+                            // exportFileDone was received — stream is drained → finalize as success.
+                            let finalChunk: Data? = batch.isEmpty ? nil : batch
+                            batch.removeAll(keepingCapacity: true)
+                            let finalPackets = packetsReceived
+                            let elapsed = CACurrentMediaTime() - exportStartTime
+                            let avgCb = finalPackets > 0 ? cbTimeTotal / Double(finalPackets) : 0
+
+                            self.fileQueue.async {
+                                if let finalChunk { fileHandle.write(finalChunk) }
+                                try? fileHandle.close()
+                                self.activeFileHandle = nil
+
+                                let pps = elapsed > 0 ? Double(finalPackets) / elapsed : 0
+                                print("📡 [\(dot.address)] \(finalPackets) pkts in \(String(format: "%.1f", elapsed))s (\(String(format: "%.0f", pps)) pkt/s), cb avg \(String(format: "%.2f", avgCb * 1000))ms")
+
+                                let isValid = self.validatePacketCount(csvURL: csvPath)
+                                if !isValid {
+                                    try? FileManager.default.removeItem(at: csvPath)
+                                    self.setOnMain { task.hasPacketLoss = true }
+                                    self.setTaskStatus(task, .failed, error: "Packet loss detected")
+                                } else {
+                                    self.setOnMain {
+                                        task.progress = 1.0
+                                        task.outputURL = csvPath
+                                        task.subphase = .complete
+                                        task.status = .success
+                                        print("✅ Exported \(task.cartItem.label) → \(csvPath.lastPathComponent)")
+                                        self.onTaskCompleted?(task)
+                                    }
+                                }
+                                self.sdkQueue.async { taskIndex += 1; exportNextFile() }
+                            }
+                        } else {
+                            // No exportFileDone yet — genuine stall → fail.
+                            print("⏰ [\(dot.address)] Export timeout for \(task.cartItem.label)")
+                            device.stopExportFileData()
+                            self.fileQueue.async {
+                                try? fileHandle.close()
+                                self.activeFileHandle = nil
+                                try? FileManager.default.removeItem(at: csvPath)
+                                self.setTaskStatus(task, .failed, error: "Export timed out")
+                                self.sdkQueue.async { taskIndex += 1; exportNextFile() }
+                            }
                         }
                     }
                     self.activeWatchdog = watchdog
-
-                    let exportStartTime = CACurrentMediaTime()
-                    var lastProgressUpdate = exportStartTime
-                    var cbTimeTotal: Double = 0
-                    var cbTimeMax: Double = 0
 
                     // MARK: Packet callback — fires on sdkQueue for every BLE packet.
                     device.setDidParseExportFileDataBlock { [weak self] plotData in
@@ -142,7 +185,9 @@ extension ExportManager {
                             let captured = batch
                             batch.removeAll(keepingCapacity: true)
                             // Dispatch to fileQueue — never dispatch back to sdkQueue from here (deadlock).
-                            self.fileQueue.async { fileHandle.write(captured) }
+                            self.fileQueue.async {
+                                fileHandle.write(captured)
+                            }
                         }
 
                         // Update progress at most every 100 packets or 0.5 seconds.
@@ -162,53 +207,16 @@ extension ExportManager {
                         }
                     }
 
-                    // MARK: Done callback — fires on sdkQueue when the file transfer ends.
-                    // Guard against the SDK firing this twice with `exportCompleted`.
+                    // MARK: Done callback — fires on sdkQueue when BLE transport is done.
+                    // The SDK fires this before all parsed packet callbacks are dispatched,
+                    // so we only record the signal here. The watchdog handles finalization
+                    // once the packet stream goes silent.
                     device.recording.exportFileDone = { [weak self] _, _ in
-                        guard let self, !exportCompleted else { return }
-                        guard self.exportFileGeneration == generation else { return }
-                        exportCompleted = true
-
-                        watchdog.stop()
-                        self.activeWatchdog = nil
-                        self.isTransferring = false
-                        self.exportFileGeneration += 1  // Invalidate any remaining packet callbacks.
-
-                        device.setDidParseExportFileDataBlock(nil)
-                        device.recording.exportFileDone = { _, _ in }
-
-                        // Capture local state before dispatching to fileQueue.
-                        let finalChunk: Data? = batch.isEmpty ? nil : batch
-                        batch.removeAll(keepingCapacity: true)
-                        let finalPackets = packetsReceived
-                        let elapsed = CACurrentMediaTime() - exportStartTime
-                        let avgCb = finalPackets > 0 ? cbTimeTotal / Double(finalPackets) : 0
-
-                        self.fileQueue.async {
-                            if let finalChunk { fileHandle.write(finalChunk) }
-                            try? fileHandle.close()
-
-                            let pps = elapsed > 0 ? Double(finalPackets) / elapsed : 0
-                            print("📡 [\(dot.address)] \(finalPackets) pkts in \(String(format: "%.1f", elapsed))s (\(String(format: "%.0f", pps)) pkt/s), cb avg \(String(format: "%.2f", avgCb * 1000))ms")
-
-                            let isValid = self.validatePacketCount(csvURL: csvPath)
-                            if !isValid {
-                                try? FileManager.default.removeItem(at: csvPath)
-                                self.setOnMain { task.hasPacketLoss = true }
-                                self.setTaskStatus(task, .failed, error: "Packet loss detected")
-                            } else {
-                                self.setOnMain {
-                                    task.progress = 1.0
-                                    task.outputURL = csvPath
-                                    task.subphase = .complete
-                                    task.status = .success
-                                    print("✅ Exported \(task.cartItem.label) → \(csvPath.lastPathComponent)")
-                                    self.onTaskCompleted?(task)
-                                }
-                            }
-
-                            self.sdkQueue.async { taskIndex += 1; exportNextFile() }
-                        }
+                        guard self != nil, !doneFired else { return }
+                        guard self!.exportFileGeneration == generation else { return }
+                        doneFired = true
+                        print("📥 [\(dot.address)] exportFileDone at pkt \(packetsReceived) — waiting for stream to drain")
+                        // Remaining packet callbacks keep flowing; watchdog will close the file.
                     }
 
                     device.recording.updateExportingStatus = { status in
@@ -217,6 +225,7 @@ extension ExportManager {
                         }
                     }
 
+                    print("📁 [\(dot.address)] Requesting fileIndex: \(fileIndex)")
                     device.startExportFileData()
                     print("📤 [\(dot.address)] Started export for file \(fileIndex)")
                 }

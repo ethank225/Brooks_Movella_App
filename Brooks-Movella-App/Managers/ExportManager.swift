@@ -78,6 +78,8 @@ final class ExportManager: ObservableObject {
     var exportFileGeneration: Int = 0
     var isTransferring = false
     let dataTimeoutInterval: TimeInterval = 10.0
+    /// Currently open CSV file handle. Accessed only on `fileQueue`. Closed by cancel if transfer is in progress.
+    var activeFileHandle: FileHandle?
 
     private var exportSequenceGeneration: Int = 0
     private var currentExportSemaphore: DispatchSemaphore?
@@ -298,11 +300,17 @@ final class ExportManager: ObservableObject {
         exportSequenceGeneration += 1
 
         sdkQueue.async {
+            self.exportFileGeneration += 1  // Stop any in-flight packet callbacks.
             self.currentExportCanceled = true
             self.isTransferring = false
         }
         activeWatchdog?.stop()
         activeWatchdog = nil
+        // Close the in-progress file handle (the watchdog won't fire to do it).
+        fileQueue.async {
+            try? self.activeFileHandle?.close()
+            self.activeFileHandle = nil
+        }
         activeExplorer?.stop()
         activeExplorer = nil
 
