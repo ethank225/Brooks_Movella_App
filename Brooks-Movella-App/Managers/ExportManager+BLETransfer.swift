@@ -28,12 +28,12 @@ extension ExportManager {
         // stepping down after discovery; finish() tears it down when all files are done.
         let explorer = DotGATTExplorer(dot: dot)
         explorer.keepDelegateInstalled = true
-        activeExplorer = explorer
+        activeExplorers[dot.address] = explorer
         explorer.start()
 
         let finish: () -> Void = { [weak self] in
             explorer.stop()
-            self?.activeExplorer = nil
+            self?.activeExplorers.removeValue(forKey: dot.address)
             completion()
         }
 
@@ -54,7 +54,7 @@ extension ExportManager {
             var doneFired = false
 
             let csvPath = csvURL(for: task)
-            let estimatedTotalPackets = max(task.cartItem.recording.fileSize / 88, 1)
+            let estimatedDurationSeconds = max(Double(task.cartItem.recording.fileSize) / (88.0 * 33.0), 1.0)
 
             // Open the CSV file on fileQueue, then begin the BLE transfer on sdkQueue.
             fileQueue.async { [weak self] in
@@ -69,7 +69,7 @@ extension ExportManager {
                     return
                 }
                 fileHandle.seekToEndOfFile()
-                self.activeFileHandle = fileHandle
+                self.activeFileHandles[dot.address] = fileHandle
 
                 // Begin the BLE transfer.
                 self.sdkQueue.async { [weak self] in
@@ -87,8 +87,8 @@ extension ExportManager {
                     self.isTransferring = true
 
                     // Bump the generation so stale callbacks from prior attempts are ignored.
-                    self.exportFileGeneration += 1
-                    let generation = self.exportFileGeneration
+                    self.exportFileGenerations[dot.address, default: 0] += 1
+                    let generation = self.exportFileGenerations[dot.address, default: 0]
 
                     device.exportDataFormat = Data(formatBytes)
                     device.recording.exportFileList = [NSNumber(value: fileIndex)]
@@ -108,9 +108,9 @@ extension ExportManager {
                         guard let self, !exportCompleted else { return }
                         exportCompleted = true
 
-                        self.activeWatchdog = nil
+                        self.activeWatchdogs.removeValue(forKey: dot.address)
                         self.isTransferring = false
-                        self.exportFileGeneration += 1
+                        self.exportFileGenerations[dot.address, default: 0] += 1
                         device.setDidParseExportFileDataBlock(nil)
                         device.recording.exportFileDone = { _, _ in }
 
@@ -125,7 +125,7 @@ extension ExportManager {
                             self.fileQueue.async {
                                 if let finalChunk { fileHandle.write(finalChunk) }
                                 try? fileHandle.close()
-                                self.activeFileHandle = nil
+                                self.activeFileHandles.removeValue(forKey: dot.address)
 
                                 let pps = elapsed > 0 ? Double(finalPackets) / elapsed : 0
                                 print("📡 [\(dot.address)] \(finalPackets) pkts in \(String(format: "%.1f", elapsed))s (\(String(format: "%.0f", pps)) pkt/s), cb avg \(String(format: "%.2f", avgCb * 1000))ms")
@@ -153,20 +153,20 @@ extension ExportManager {
                             device.stopExportFileData()
                             self.fileQueue.async {
                                 try? fileHandle.close()
-                                self.activeFileHandle = nil
+                                self.activeFileHandles.removeValue(forKey: dot.address)
                                 try? FileManager.default.removeItem(at: csvPath)
                                 self.setTaskStatus(task, .failed, error: "Export timed out")
                                 self.sdkQueue.async { taskIndex += 1; exportNextFile() }
                             }
                         }
                     }
-                    self.activeWatchdog = watchdog
+                    self.activeWatchdogs[dot.address] = watchdog
 
                     // MARK: Packet callback — fires on sdkQueue for every BLE packet.
                     device.setDidParseExportFileDataBlock { [weak self] plotData in
                         let cbStart = CACurrentMediaTime()
                         guard let self, !exportCompleted else { return }
-                        guard self.exportFileGeneration == generation else { return }
+                        guard self.exportFileGenerations[dot.address] == generation else { return }
 
                         watchdog.beat()
                         packetsReceived += 1
@@ -194,7 +194,7 @@ extension ExportManager {
                         let now = CACurrentMediaTime()
                         if packetsReceived % 100 == 0 || (now - lastProgressUpdate) >= 0.5 {
                             lastProgressUpdate = now
-                            let progress = min(Double(packetsReceived) / Double(estimatedTotalPackets), 0.99)
+                            let progress = min((now - exportStartTime) / estimatedDurationSeconds, 0.99)
                             self.setOnMain { task.progress = progress }
                         }
 
@@ -213,7 +213,7 @@ extension ExportManager {
                     // once the packet stream goes silent.
                     device.recording.exportFileDone = { [weak self] _, _ in
                         guard self != nil, !doneFired else { return }
-                        guard self!.exportFileGeneration == generation else { return }
+                        guard self!.exportFileGenerations[dot.address] == generation else { return }
                         doneFired = true
                         print("📥 [\(dot.address)] exportFileDone at pkt \(packetsReceived) — waiting for stream to drain")
                         // Remaining packet callbacks keep flowing; watchdog will close the file.

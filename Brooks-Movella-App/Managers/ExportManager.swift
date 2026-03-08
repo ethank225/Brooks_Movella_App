@@ -1,5 +1,6 @@
 import Foundation
 import UIKit
+import UserNotifications
 import MovellaDotSdk
 import Combine
 
@@ -73,16 +74,18 @@ final class ExportManager: ObservableObject {
 
     // Internal so ExportManager+BLETransfer.swift can access them.
     var currentExportCanceled = false
-    var activeWatchdog: ExportWatchdog?
-    var activeExplorer: DotGATTExplorer?
-    var exportFileGeneration: Int = 0
+    var activeWatchdogs: [String: ExportWatchdog] = [:]
+    var activeExplorers: [String: DotGATTExplorer] = [:]
+    var exportFileGenerations: [String: Int] = [:]
     var isTransferring = false
     let dataTimeoutInterval: TimeInterval = 10.0
-    /// Currently open CSV file handle. Accessed only on `fileQueue`. Closed by cancel if transfer is in progress.
-    var activeFileHandle: FileHandle?
+    /// Currently open CSV file handles keyed by dot address. Accessed only on `fileQueue`. Closed by cancel if transfer is in progress.
+    var activeFileHandles: [String: FileHandle] = [:]
 
     private var exportSequenceGeneration: Int = 0
     private var currentExportSemaphore: DispatchSemaphore?
+    /// How many semaphore signals cancelExport() must send to unblock any pending waits.
+    private var exportPendingSignals: Int = 0
     private var cancellables = Set<AnyCancellable>()
     private var bgTaskID: UIBackgroundTaskIdentifier = .invalid
 
@@ -248,7 +251,7 @@ final class ExportManager: ObservableObject {
 
     // MARK: - Export Pipeline
 
-    /// Start exporting all cart items. Processes one device at a time.
+    /// Start exporting all cart items. All devices transfer concurrently.
     func startExport() {
         guard !cartItems.isEmpty, exportPhase != .exporting else { return }
 
@@ -261,34 +264,36 @@ final class ExportManager: ObservableObject {
             self.exportPhase = .exporting
         }
 
-        // Group tasks by device, then process devices one at a time on exportSequenceQueue.
-        // fileQueue stays free for CSV writes dispatched from SDK callbacks.
         let grouped = Dictionary(grouping: newTasks, by: { $0.cartItem.recording.dotAddress })
+        let deviceCount = grouped.count
 
         exportSequenceGeneration += 1
         let myGen = exportSequenceGeneration
         let semaphore = DispatchSemaphore(value: 0)
         currentExportSemaphore = semaphore
+        exportPendingSignals = deviceCount
 
+        // Launch all devices concurrently.
+        for address in grouped.keys.sorted() {
+            guard let tasksForDot = grouped[address] else {
+                semaphore.signal(); continue
+            }
+            guard let dot = DotManager.shared.dot(forUuid: address), dot.isConnected else {
+                tasksForDot.forEach { setTaskStatus($0, .failed, error: "Sensor disconnected") }
+                semaphore.signal(); continue
+            }
+            exportFilesForDot(dot: dot, tasks: tasksForDot) { semaphore.signal() }
+        }
+
+        // Wait for all N devices to finish without blocking main.
         exportSequenceQueue.async { [weak self] in
             guard let self else { return }
-
-            for address in grouped.keys.sorted() {
-                guard !self.currentExportCanceled else { break }
-                guard let tasksForDot = grouped[address] else { continue }
-
-                guard let dot = DotManager.shared.dot(forUuid: address), dot.isConnected else {
-                    tasksForDot.forEach { self.setTaskStatus($0, .failed, error: "Sensor disconnected") }
-                    continue
-                }
-
-                self.exportFilesForDot(dot: dot, tasks: tasksForDot) { semaphore.signal() }
-                semaphore.wait()
-            }
-
+            for _ in 0..<deviceCount { semaphore.wait() }
             DispatchQueue.main.async {
                 guard self.exportSequenceGeneration == myGen else { return }
+                self.exportPendingSignals = 0
                 self.exportPhase = .done
+                self.sendCompletionNotification()
                 self.endExportBackgroundTask()
             }
         }
@@ -296,23 +301,28 @@ final class ExportManager: ObservableObject {
 
     /// Cancel the active export.
     func cancelExport() {
-        // Bump generation so the sequence block's completion handler is a no-op.
+        // Bump generation so sequence block completion handlers are no-ops.
         exportSequenceGeneration += 1
 
         sdkQueue.async {
-            self.exportFileGeneration += 1  // Stop any in-flight packet callbacks.
+            for address in Array(self.exportFileGenerations.keys) {
+                self.exportFileGenerations[address, default: 0] += 1
+            }
             self.currentExportCanceled = true
             self.isTransferring = false
         }
-        activeWatchdog?.stop()
-        activeWatchdog = nil
-        // Close the in-progress file handle (the watchdog won't fire to do it).
+
+        for watchdog in activeWatchdogs.values { watchdog.stop() }
+        activeWatchdogs.removeAll()
+
+        // Close all in-progress file handles (watchdogs won't fire to do it).
         fileQueue.async {
-            try? self.activeFileHandle?.close()
-            self.activeFileHandle = nil
+            for handle in self.activeFileHandles.values { try? handle.close() }
+            self.activeFileHandles.removeAll()
         }
-        activeExplorer?.stop()
-        activeExplorer = nil
+
+        for explorer in activeExplorers.values { explorer.stop() }
+        activeExplorers.removeAll()
 
         // Tell any actively-transferring devices to stop.
         let runningAddresses = Set(
@@ -333,13 +343,15 @@ final class ExportManager: ObservableObject {
             setTaskStatus(task, .canceled)
         }
 
-        // Unblock exportSequenceQueue — the SDK does NOT fire exportFileDone when
-        // stopExportFileData() is called mid-transfer, so the semaphore needs a manual signal.
-        currentExportSemaphore?.signal()
+        // Unblock all pending semaphore waits (one per device in parallel export).
+        let pending = exportPendingSignals
+        exportPendingSignals = 0
+        for _ in 0..<pending { currentExportSemaphore?.signal() }
         currentExportSemaphore = nil
 
         setOnMain {
             self.exportPhase = .done
+            self.sendCompletionNotification()
             self.endExportBackgroundTask()
         }
     }
@@ -429,6 +441,7 @@ final class ExportManager: ObservableObject {
 
             guard !grouped.isEmpty else {
                 self.exportPhase = .done
+                self.sendCompletionNotification()
                 self.endExportBackgroundTask()
                 return
             }
@@ -436,6 +449,7 @@ final class ExportManager: ObservableObject {
             self.exportSequenceGeneration += 1
             let myGen = self.exportSequenceGeneration
             let semaphore = DispatchSemaphore(value: 0)
+            self.exportPendingSignals = 1
             self.currentExportSemaphore = semaphore
 
             self.exportSequenceQueue.async { [weak self] in
@@ -456,6 +470,7 @@ final class ExportManager: ObservableObject {
                 DispatchQueue.main.async {
                     guard self.exportSequenceGeneration == myGen else { return }
                     self.exportPhase = .done
+                    self.sendCompletionNotification()
                     self.endExportBackgroundTask()
                 }
             }
@@ -496,6 +511,7 @@ final class ExportManager: ObservableObject {
                         task.outputURL = csv
                         task.error = nil
                         self.exportPhase = .done
+                        self.sendCompletionNotification()
                         self.endExportBackgroundTask()
                     } else {
                         // File is gone — run the full BLE pipeline.
@@ -506,6 +522,7 @@ final class ExportManager: ObservableObject {
                         self.exportSequenceGeneration += 1
                         let myGen = self.exportSequenceGeneration
                         let semaphore = DispatchSemaphore(value: 0)
+                        self.exportPendingSignals = 1
                         self.currentExportSemaphore = semaphore
 
                         self.exportSequenceQueue.async { [weak self] in
@@ -518,6 +535,7 @@ final class ExportManager: ObservableObject {
                                 DispatchQueue.main.async {
                                     guard self.exportSequenceGeneration == myGen else { return }
                                     self.exportPhase = .done
+                                    self.sendCompletionNotification()
                                     self.endExportBackgroundTask()
                                 }
                                 return
@@ -529,6 +547,7 @@ final class ExportManager: ObservableObject {
                             DispatchQueue.main.async {
                                 guard self.exportSequenceGeneration == myGen else { return }
                                 self.exportPhase = .done
+                                self.sendCompletionNotification()
                                 self.endExportBackgroundTask()
                             }
                         }
@@ -548,6 +567,7 @@ final class ExportManager: ObservableObject {
                 }
                 DispatchQueue.main.async {
                     self.exportPhase = .done
+                    self.sendCompletionNotification()
                     self.endExportBackgroundTask()
                 }
                 return
@@ -559,6 +579,7 @@ final class ExportManager: ObservableObject {
             exportSequenceGeneration += 1
             let myGen = exportSequenceGeneration
             let semaphore = DispatchSemaphore(value: 0)
+            exportPendingSignals = 1
             currentExportSemaphore = semaphore
 
             exportSequenceQueue.async { [weak self] in
@@ -571,6 +592,7 @@ final class ExportManager: ObservableObject {
                     DispatchQueue.main.async {
                         guard self.exportSequenceGeneration == myGen else { return }
                         self.exportPhase = .done
+                        self.sendCompletionNotification()
                         self.endExportBackgroundTask()
                     }
                     return
@@ -582,6 +604,7 @@ final class ExportManager: ObservableObject {
                 DispatchQueue.main.async {
                     guard self.exportSequenceGeneration == myGen else { return }
                     self.exportPhase = .done
+                    self.sendCompletionNotification()
                     self.endExportBackgroundTask()
                 }
             }
@@ -651,6 +674,21 @@ final class ExportManager: ObservableObject {
             self.cancelExport()
             self.endExportBackgroundTask()
         }
+    }
+
+    /// Fires a local notification summarising the export result.
+    /// Assumes notification authorization was already requested at app launch.
+    func sendCompletionNotification() {
+        let succeeded = tasks.filter { $0.status == .success }.count
+        let failed = tasks.filter { $0.status == .failed || $0.status == .canceled }.count
+        let content = UNMutableNotificationContent()
+        content.title = "Export Complete"
+        content.body = failed > 0
+            ? "\(succeeded) file\(succeeded == 1 ? "" : "s") succeeded, \(failed) failed"
+            : "\(succeeded) file\(succeeded == 1 ? "" : "s") exported successfully"
+        content.sound = .default
+        let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(request)
     }
 
     /// Re-enables the idle timer and ends the UIBackgroundTask. Safe to call multiple times.

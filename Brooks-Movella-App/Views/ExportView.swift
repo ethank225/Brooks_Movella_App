@@ -23,6 +23,13 @@ struct ExportView: View {
             }
             .refreshable { exportManager.fetchRecordings(for: connectedDots) }
             .onAppear {
+                // Re-open cart sheet if export was in progress/done when app was backgrounded.
+                if (exportManager.exportPhase == .exporting || exportManager.exportPhase == .done)
+                    && !exportManager.tasks.isEmpty
+                    && UserDefaults.standard.data(forKey: "activeExportContext") != nil {
+                    showCart = true
+                }
+
                 // Auto-refresh recordings whenever the Export tab becomes visible,
                 // but only when it's safe: sensors connected, not mid-export, not
                 // in the post-export done state (user may be about to share).
@@ -139,6 +146,19 @@ private struct CartBadgeButton: View {
 // MARK: - Cart View
 
 struct CartView: View {
+
+    private struct ExportContext: Codable {
+        let profileId: UUID
+        let dbSessionMap: [String: UUID]   // UUID keys as strings; [UUID:UUID] is not JSONEncoder-safe
+        let shoeBrand: String
+        let shoeModel: String
+        let shoeGeneration: String
+        let conditionTags: [String]
+        let study: String
+        let test: String
+        let product: String
+    }
+
     @ObservedObject private var exportManager   = ExportManager.shared
     @ObservedObject private var supabaseManager = SupabaseManager.shared
     @ObservedObject private var dotManager      = DotManager.shared
@@ -245,10 +265,20 @@ struct CartView: View {
                 await supabaseManager.fetchProfiles()
                 await supabaseManager.fetchWorkoutTemplates()
             }
+            .onAppear {
+                restoreExportContextIfNeeded()
+            }
+            .onChange(of: supabaseManager.profiles) { _ in
+                // Retry profile lookup if restore ran before fetchProfiles() completed.
+                if selectedProfile == nil {
+                    restoreExportContextIfNeeded()
+                }
+            }
             .onChange(of: exportManager.exportPhase) { phase in
-                if phase == .idle {
+                if phase == .idle || phase == .ready {
                     dbSessionMap = [:]
                     exportManager.onTaskCompleted = nil
+                    clearExportContext()
                 }
             }
         }
@@ -303,6 +333,48 @@ struct CartView: View {
         }
     }
 
+    // MARK: - Export Context Persistence
+
+    private func saveExportContext() {
+        guard let profile = selectedProfile else { return }
+        let ctx = ExportContext(
+            profileId: profile.id,
+            dbSessionMap: Dictionary(uniqueKeysWithValues: dbSessionMap.map { ($0.key.uuidString, $0.value) }),
+            shoeBrand: shoeBrand, shoeModel: shoeModel, shoeGeneration: shoeGeneration,
+            conditionTags: conditionTags, study: study, test: test, product: product
+        )
+        if let data = try? JSONEncoder().encode(ctx) {
+            UserDefaults.standard.set(data, forKey: "activeExportContext")
+        }
+    }
+
+    private func clearExportContext() {
+        UserDefaults.standard.removeObject(forKey: "activeExportContext")
+    }
+
+    private func restoreExportContextIfNeeded() {
+        guard (exportManager.exportPhase == .exporting || exportManager.exportPhase == .done),
+              !exportManager.tasks.isEmpty,
+              let data = UserDefaults.standard.data(forKey: "activeExportContext"),
+              let ctx = try? JSONDecoder().decode(ExportContext.self, from: data)
+        else { return }
+
+        dbSessionMap = Dictionary(uniqueKeysWithValues: ctx.dbSessionMap.compactMap {
+            guard let k = UUID(uuidString: $0.key) else { return nil }
+            return (k, $0.value)
+        })
+        shoeBrand = ctx.shoeBrand; shoeModel = ctx.shoeModel; shoeGeneration = ctx.shoeGeneration
+        conditionTags = ctx.conditionTags; study = ctx.study; test = ctx.test; product = ctx.product
+        selectedProfile = supabaseManager.profiles.first(where: { $0.id == ctx.profileId })
+
+        // Re-wire callback only if tasks are still in flight.
+        if exportManager.exportPhase == .exporting {
+            exportManager.onTaskCompleted = { [self] task in
+                Task { await uploadTask(task) }
+            }
+        }
+    }
+
     // MARK: - Upload Helpers
 
     private func currentTemplate() -> WorkoutTemplate {
@@ -339,6 +411,7 @@ struct CartView: View {
             return
         }
         dbSessionMap = map
+        saveExportContext()
 
         exportManager.onTaskCompleted = { [self] task in
             Task { await uploadTask(task) }
@@ -348,60 +421,78 @@ struct CartView: View {
     }
 
     /// Upload a single completed task to Supabase using the pre-created DB session.
-    private func uploadTask(_ task: ExportTask) async {
+    /// Retries up to `maxRetries` times with exponential backoff (1s, 2s, 4s, …).
+    private func uploadTask(_ task: ExportTask, maxRetries: Int = 3) async {
+        guard !task.hasPacketLoss else { return }
         guard let profile = selectedProfile,
               let url = task.outputURL,
               let dbSessionId = dbSessionMap[task.cartItem.sessionId] else { return }
         let template = currentTemplate()
         task.uploadStatus = .uploading
-        do {
-            try await SupabaseManager.shared.uploadWorkout(
-                csvURL: url,
-                userId: profile.id,
-                sessionId: dbSessionId,
-                template: template,
-                conditionType: conditionType,
-                sensorAddress: task.cartItem.recording.macAddress,
-                recordedAt: Date(timeIntervalSince1970: TimeInterval(task.cartItem.recording.timestamp))
-            )
-            task.uploadStatus = .uploaded
-        } catch {
-            task.uploadError = error.localizedDescription
-            task.uploadStatus = .failed
-        }
-    }
-
-    private func retryUpload(for task: ExportTask) {
-        guard let profile = selectedProfile, let url = task.outputURL else { return }
-        let template = currentTemplate()
-        let cartSessionId = task.cartItem.sessionId
-        task.uploadStatus = .uploading
-        task.uploadError = nil
-        Task {
+        for attempt in 0..<maxRetries {
             do {
-                // Reuse the existing DB session if still available; only create a new
-                // one if the map has been cleared (e.g. after "Clear & Start Over").
-                let sessionId: UUID
-                if let existing = dbSessionMap[cartSessionId] {
-                    sessionId = existing
-                } else {
-                    let recordedDate = Date(timeIntervalSince1970: TimeInterval(task.cartItem.recording.timestamp))
-                    sessionId = try await SupabaseManager.shared.createSession(
-                        userId: profile.id, template: template, recordedDate: recordedDate
-                    )
-                }
                 try await SupabaseManager.shared.uploadWorkout(
-                    csvURL: url, userId: profile.id,
-                    sessionId: sessionId,
+                    csvURL: url,
+                    userId: profile.id,
+                    sessionId: dbSessionId,
                     template: template,
                     conditionType: conditionType,
                     sensorAddress: task.cartItem.recording.macAddress,
                     recordedAt: Date(timeIntervalSince1970: TimeInterval(task.cartItem.recording.timestamp))
                 )
                 task.uploadStatus = .uploaded
+                return
             } catch {
-                task.uploadError = error.localizedDescription
-                task.uploadStatus = .failed
+                if attempt < maxRetries - 1 {
+                    let delay = UInt64(pow(2.0, Double(attempt))) * 1_000_000_000
+                    try? await Task.sleep(nanoseconds: delay)
+                } else {
+                    task.uploadError = error.localizedDescription
+                    task.uploadStatus = .failed
+                }
+            }
+        }
+    }
+
+    private func retryUpload(for task: ExportTask, maxRetries: Int = 3) {
+        guard let profile = selectedProfile, let url = task.outputURL else { return }
+        let template = currentTemplate()
+        let cartSessionId = task.cartItem.sessionId
+        task.uploadStatus = .uploading
+        task.uploadError = nil
+        Task {
+            for attempt in 0..<maxRetries {
+                do {
+                    // Reuse the existing DB session if still available; only create a new
+                    // one if the map has been cleared (e.g. after "Clear & Start Over").
+                    let sessionId: UUID
+                    if let existing = dbSessionMap[cartSessionId] {
+                        sessionId = existing
+                    } else {
+                        let recordedDate = Date(timeIntervalSince1970: TimeInterval(task.cartItem.recording.timestamp))
+                        sessionId = try await SupabaseManager.shared.createSession(
+                            userId: profile.id, template: template, recordedDate: recordedDate
+                        )
+                    }
+                    try await SupabaseManager.shared.uploadWorkout(
+                        csvURL: url, userId: profile.id,
+                        sessionId: sessionId,
+                        template: template,
+                        conditionType: conditionType,
+                        sensorAddress: task.cartItem.recording.macAddress,
+                        recordedAt: Date(timeIntervalSince1970: TimeInterval(task.cartItem.recording.timestamp))
+                    )
+                    task.uploadStatus = .uploaded
+                    return
+                } catch {
+                    if attempt < maxRetries - 1 {
+                        let delay = UInt64(pow(2.0, Double(attempt))) * 1_000_000_000
+                        try? await Task.sleep(nanoseconds: delay)
+                    } else {
+                        task.uploadError = error.localizedDescription
+                        task.uploadStatus = .failed
+                    }
+                }
             }
         }
     }

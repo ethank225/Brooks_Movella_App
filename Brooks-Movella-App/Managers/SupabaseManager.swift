@@ -106,7 +106,7 @@ final class SupabaseManager: ObservableObject {
         }
         do {
             let rows: [WorkoutTemplateRow] = try await client
-                .from("sessions")
+                .from("trials")
                 .select("shoe_brand,shoe_model,shoe_generation,study,test,product,condition_type")
                 .order("created_at", ascending: false)
                 .execute()
@@ -165,7 +165,7 @@ final class SupabaseManager: ObservableObject {
             recordedDate:   Self.dateFormatter.string(from: recordedDate)
         )
         let session: Session = try await client
-            .from("sessions")
+            .from("trials")
             .insert(payload)
             .select()
             .single()
