@@ -20,6 +20,7 @@ final class ExportManager: ObservableObject {
     static let shared = ExportManager()
 
     private init() {
+        restorePersistedTasks()
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(appWillResignActive),
@@ -69,6 +70,9 @@ final class ExportManager: ObservableObject {
 
     /// True while recording file metadata is being fetched from sensors.
     @Published private(set) var isFetching: Bool = false
+
+    /// True when tasks were rehydrated from disk on launch (not from a live export session).
+    @Published private(set) var hasRestoredTasks: Bool = false
 
     // MARK: - Export State
 
@@ -259,6 +263,19 @@ final class ExportManager: ObservableObject {
         currentExportCanceled = false
 
         let newTasks = cartItems.map { ExportTask(cartItem: $0) }
+        for task in newTasks {
+            task.$status
+                .filter { $0 == .success || $0 == .failed || $0 == .canceled }
+                .sink { [weak self] _ in self?.persistTasks() }
+                .store(in: &cancellables)
+            task.$uploadStatus
+                .filter { $0 == .uploaded || $0 == .failed }
+                .sink { [weak self] status in
+                    print("📡 uploadStatus changed to \(status) for task \(task.cartItem.label)")
+                    self?.persistTasks()
+                }
+                .store(in: &cancellables)
+        }
         setOnMain {
             self.tasks = newTasks
             self.exportPhase = .exporting
@@ -611,10 +628,26 @@ final class ExportManager: ObservableObject {
         }
     }
 
+    /// Used by ExportManager+Persistence.swift to restore task state on launch.
+    func applyRestoredTasks(_ restored: [ExportTask]) {
+        for task in restored where task.uploadStatus == .uploading {
+            task.uploadStatus = .pending
+        }
+        tasks            = restored
+        exportPhase      = .done
+        hasRestoredTasks = true
+    }
+
     /// Reset state so the user can start a new export.
     func resetExport() {
+        clearPersistedTasks()
         tasks.removeAll()
+        hasRestoredTasks = false
         exportPhase = recordings.isEmpty ? .idle : .ready
+    }
+
+    func dismissRestoredTasksBanner() {
+        hasRestoredTasks = false
     }
 
     // MARK: - Exported File URLs
@@ -643,7 +676,7 @@ final class ExportManager: ObservableObject {
         return "\(label)_\(last4)_f\(fileIndex)_\(idHash)"
     }
 
-    private func exportDir() -> URL? {
+    func exportDir() -> URL? {
         let fm = FileManager.default
         guard let docs = fm.urls(for: .documentDirectory, in: .userDomainMask).first else { return nil }
         let dir = docs.appendingPathComponent("Exports", isDirectory: true)

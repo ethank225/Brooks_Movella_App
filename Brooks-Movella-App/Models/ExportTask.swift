@@ -33,7 +33,7 @@ final class ExportTask: ObservableObject, Identifiable {
     }
 }
 
-nonisolated enum ExportStatus: Equatable, Sendable {
+nonisolated enum ExportStatus: Codable, Equatable, Sendable {
     case queued
     case running
     case success
@@ -41,7 +41,7 @@ nonisolated enum ExportStatus: Equatable, Sendable {
     case canceled
 }
 
-nonisolated enum UploadStatus: Equatable, Sendable {
+nonisolated enum UploadStatus: Codable, Equatable, Sendable {
     case pending
     case uploading
     case uploaded

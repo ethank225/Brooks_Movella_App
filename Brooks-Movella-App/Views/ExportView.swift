@@ -5,6 +5,7 @@ struct ExportView: View {
     @ObservedObject private var exportManager = ExportManager.shared
 
     @State private var showCart = false
+    @State private var showClearConfirmation = false
     #if DEBUG
     @State private var showMockTest = false
     #endif
@@ -16,12 +17,27 @@ struct ExportView: View {
         NavigationView {
             ScrollView {
                 VStack(spacing: 16) {
+                    if exportManager.hasRestoredTasks {
+                        RestoredTasksBanner(exportManager: exportManager) {
+                            showCart = true
+                        }
+                        .padding(.horizontal)
+                    }
                     recordingsContent
                     Spacer()
                 }
                 .padding(.top)
             }
             .refreshable { exportManager.fetchRecordings(for: connectedDots) }
+            .alert("Clear Previous Results?", isPresented: $showClearConfirmation) {
+                Button("Clear & Continue", role: .destructive) {
+                    exportManager.resetExport()
+                    exportManager.buildCart()
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("You have exported files from a previous session. Adding new files will clear those results.")
+            }
             .onAppear {
                 // Re-open cart sheet if export was in progress/done when app was backgrounded.
                 if (exportManager.exportPhase == .exporting || exportManager.exportPhase == .done)
@@ -113,7 +129,11 @@ struct ExportView: View {
                     label: "Add \(exportManager.selectedIDs.count) to Cart",
                     color: .purple
                 ) {
-                    exportManager.buildCart()
+                    if exportManager.hasRestoredTasks {
+                        showClearConfirmation = true
+                    } else {
+                        exportManager.buildCart()
+                    }
                 }
                 .padding(.horizontal)
             }
@@ -353,6 +373,7 @@ struct CartView: View {
     }
 
     private func restoreExportContextIfNeeded() {
+        guard !exportManager.hasRestoredTasks else { return }
         guard (exportManager.exportPhase == .exporting || exportManager.exportPhase == .done),
               !exportManager.tasks.isEmpty,
               let data = UserDefaults.standard.data(forKey: "activeExportContext"),
@@ -424,6 +445,7 @@ struct CartView: View {
     /// Retries up to `maxRetries` times with exponential backoff (1s, 2s, 4s, …).
     private func uploadTask(_ task: ExportTask, maxRetries: Int = 3) async {
         guard !task.hasPacketLoss else { return }
+        guard task.uploadStatus != .uploaded else { return }
         guard let profile = selectedProfile,
               let url = task.outputURL,
               let dbSessionId = dbSessionMap[task.cartItem.sessionId] else { return }
@@ -441,6 +463,7 @@ struct CartView: View {
                     recordedAt: Date(timeIntervalSince1970: TimeInterval(task.cartItem.recording.timestamp))
                 )
                 task.uploadStatus = .uploaded
+                exportManager.persistTasks()
                 return
             } catch {
                 if attempt < maxRetries - 1 {
@@ -449,6 +472,7 @@ struct CartView: View {
                 } else {
                     task.uploadError = error.localizedDescription
                     task.uploadStatus = .failed
+                    exportManager.persistTasks()
                 }
             }
         }
@@ -483,6 +507,7 @@ struct CartView: View {
                         recordedAt: Date(timeIntervalSince1970: TimeInterval(task.cartItem.recording.timestamp))
                     )
                     task.uploadStatus = .uploaded
+                    exportManager.persistTasks()
                     return
                 } catch {
                     if attempt < maxRetries - 1 {
@@ -491,6 +516,7 @@ struct CartView: View {
                     } else {
                         task.uploadError = error.localizedDescription
                         task.uploadStatus = .failed
+                        exportManager.persistTasks()
                     }
                 }
             }
