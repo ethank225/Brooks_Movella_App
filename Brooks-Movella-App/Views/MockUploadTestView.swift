@@ -101,7 +101,7 @@ struct MockUploadTestView: View {
             study:          "Mock Study",
             test:           "Mock Test",
             product:        "Mock Product",
-            conditionType:  "RUN"
+            conditionType:  "RUN",
         )
 
         for task in tasks {

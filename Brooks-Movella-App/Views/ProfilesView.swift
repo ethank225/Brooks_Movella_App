@@ -159,6 +159,9 @@ private struct ProfileRow: View {
         HStack {
             Text(profile.displayName)
                 .font(.body)
+//            Text(profile.shoeGender.capitalized)
+//                .font(.caption)
+//                .foregroundColor(.secondary)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.vertical, 4)
@@ -183,12 +186,14 @@ struct ProfileFormView: View {
     @State private var birthDate    = Calendar.current.date(byAdding: .year, value: -25, to: Date()) ?? Date()
     @State private var shoeSize     = 10.0
     @State private var shoeWidth    = "D"
+    @State private var shoeGender   = "mens"
 
     @State private var isSaving     = false
     @State private var saveError: String?
 
     private let genders     = ["Male", "Female", "Non-binary", "Prefer not to say"]
     private let shoeSizes   = stride(from: 4.0, through: 17.0, by: 0.5).map { $0 }
+    private let shoeGenders = ["mens", "womens"]
     private let shoeWidths  = ["B", "D", "2E", "4E"]
     private let shoeWidthLabels: [String: String] = [
         "B":  "Narrow (B)",
@@ -240,6 +245,10 @@ struct ProfileFormView: View {
 
                 // Shoe Info
                 Section("Shoe Info") {
+                    Picker("Gender", selection: $shoeGender) {
+                        ForEach(shoeGenders, id: \.self) { Text($0.capitalized) }
+                    }
+                    .pickerStyle(.segmented)
                     Picker("Size", selection: $shoeSize) {
                         ForEach(shoeSizes, id: \.self) { size in
                             let isWhole = size.truncatingRemainder(dividingBy: 1) == 0
@@ -294,6 +303,7 @@ struct ProfileFormView: View {
         weightLbs    = profile.weightLbs
         shoeSize     = profile.shoeSize
         shoeWidth    = profile.shoeWidth
+        shoeGender   = profile.shoeGender
 
         let fmt = DateFormatter()
         fmt.dateFormat = "yyyy-MM-dd"
@@ -311,7 +321,8 @@ struct ProfileFormView: View {
             weightLbs:    weightLbs,
             birthDate:    fmt.string(from: birthDate),
             shoeSize:     shoeSize,
-            shoeWidth:    shoeWidth
+            shoeWidth:    shoeWidth,
+            shoeGender:   shoeGender
         )
 
         isSaving  = true

@@ -12,6 +12,7 @@ struct Profile: Codable, Identifiable, Hashable {
     var birthDate: String   // "YYYY-MM-DD"
     var shoeSize: Double
     var shoeWidth: String
+    var shoeGender: String
 
     enum CodingKeys: String, CodingKey {
         case id           = "user_id"  // <-- add this
@@ -23,6 +24,7 @@ struct Profile: Codable, Identifiable, Hashable {
         case birthDate    = "birth_date"
         case shoeSize     = "shoe_size"
         case shoeWidth    = "shoe_width"
+        case shoeGender   = "shoe_gender"
     }
 
     var displayName: String { "\(firstName) \(lastName)" }
@@ -45,6 +47,7 @@ struct ProfilePayload: Codable {
     var birthDate: String   // "YYYY-MM-DD"
     var shoeSize: Double
     var shoeWidth: String
+    var shoeGender: String
 
     enum CodingKeys: String, CodingKey {
         case firstName    = "first_name"
@@ -55,5 +58,6 @@ struct ProfilePayload: Codable {
         case birthDate    = "birth_date"
         case shoeSize     = "shoe_size"
         case shoeWidth    = "shoe_width"
+        case shoeGender   = "shoe_gender"
     }
 }
