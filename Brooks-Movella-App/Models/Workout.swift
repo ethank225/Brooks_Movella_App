@@ -11,7 +11,7 @@ struct Workout: Codable, Identifiable {
 
     enum CodingKeys: String, CodingKey {
         case id            = "workout_id"
-        case sessionId     = "session_id"
+        case sessionId     = "trial_id"
         case blobAddress   = "blob_address"
         case sensorAddress = "sensor_address"
         case recordedTime  = "recorded_time"
@@ -27,7 +27,7 @@ struct WorkoutPayload: Codable {
     let recordedTime:  String
 
     enum CodingKeys: String, CodingKey {
-        case sessionId     = "session_id"
+        case sessionId     = "trial_id"
         case blobAddress   = "blob_address"
         case sensorAddress = "sensor_address"
         case recordedTime  = "recorded_time"
@@ -96,7 +96,7 @@ struct Session: Codable, Identifiable {
     let createdAt: Date
 
     enum CodingKeys: String, CodingKey {
-        case id             = "session_id"
+        case id             = "trial_id"
         case userId         = "user_id"
         case shoeBrand      = "shoe_brand"
         case shoeModel      = "shoe_model"

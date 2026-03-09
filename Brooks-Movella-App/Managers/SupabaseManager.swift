@@ -140,7 +140,7 @@ final class SupabaseManager: ObservableObject {
 
         try await client.storage
             .from("run-data")
-            .upload(storagePath, data: csvData, options: FileOptions(contentType: "text/csv"))
+            .upload(storagePath, data: csvData, options: FileOptions(contentType: "text/csv", upsert: true))
 
         let payload = WorkoutPayload(
             sessionId:     sessionId,

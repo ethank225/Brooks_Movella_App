@@ -29,8 +29,16 @@ final class DotOperationRunner {
 
     /// Refreshes flash storage info for each dot, waiting for initialization first.
     /// `onDotComplete` fires after each dot finishes (success or skip).
+    ///
+    /// `settleDelay` is an extra pause inserted after `isInitialized()` becomes
+    /// true but before `getFlashInfo` is called. Pass a non-zero value when
+    /// reconnecting after a Bluetooth power-off/reset — `bindDevice` causes
+    /// `isInitialized()` to return `true` before the SDK finishes its internal
+    /// BLE re-initialisation handshake, so the flash callback never fires without
+    /// this settle period.
     func refreshStorage(
         dots: [Dot],
+        settleDelay: TimeInterval = 0,
         onDotComplete: @escaping (Dot, Bool) -> Void,
         completion: @escaping () -> Void
     ) {
@@ -40,7 +48,7 @@ final class DotOperationRunner {
 
         sdkQueue.async { [self] in
             executeSequentially(items: dots) { dot, done in
-                waitForInitialization(dot: dot, timeout: 5.0) { ready in
+                waitForInitialization(dot: dot, timeout: 5.0, settleDelay: settleDelay) { ready in
                     if !ready {
                         print("⚠️ [\(dot.address)] Not initialized, skipping storage refresh")
                         onDotComplete(dot, false)
@@ -48,9 +56,9 @@ final class DotOperationRunner {
                         return
                     }
 
-                    dot.getFlashInfo { _ in
-                        onDotComplete(dot, true)
-                        done(true)
+                    dot.getFlashInfo { flashSuccess in
+                        onDotComplete(dot, flashSuccess)
+                        done(flashSuccess)
                     }
                 }
             } completion: { _ in
@@ -87,12 +95,25 @@ final class DotOperationRunner {
     }
 
     /// Polls `dot.isInitialized` using asyncAfter to yield sdkQueue between checks.
-    private func waitForInitialization(dot: Dot, timeout: TimeInterval, completion: @escaping (Bool) -> Void) {
+    ///
+    /// After `isInitialized()` returns `true`, waits an additional `settleDelay`
+    /// seconds on `sdkQueue` before signalling completion. This prevents
+    /// `getFlashInfo` from being dispatched while the SDK is still mid-BLE-handshake
+    /// after a Bluetooth power-off/reset reconnect (where `bindDevice` prematurely
+    /// sets `isInitialized() = true` before characteristic reads finish).
+    private func waitForInitialization(dot: Dot, timeout: TimeInterval, settleDelay: TimeInterval = 0, completion: @escaping (Bool) -> Void) {
         let start = Date()
 
         func check() {
             if dot.isInitialized {
-                completion(true)
+                if settleDelay > 0 {
+                    print("⏳ [\(dot.address)] isInitialized=true — settling \(settleDelay)s before flash query")
+                    sdkQueue.asyncAfter(deadline: .now() + settleDelay) {
+                        completion(true)
+                    }
+                } else {
+                    completion(true)
+                }
                 return
             }
             if Date().timeIntervalSince(start) > timeout {

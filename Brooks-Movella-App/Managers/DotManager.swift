@@ -134,6 +134,7 @@ final class DotManager: NSObject, ObservableObject {
     func activate() {
         DotConnectionManager.setConnectionDelegate(self)
         DotReconnectManager.setEnable(true)
+        restoreRecoveryState()
     }
 
     // MARK: - Published State (UI-facing)
@@ -318,7 +319,9 @@ final class DotManager: NSObject, ObservableObject {
                 guard let self else { return }
                 self.stateQueue.async {
                     if success {
+                        self.registry.activeRecordingUuids.removeAll()
                         self.setPhase(.idle)
+                        self.clearRecoveryState()
                     } else {
                         self.setPhase(.error("Failed to stop recording. Please try again."))
                     }
@@ -431,6 +434,7 @@ final class DotManager: NSObject, ObservableObject {
         setPhase(.startingRecording)
         print("🎙️ performStartRecording(): \(dots.map { $0.address })")
 
+        let recordingUuids = Set(dots.map { $0.address })
         operations.runAll(
             dots: dots,
             operation: { dot, done in dot.startRecording(seconds: 0xFFFF, completion: done) }
@@ -438,7 +442,9 @@ final class DotManager: NSObject, ObservableObject {
             guard let self else { return }
             self.stateQueue.async {
                 if success {
+                    self.registry.activeRecordingUuids = recordingUuids
                     self.setPhase(.recording)
+                    self.syncRecoveryPersistence()
                 } else {
                     self.setPhase(.error("Recording failed to start. Please try again."))
                 }
@@ -478,23 +484,28 @@ final class DotManager: NSObject, ObservableObject {
     }
 
     /// Fetch flash usage for each dot after sync or connection. Must be called on `stateQueue`.
-    private func refreshStorage(dots: [Dot]) {
-        operations.refreshStorage(dots: dots) { [weak self] dot, _ in
+    private func refreshStorage(dots: [Dot], settleDelay: TimeInterval = 0) {
+        operations.refreshStorage(dots: dots, settleDelay: settleDelay) { [weak self] dot, success in
             self?.stateQueue.async {
                 guard let self else { return }
                 let uuid = dot.device.uuid
                 self.registry.initializationInProgress.remove(uuid)
+
+                guard success else {
+                    print("⚠️ [\(uuid)] Init failed — not marking .ready")
+                    self.registry.setConnectionPhase(uuid, .failed("Initialization timed out"))
+                    self.notify()
+                    return
+                }
+
                 self.registry.setConnectionPhase(uuid, .ready)
                 print("✅ [\(uuid)] phase now .ready")
+
+                // Re-query actual recording state after reconnect.
+                // SDK does not push this automatically, so isRecording stays stale otherwise.
+                dot.refreshRecordingStatus()
+
                 self.notify()
-                
-                // After a BT power cycle, restore the recording session once
-                // at least one device is back and ready.
-                if self.registry.wasRecordingBeforeDisconnect {
-                    self.registry.wasRecordingBeforeDisconnect = false
-                    print("🔄 Restoring recording session after BT reconnect")
-                    self.setPhase(.recording)
-                }
             }
         } completion: {}
     }
@@ -631,11 +642,31 @@ extension DotManager: DotConnectionDelegate {
                 }
 
                 if let dot = self.registry.dot(forUuid: device.uuid) {
-                    self.refreshStorage(dots: [dot])
+                    if self.registry.uuidsRecordingOnDisconnect.contains(device.uuid) {
+                        // Device is still recording — getFlashInfo won't respond.
+                        // Mark ready immediately; sessionPhase stays .recording.
+                        print("⏳ [\(device.uuid)] Was recording before disconnect — skipping flash query (auto-reconnect)")
+                        self.registry.uuidsRecordingOnDisconnect.remove(device.uuid)
+                        self.registry.setConnectionPhase(device.uuid, .ready)
+                        print("✅ [\(device.uuid)] phase now .ready (recording device, flash skipped)")
+                        dot.refreshRecordingStatus()
+                        self.syncRecoveryPersistence()
+                    } else {
+                        self.refreshStorage(dots: [dot])
+                    }
                 }
                 self.notify()
                 return
             }
+
+            // Detect a BT-reset reconnect: the Dot model already exists (device
+            // previously connected) but went through the normal connect queue
+            // because onManagerStateUpdate(.poweredOn) re-queued the UUID.
+            // In this case bindDevice() causes isInitialized() to return true
+            // before the SDK finishes its internal BLE handshake, so we need a
+            // settle delay before calling getFlashInfo.
+            let isReconnect = self.registry.byUuid[device.uuid]?.dot != nil
+            let settleDelay: TimeInterval = isReconnect ? 2.0 : 0
 
             // recordConnection sets phase to .initializing
             self.registry.recordConnection(device)
@@ -646,10 +677,37 @@ extension DotManager: DotConnectionDelegate {
             }
 
             if let dot = self.registry.dot(forUuid: device.uuid) {
-                print("⏳ [\(device.uuid)] Queuing initialization & storage refresh...")
-
-                // refreshStorage will set phase to .ready on completion
-                self.refreshStorage(dots: [dot])
+                if self.registry.uuidsRecordingOnDisconnect.contains(device.uuid) {
+                    // Per-device disconnect path — device is still recording.
+                    // sessionPhase remains .recording (was never cleared), so no restore needed.
+                    print("⏳ [\(device.uuid)] Was recording before disconnect — skipping flash query")
+                    self.registry.uuidsRecordingOnDisconnect.remove(device.uuid)
+                    self.registry.initializationInProgress.remove(device.uuid)
+                    self.registry.setConnectionPhase(device.uuid, .ready)
+                    print("✅ [\(device.uuid)] phase now .ready (recording device, flash skipped)")
+                    dot.refreshRecordingStatus()
+                    self.syncRecoveryPersistence()
+                } else if self.registry.activeRecordingUuids.contains(device.uuid) {
+                    // Recording session reconnect — BT reset or app relaunch while recording.
+                    // Device is still recording; getFlashInfo won't respond. Skip it.
+                    // Every dot in the session uses this path independently, so no
+                    // flag is consumed here — activeRecordingUuids stays intact until endSession.
+                    print("⏳ [\(device.uuid)] Part of active recording session — skipping flash query")
+                    self.registry.initializationInProgress.remove(device.uuid)
+                    self.registry.setConnectionPhase(device.uuid, .ready)
+                    print("✅ [\(device.uuid)] phase now .ready (recording device, flash skipped)")
+                    dot.refreshRecordingStatus()
+                    print("🔄 Restoring recording session phase after reconnect")
+                    self.setPhase(.recording)
+                } else {
+                    if isReconnect {
+                        print("⏳ [\(device.uuid)] Reconnect — will settle \(settleDelay)s after isInitialized")
+                    } else {
+                        print("⏳ [\(device.uuid)] Queuing initialization & storage refresh...")
+                    }
+                    // refreshStorage will set phase to .ready on completion
+                    self.refreshStorage(dots: [dot], settleDelay: settleDelay)
+                }
 
                 self.registry.advanceConnectQueue()
                 self.processConnectQueue()
@@ -680,6 +738,18 @@ extension DotManager: DotConnectionDelegate {
                 // The dots remain visually "connected" throughout the sync process.
                 return
             }
+
+            // Capture per-device recording state before clearing it.
+            // This is the per-device path; the BT-manager-reset path uses
+            // wasRecordingBeforeDisconnect set in onManagerStateUpdate instead.
+            if self.sessionPhase == .recording,
+               let dot = self.registry.dot(forUuid: device.uuid),
+               dot.isRecording {
+                self.registry.uuidsRecordingOnDisconnect.insert(device.uuid)
+                print("📝 [\(device.uuid)] Was recording on disconnect — flagged for recording-aware reconnect")
+                self.syncRecoveryPersistence()
+            }
+
             self.registry.recordDisconnection(device.uuid)
             self.notify()
         }
@@ -701,16 +771,25 @@ extension DotManager: DotConnectionDelegate {
                 if !self.registry.connectQueue.isEmpty {
                     print("🔄 Resuming connection logic for \(self.registry.connectQueue.count) pending devices...")
                     self.registry.isScanningInternal = false
+                    // Start timers for every queued UUID so a silent connect failure
+                    // doesn't leave connectInProgress stuck forever.
+                    for uuid in self.registry.connectQueue {
+                        self.startConnectTimer(uuid)
+                    }
+                    // Use the persisted DotDevice from byUuid immediately — no need
+                    // to wait for onDiscover. startScan runs in parallel as a fallback
+                    // in case the stored reference is stale.
+                    self.processConnectQueue()
                     self.startScan()
                 }
 
             case .poweredOff, .resetting:
                 print("⚠️ Bluetooth powered OFF/RESET")
-                self.registry.wasRecordingBeforeDisconnect = (self.sessionPhase == .recording)
                 self.cancelAllConnectTimers()
-                self.registry.clearBusyFlags()
+                self.registry.clearBusyFlags()   // clears uuidsRecordingOnDisconnect; activeRecordingUuids survives
                 self.registry.markAllDisconnected()
                 self.setPhase(.error("Bluetooth disconnected."))
+                self.syncRecoveryPersistence()   // persists activeRecordingUuids so every dot can recover
 
             case .unauthorized, .unsupported:
                 print("❌ Bluetooth Error: \(managerState.rawValue)")
@@ -718,6 +797,83 @@ extension DotManager: DotConnectionDelegate {
             @unknown default:
                 break
             }
+        }
+    }
+}
+
+// MARK: - Persistence
+
+/// Minimal persistence for reconnect recovery state.
+///
+/// Two values survive app kills:
+///   - `activeRecordingUuids`       — all dots in the current recording session.
+///                                    Used by every reconnecting dot (BT reset or relaunch).
+///   - `uuidsRecordingOnDisconnect` — dots that individually disconnected mid-session.
+///                                    Used by per-device disconnect reconnect path.
+///
+/// The file is written atomically after every mutation and deleted when the session
+/// ends normally or both sets are empty.
+extension DotManager {
+
+    private struct SessionRecoveryState: Codable {
+        var activeRecordingUuids: [String]
+        var uuidsRecordingOnDisconnect: [String]
+    }
+
+    private var recoveryStateURL: URL? {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first?
+            .appendingPathComponent("session_recovery.json")
+    }
+
+    /// Snapshot both sets and write (or delete) the JSON file.
+    /// Must be called on `stateQueue` — reads registry directly without locking.
+    func syncRecoveryPersistence() {
+        let active = registry.activeRecordingUuids
+        let onDisconnect = registry.uuidsRecordingOnDisconnect
+        guard let url = recoveryStateURL else { return }
+
+        guard !active.isEmpty || !onDisconnect.isEmpty else {
+            // Nothing to recover — remove any stale file.
+            DispatchQueue.global(qos: .utility).async {
+                try? FileManager.default.removeItem(at: url)
+            }
+            return
+        }
+
+        let state = SessionRecoveryState(
+            activeRecordingUuids: Array(active),
+            uuidsRecordingOnDisconnect: Array(onDisconnect)
+        )
+        guard let data = try? JSONEncoder().encode(state) else { return }
+        DispatchQueue.global(qos: .utility).async {
+            try? data.write(to: url, options: .atomic)
+        }
+    }
+
+    /// Read the persisted file and apply recovery state to the registry.
+    /// Called once from `activate()` before any connections are made.
+    func restoreRecoveryState() {
+        guard let url = recoveryStateURL,
+              let data = try? Data(contentsOf: url),
+              let state = try? JSONDecoder().decode(SessionRecoveryState.self, from: data)
+        else { return }
+
+        stateQueue.async {
+            if !state.activeRecordingUuids.isEmpty {
+                self.registry.activeRecordingUuids.formUnion(state.activeRecordingUuids)
+            }
+            if !state.uuidsRecordingOnDisconnect.isEmpty {
+                self.registry.uuidsRecordingOnDisconnect.formUnion(state.uuidsRecordingOnDisconnect)
+            }
+            print("🔄 Restored recovery state: active=\(state.activeRecordingUuids) onDisconnect=\(state.uuidsRecordingOnDisconnect)")
+        }
+    }
+
+    /// Delete the persisted recovery file. Called when recording ends normally.
+    func clearRecoveryState() {
+        guard let url = recoveryStateURL else { return }
+        DispatchQueue.global(qos: .utility).async {
+            try? FileManager.default.removeItem(at: url)
         }
     }
 }
