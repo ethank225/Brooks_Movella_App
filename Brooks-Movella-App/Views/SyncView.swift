@@ -6,145 +6,166 @@ struct SyncView: View {
     @State private var isErasing = false
     @State private var showEraseConfirmation = false
     @State private var eraseResult: String = ""
+    @State private var researcherMode = false
+    @StateObject private var researcherState = ResearcherSessionState()
 
     private var phase: SessionPhase { manager.sessionPhase }
 
     var body: some View {
         NavigationView {
-        ScrollView {
-            VStack(spacing: 16) {
+            Group {
+                if researcherMode {
+                    ResearcherModeRecordView(state: researcherState)
+                } else {
+                    ScrollView {
+                        VStack(spacing: 16) {
 
-                // MARK: - Sensor Status
+                            // MARK: - Sensor Status
 
-                SectionCard(title: "Sensor Status", icon: "sensor.tag.radiowaves.forward") {
-                    if manager.connectedDots.isEmpty {
-                        VStack(spacing: 8) {
-                            Image(systemName: "sensor.tag.radiowaves.forward")
-                                .font(.largeTitle)
-                                .foregroundColor(.secondary)
-                            Text("No sensors connected")
-                                .font(.headline)
-                                .foregroundColor(.secondary)
-                            Text("Go to the Connect tab to pair your DOTs")
-                                .font(.subheadline)
-                                .foregroundColor(.secondary)
-                        }
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 20)
-                    } else {
-                        ForEach(manager.connectedDots, id: \.address) { dot in
-                            DotStatusRow(dot: dot, sessionPhase: phase)
-                        }
-                    }
-                }
+                            SectionCard(title: "Sensor Status", icon: "sensor.tag.radiowaves.forward") {
+                                if manager.connectedDots.isEmpty {
+                                    VStack(spacing: 8) {
+                                        Image(systemName: "sensor.tag.radiowaves.forward")
+                                            .font(.largeTitle)
+                                            .foregroundColor(.secondary)
+                                        Text("No sensors connected")
+                                            .font(.headline)
+                                            .foregroundColor(.secondary)
+                                        Text("Go to the Connect tab to pair your DOTs")
+                                            .font(.subheadline)
+                                            .foregroundColor(.secondary)
+                                    }
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.vertical, 20)
+                                } else {
+                                    ForEach(manager.connectedDots, id: \.address) { dot in
+                                        DotStatusRow(dot: dot, sessionPhase: phase)
+                                    }
+                                }
+                            }
 
-                // MARK: - Session (Record)
+                            // MARK: - Session (Record)
 
-                SectionCard(title: "Session", icon: "record.circle") {
+                            SectionCard(title: "Session", icon: "record.circle") {
 
-                    // Error banner
-                    if case .error(let msg) = phase {
-                        HStack {
-                            Image(systemName: "exclamationmark.triangle.fill")
-                                .foregroundColor(.orange)
-                            Text(msg)
-                                .font(.subheadline)
-                                .foregroundColor(.orange)
+                                // Error banner
+                                if case .error(let msg) = phase {
+                                    HStack {
+                                        Image(systemName: "exclamationmark.triangle.fill")
+                                            .foregroundColor(.orange)
+                                        Text(msg)
+                                            .font(.subheadline)
+                                            .foregroundColor(.orange)
+                                        Spacer()
+                                        Button { manager.dismissError() } label: {
+                                            Image(systemName: "xmark.circle.fill")
+                                                .foregroundColor(.secondary)
+                                        }
+                                    }
+                                    .padding()
+                                    .background(Color.orange.opacity(0.1))
+                                    .cornerRadius(8)
+                                }
+
+                                // Status text
+                                if let statusText = phaseStatusText {
+                                    HStack(spacing: 8) {
+                                        if phase.isBusy {
+                                            ProgressView()
+                                                .progressViewStyle(CircularProgressViewStyle(tint: phaseColor))
+                                                .scaleEffect(0.8)
+                                        }
+                                        Text(statusText)
+                                            .font(.subheadline)
+                                            .foregroundColor(phaseColor)
+                                    }
+                                    .padding(.bottom, 4)
+                                }
+
+                                // Primary button
+                                Button {
+                                    handlePrimaryAction()
+                                } label: {
+                                    HStack {
+                                        if phase.isBusy {
+                                            ProgressView()
+                                                .progressViewStyle(CircularProgressViewStyle(tint: .white))
+                                        } else {
+                                            Image(systemName: primaryButtonIcon)
+                                        }
+                                        Text(primaryButtonTitle)
+                                    }
+                                    .frame(maxWidth: .infinity)
+                                    .padding()
+                                    .background(primaryButtonColor)
+                                    .foregroundColor(.white)
+                                    .cornerRadius(10)
+                                }
+                                .disabled(primaryButtonDisabled)
+                            }
+
+                            // MARK: - Storage Management
+
+                            SectionCard(title: "Storage", icon: "internaldrive") {
+                                Button {
+                                    showEraseConfirmation = true
+                                } label: {
+                                    HStack {
+                                        if isErasing {
+                                            ProgressView()
+                                                .progressViewStyle(CircularProgressViewStyle(tint: .white))
+                                        }
+                                        Image(systemName: "trash")
+                                        Text(isErasing ? "Erasing..." : "Erase All Flash")
+                                    }
+                                    .frame(maxWidth: .infinity)
+                                    .padding()
+                                    .background(isErasing ? Color.gray : Color.purple)
+                                    .foregroundColor(.white)
+                                    .cornerRadius(10)
+                                }
+                                .disabled(isErasing || manager.connectedDots.isEmpty || phase != .idle)
+
+                                if !eraseResult.isEmpty {
+                                    Text(eraseResult)
+                                        .font(.subheadline)
+                                        .foregroundColor(.secondary)
+                                        .padding(.top, 4)
+                                }
+                            }
+
                             Spacer()
-                            Button { manager.dismissError() } label: {
-                                Image(systemName: "xmark.circle.fill")
-                                    .foregroundColor(.secondary)
-                            }
                         }
-                        .padding()
-                        .background(Color.orange.opacity(0.1))
-                        .cornerRadius(8)
+                        .padding(.top)
                     }
-
-                    // Status text
-                    if let statusText = phaseStatusText {
-                        HStack(spacing: 8) {
-                            if phase.isBusy {
-                                ProgressView()
-                                    .progressViewStyle(CircularProgressViewStyle(tint: phaseColor))
-                                    .scaleEffect(0.8)
-                            }
-                            Text(statusText)
-                                .font(.subheadline)
-                                .foregroundColor(phaseColor)
-                        }
-                        .padding(.bottom, 4)
-                    }
-
-                    // Primary button
-                    Button {
-                        handlePrimaryAction()
-                    } label: {
-                        HStack {
-                            if phase.isBusy {
-                                ProgressView()
-                                    .progressViewStyle(CircularProgressViewStyle(tint: .white))
-                            } else {
-                                Image(systemName: primaryButtonIcon)
-                            }
-                            Text(primaryButtonTitle)
-                        }
-                        .frame(maxWidth: .infinity)
-                        .padding()
-                        .background(primaryButtonColor)
-                        .foregroundColor(.white)
-                        .cornerRadius(10)
-                    }
-                    .disabled(primaryButtonDisabled)
                 }
-
-                // MARK: - Storage Management
-
-                SectionCard(title: "Storage", icon: "internaldrive") {
-                    Button {
-                        showEraseConfirmation = true
-                    } label: {
-                        HStack {
-                            if isErasing {
-                                ProgressView()
-                                    .progressViewStyle(CircularProgressViewStyle(tint: .white))
-                            }
-                            Image(systemName: "trash")
-                            Text(isErasing ? "Erasing..." : "Erase All Flash")
-                        }
-                        .frame(maxWidth: .infinity)
-                        .padding()
-                        .background(isErasing ? Color.gray : Color.purple)
-                        .foregroundColor(.white)
-                        .cornerRadius(10)
-                    }
-                    .disabled(isErasing || manager.connectedDots.isEmpty || phase != .idle)
-
-                    if !eraseResult.isEmpty {
-                        Text(eraseResult)
+            }
+            .navigationTitle("Record")
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    HStack(spacing: 10) {
+                        LiveBadge(count: researcherState.liveCount)
+                        Toggle("Researcher", isOn: $researcherMode)
+                            .toggleStyle(.switch)
+                            .labelsHidden()
+                        Text("Researcher")
                             .font(.subheadline)
                             .foregroundColor(.secondary)
-                            .padding(.top, 4)
                     }
                 }
-
-                Spacer()
             }
-            .padding(.top)
-        }
-        .navigationTitle("Record")
-        .onAppear {
-            // Recover session state after app relaunch if dots are still recording
-            if manager.sessionPhase == .idle && manager.connectedDots.contains(where: { $0.isRecording }) {
-                manager.resumeRecordingSession()
+            .onAppear {
+                // Recover session state after app relaunch if dots are still recording
+                if manager.sessionPhase == .idle && manager.connectedDots.contains(where: { $0.isRecording }) {
+                    manager.resumeRecordingSession()
+                }
             }
-        }
-        .confirmationDialog("Erase all flash storage?", isPresented: $showEraseConfirmation, titleVisibility: .visible) {
-            Button("Erase All", role: .destructive) { eraseFlash() }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text("This will permanently delete all recorded data on every connected sensor.")
-        }
+            .confirmationDialog("Erase all flash storage?", isPresented: $showEraseConfirmation, titleVisibility: .visible) {
+                Button("Erase All", role: .destructive) { eraseFlash() }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("This will permanently delete all recorded data on every connected sensor.")
+            }
         }
     }
 
