@@ -1,0 +1,6 @@
+framework module MovellaDotSdk {
+  umbrella header "MovellaDotSdk.h"
+
+  export *
+  module * { export * }
+}
