@@ -10,6 +10,7 @@ struct ConnectionView: View {
 
     @State private var identifyingUuid: String?
     @State private var showModeToggleAlert = false
+    @State private var modeToggleAlertMessage = ""
     @State private var editingUuid: String?
     @State private var editText: String = ""
 
@@ -138,10 +139,23 @@ struct ConnectionView: View {
             .toolbar {
                 ToolbarItem(placement: .navigationBarLeading) {
                     Button {
-                        if manager.connectedDots.isEmpty {
-                            runnerStore.isMultiRunnerMode.toggle()
+                        if !runnerStore.isMultiRunnerMode {
+                            // single → multi: always allowed
+                            if runnerStore.runners.contains(where: { $0.id == DotManager.singleRunnerID }) {
+                                let newId = UUID().uuidString
+                                manager.promoteSingleRunner(to: newId, label: "Runner A")
+                            }
+                            runnerStore.isMultiRunnerMode = true
                         } else {
-                            showModeToggleAlert = true
+                            // multi → single: blocked if real runners exist or any phase is active
+                            let hasRealRunners = runnerStore.runners.contains { $0.id != DotManager.singleRunnerID }
+                            let hasActivePhase = manager.runnerPhases.contains { $0.key != DotManager.singleRunnerID && $0.value != .idle }
+                            if hasRealRunners || hasActivePhase {
+                                modeToggleAlertMessage = "Remove all runners before switching to single runner mode."
+                                showModeToggleAlert = true
+                            } else {
+                                runnerStore.isMultiRunnerMode = false
+                            }
                         }
                     } label: {
                         HStack(spacing: 4) {
@@ -167,7 +181,7 @@ struct ConnectionView: View {
             .alert("Cannot Switch Modes", isPresented: $showModeToggleAlert) {
                 Button("OK", role: .cancel) {}
             } message: {
-                Text("Disconnect all sensors before switching between single and multi-runner modes.")
+                Text(modeToggleAlertMessage)
             }
             .refreshable { manager.startScan() }
             .onAppear {

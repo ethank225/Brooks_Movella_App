@@ -7,7 +7,6 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		AA316F222F46863000AF15AB /* Secrets.xconfig in Resources */ = {isa = PBXBuildFile; fileRef = AA316F212F46862300AF15AB /* Secrets.xconfig */; };
 		AA316F2D2F468BE200AF15AB /* Supabase in Frameworks */ = {isa = PBXBuildFile; productRef = AA316F2C2F468BE200AF15AB /* Supabase */; };
 /* End PBXBuildFile section */
 
@@ -25,7 +24,6 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
-		AA316F212F46862300AF15AB /* Secrets.xconfig */ = {isa = PBXFileReference; lastKnownFileType = text; path = Secrets.xconfig; sourceTree = "<group>"; };
 		AA4A46D42F2D48F800CA4F7C /* Brooks-Movella-App.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Brooks-Movella-App.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
@@ -79,7 +77,6 @@
 		AA4A46CB2F2D48F800CA4F7C = {
 			isa = PBXGroup;
 			children = (
-				AA316F212F46862300AF15AB /* Secrets.xconfig */,
 				AA4A46D62F2D48F800CA4F7C /* Brooks-Movella-App */,
 				AA4A47302F3054C600CA4F7C /* Frameworks */,
 				AA4A46D52F2D48F800CA4F7C /* Products */,
@@ -170,7 +167,6 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				AA316F222F46863000AF15AB /* Secrets.xconfig in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -314,8 +310,8 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = PGW4TTC8R2;
+				CURRENT_PROJECT_VERSION = 2;
+				DEVELOPMENT_TEAM = ZMY2AZH7FS;
 				ENABLE_PREVIEWS = YES;
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(inherited)",
@@ -337,7 +333,7 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 2.0;
-				PRODUCT_BUNDLE_IDENTIFIER = "com.ethank225.Brooks-Movella-App-v2";
+				PRODUCT_BUNDLE_IDENTIFIER = "com.brookssports.movellaapp-";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
@@ -355,8 +351,8 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = PGW4TTC8R2;
+				CURRENT_PROJECT_VERSION = 2;
+				DEVELOPMENT_TEAM = ZMY2AZH7FS;
 				ENABLE_PREVIEWS = YES;
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(inherited)",
@@ -378,7 +374,7 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 2.0;
-				PRODUCT_BUNDLE_IDENTIFIER = "com.ethank225.Brooks-Movella-App-v2";
+				PRODUCT_BUNDLE_IDENTIFIER = "com.brookssports.movellaapp-";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;

@@ -453,6 +453,28 @@ final class DotManager: NSObject, ObservableObject {
         dismissError(runnerId: Self.singleRunnerID)
     }
 
+    /// Promotes the `__single__` runner to a real runner with a new UUID.
+    /// Transfers any active session phase to the new runner ID.
+    /// Must be called on the **main thread** (mutates RunnerStore).
+    func promoteSingleRunner(to newId: String, label: String) {
+        let store = RunnerStore.shared
+        guard let single = store.runner(forId: Self.singleRunnerID) else { return }
+
+        // Replace __single__ with the real runner in the store.
+        store.setRunner(Runner(id: newId, label: label, sensorUuids: single.sensorUuids))
+        store.removeRunner(id: Self.singleRunnerID)
+
+        // Transfer session phase on stateQueue.
+        stateQueue.async {
+            if let phase = self.runnerPhasesInternal.removeValue(forKey: Self.singleRunnerID) {
+                self.runnerPhasesInternal[newId] = phase
+            }
+            let snapshot = self.runnerPhasesInternal
+            DispatchQueue.main.async { self.runnerPhases = snapshot }
+            self.notify()
+        }
+    }
+
     // MARK: - Session Helpers
 
     /// Single writer for per-runner session phase. Must be called on `stateQueue`.
@@ -466,6 +488,13 @@ final class DotManager: NSObject, ObservableObject {
         if !phase.isSyncActive {
             let sensorUuids = Set(RunnerStore.shared.runner(forId: runnerId)?.sensorUuids ?? [])
             registry.syncingUuids.subtract(sensorUuids)
+        }
+        // Clear stale export cart when a new recording begins.
+        if phase == .recording {
+            DispatchQueue.main.async {
+                ExportManager.shared.clearCart()
+                ExportManager.shared.resetExport()
+            }
         }
         let snapshot = runnerPhasesInternal
         DispatchQueue.main.async {
@@ -852,6 +881,20 @@ extension DotManager: DotConnectionDelegate {
             }
 
             self.registry.recordDisconnection(device.uuid)
+
+            // If this sensor belonged to a recording runner and no sensors
+            // in that runner are still connected, move the runner to error.
+            for (runnerId, phase) in self.runnerPhasesInternal where phase == .recording || phase == .syncing || phase == .startingRecording {
+                guard let runner = RunnerStore.shared.runner(forId: runnerId) else { continue }
+                guard runner.sensorUuids.contains(device.uuid) else { continue }
+                let hasConnected = runner.sensorUuids.contains { uuid in
+                    self.registry.byUuid[uuid]?.connectionPhase.isConnected == true
+                }
+                if !hasConnected {
+                    self.setPhase(.error("All sensors disconnected."), forRunner: runnerId)
+                }
+            }
+
             self.notify()
         }
     }

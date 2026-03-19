@@ -28,6 +28,13 @@ final class SupabaseManager: ObservableObject {
         return f
     }()
 
+    private static let utcFormatter: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        f.timeZone = TimeZone(identifier: "UTC")
+        return f
+    }()
+
     private init() {
         let info = Bundle.main.infoDictionary
         let urlString = (info?["SUPABASE_URL"] as? String) ?? ""
@@ -143,10 +150,11 @@ final class SupabaseManager: ObservableObject {
             .upload(storagePath, data: csvData, options: FileOptions(contentType: "text/csv", upsert: true))
 
         let payload = WorkoutPayload(
-            sessionId:     sessionId,
-            blobAddress:   storagePath,
-            sensorAddress: sensorAddress,
-            recordedTime:  Self.timeFormatter.string(from: recordedAt)
+            sessionId:        sessionId,
+            blobAddress:      storagePath,
+            sensorAddress:    sensorAddress,
+            recordedTime:     Self.timeFormatter.string(from: recordedAt),
+            recordingStartUtc: Self.utcFormatter.string(from: recordedAt)
         )
         try await client.from("workouts").insert(payload).execute()
     }

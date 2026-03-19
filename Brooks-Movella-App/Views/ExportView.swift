@@ -17,6 +17,9 @@ struct ExportView: View {
         connectedDots.contains { $0.connectionPhase != .ready }
     }
     private var cartCount: Int { exportManager.cartItems.count }
+    private var isAnyRecording: Bool {
+        manager.runnerPhases.values.contains { $0 == .recording || $0 == .syncing || $0 == .startingRecording || $0 == .stoppingRecording }
+    }
 
     var body: some View {
         NavigationView {
@@ -34,6 +37,7 @@ struct ExportView: View {
                 .padding(.top)
             }
             .refreshable {
+                guard !isAnyRecording else { return }
                 if hasInitializingSensors {
                     showInitializingAlert = true
                 } else {
@@ -66,6 +70,7 @@ struct ExportView: View {
                 // but only when it's safe: sensors connected, not mid-export, not
                 // in the post-export done state (user may be about to share).
                 let safeToRefresh = !readyDots.isEmpty
+                    && !isAnyRecording
                     && exportManager.exportPhase != .exporting
                     && exportManager.exportPhase != .done
                 if safeToRefresh {
@@ -103,7 +108,19 @@ struct ExportView: View {
 
     @ViewBuilder
     private var recordingsContent: some View {
-        if connectedDots.isEmpty {
+        if isAnyRecording {
+            SectionCard(title: "Recordings", icon: "doc.on.doc") {
+                HStack(spacing: 8) {
+                    Image(systemName: "record.circle")
+                        .foregroundColor(.red)
+                    Text("Stop all recordings before exporting.")
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .center)
+                .padding(.vertical, 8)
+            }
+        } else if connectedDots.isEmpty {
             SectionCard(title: "Recordings", icon: "doc.on.doc") {
                 EmptyStateView(
                     icon: "sensor.tag.radiowaves.forward",
@@ -242,8 +259,12 @@ struct CartView: View {
         }
     }
 
+    private var isAnyRecording: Bool {
+        dotManager.runnerPhases.values.contains { $0 == .recording || $0 == .syncing || $0 == .startingRecording || $0 == .stoppingRecording }
+    }
+
     private var canExport: Bool {
-        !exportManager.cartItems.isEmpty && selectedProfile != nil && emptyMetadataFields.isEmpty
+        !exportManager.cartItems.isEmpty && selectedProfile != nil && emptyMetadataFields.isEmpty && !isAnyRecording
     }
 
     var body: some View {

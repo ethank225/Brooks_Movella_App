@@ -8,29 +8,33 @@ struct Workout: Codable, Identifiable {
     var blobAddress: String
     var sensorAddress: String
     var recordedTime: String
+    var recordingStartUtc: String?
 
     enum CodingKeys: String, CodingKey {
-        case id            = "workout_id"
-        case sessionId     = "trial_id"
-        case blobAddress   = "blob_address"
-        case sensorAddress = "sensor_address"
-        case recordedTime  = "recorded_time"
+        case id               = "workout_id"
+        case sessionId        = "trial_id"
+        case blobAddress      = "blob_address"
+        case sensorAddress    = "sensor_address"
+        case recordedTime     = "recorded_time"
+        case recordingStartUtc = "recording_start_utc"
     }
 }
 
 // MARK: - WorkoutPayload (for DB insert, no workout_id)
 
 struct WorkoutPayload: Codable {
-    let sessionId:     UUID
-    let blobAddress:   String
-    let sensorAddress: String
-    let recordedTime:  String
+    let sessionId:        UUID
+    let blobAddress:      String
+    let sensorAddress:    String
+    let recordedTime:     String
+    let recordingStartUtc: String
 
     enum CodingKeys: String, CodingKey {
-        case sessionId     = "trial_id"
-        case blobAddress   = "blob_address"
-        case sensorAddress = "sensor_address"
-        case recordedTime  = "recorded_time"
+        case sessionId        = "trial_id"
+        case blobAddress      = "blob_address"
+        case sensorAddress    = "sensor_address"
+        case recordedTime     = "recorded_time"
+        case recordingStartUtc = "recording_start_utc"
     }
 }
 

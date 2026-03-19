@@ -104,6 +104,10 @@ struct RunnerCard: View {
         self.onDismissError = onDismissError
     }
 
+    @State private var showDeleteConfirm = false
+    @State private var showUnassignConfirm = false
+    @State private var pendingUnassignUuid: String?
+
     private var canModify: Bool {
         phase == .idle || phase.isError
     }
@@ -166,6 +170,31 @@ struct RunnerCard: View {
         .animation(.easeInOut(duration: 0.25), value: phase)
         .animation(.easeInOut(duration: 0.2), value: isValidPlacementTarget)
         .padding(.horizontal)
+        .alert("Delete Runner?", isPresented: $showDeleteConfirm) {
+            Button("Cancel", role: .cancel) {}
+            Button("Delete", role: .destructive) { onRemove() }
+        } message: {
+            if phase == .idle {
+                Text("Are you sure you want to delete this runner?")
+            } else {
+                Text("This runner has an active session. Deleting it may orphan recordings. Are you sure?")
+            }
+        }
+        .alert("Remove Sensor?", isPresented: $showUnassignConfirm) {
+            Button("Cancel", role: .cancel) { pendingUnassignUuid = nil }
+            Button("Remove", role: .destructive) {
+                if let uuid = pendingUnassignUuid {
+                    onUnassign(uuid)
+                    pendingUnassignUuid = nil
+                }
+            }
+        } message: {
+            if phase == .idle {
+                Text("Are you sure you want to remove this sensor?")
+            } else {
+                Text("This runner has an active session. Removing the sensor may orphan its recording.")
+            }
+        }
     }
 
     // MARK: - Sub-views
@@ -195,7 +224,9 @@ struct RunnerCard: View {
             Spacer()
 
             if canModify {
-                Button(action: onRemove) {
+                Button {
+                    showDeleteConfirm = true
+                } label: {
                     Image(systemName: "trash")
                         .font(.caption)
                         .foregroundColor(.red.opacity(0.6))
@@ -227,7 +258,10 @@ struct RunnerCard: View {
                     dot: dot,
                     isSelected: isThisSelected,
                     onTap: canModify ? { onSelectDot(dot.address) } : nil,
-                    onUnassign: canModify ? { onUnassign(dot.address) } : nil
+                    onUnassign: canModify ? {
+                        pendingUnassignUuid = dot.address
+                        showUnassignConfirm = true
+                    } : nil
                 )
                 .opacity(selectedDotId != nil && !isThisSelected ? 0.45 : 1.0)
                 .transition(.asymmetric(
