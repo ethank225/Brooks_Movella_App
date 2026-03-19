@@ -6,11 +6,16 @@ struct ExportView: View {
 
     @State private var showCart = false
     @State private var showClearConfirmation = false
+    @State private var showInitializingAlert = false
     #if DEBUG
     @State private var showMockTest = false
     #endif
 
     private var connectedDots: [Dot] { manager.connectedDots }
+    private var readyDots: [Dot] { connectedDots.filter { $0.connectionPhase == .ready } }
+    private var hasInitializingSensors: Bool {
+        connectedDots.contains { $0.connectionPhase != .ready }
+    }
     private var cartCount: Int { exportManager.cartItems.count }
 
     var body: some View {
@@ -28,7 +33,13 @@ struct ExportView: View {
                 }
                 .padding(.top)
             }
-            .refreshable { exportManager.fetchRecordings(for: connectedDots) }
+            .refreshable {
+                if hasInitializingSensors {
+                    showInitializingAlert = true
+                } else {
+                    exportManager.fetchRecordings(for: connectedDots)
+                }
+            }
             .alert("Clear Previous Results?", isPresented: $showClearConfirmation) {
                 Button("Clear & Continue", role: .destructive) {
                     exportManager.resetExport()
@@ -37,6 +48,11 @@ struct ExportView: View {
                 Button("Cancel", role: .cancel) {}
             } message: {
                 Text("You have exported files from a previous session. Adding new files will clear those results.")
+            }
+            .alert("Sensors Initializing", isPresented: $showInitializingAlert) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text("Some sensors are still initializing. Please wait until all sensors are ready.")
             }
             .onAppear {
                 // Re-open cart sheet if export was in progress/done when app was backgrounded.
@@ -49,11 +65,11 @@ struct ExportView: View {
                 // Auto-refresh recordings whenever the Export tab becomes visible,
                 // but only when it's safe: sensors connected, not mid-export, not
                 // in the post-export done state (user may be about to share).
-                let safeToRefresh = !connectedDots.isEmpty
+                let safeToRefresh = !readyDots.isEmpty
                     && exportManager.exportPhase != .exporting
                     && exportManager.exportPhase != .done
                 if safeToRefresh {
-                    exportManager.fetchRecordings(for: connectedDots)
+                    exportManager.fetchRecordings(for: readyDots)
                 }
             }
             .navigationTitle("Export")
@@ -98,7 +114,11 @@ struct ExportView: View {
         } else if exportManager.exportPhase == .idle {
             SectionCard(title: "Recordings", icon: "doc.on.doc") {
                 FullWidthButton(icon: "arrow.down.doc", label: "Fetch Recordings", color: .blue) {
-                    exportManager.fetchRecordings(for: connectedDots)
+                    if hasInitializingSensors {
+                        showInitializingAlert = true
+                    } else {
+                        exportManager.fetchRecordings(for: connectedDots)
+                    }
                 }
             }
         } else {
@@ -185,6 +205,7 @@ struct CartView: View {
     @Environment(\.dismiss) private var dismiss
 
     @State private var showCloseBlockedAlert = false
+    @State private var showInitializingAlert = false
     @State private var dbSessionMap: [UUID: UUID] = [:]
 
     // Run Details state
@@ -212,6 +233,13 @@ struct CartView: View {
         if test.trimmingCharacters(in: .whitespaces).isEmpty           { missing.append("Test") }
         if product.trimmingCharacters(in: .whitespaces).isEmpty        { missing.append("Product") }
         return missing
+    }
+
+    private var hasInitializingSensors: Bool {
+        let cartAddresses = Set(exportManager.cartItems.map { $0.recording.dotAddress })
+        return cartAddresses.contains { address in
+            dotManager.dot(forUuid: address)?.connectionPhase != .ready
+        }
     }
 
     private var canExport: Bool {
@@ -281,6 +309,11 @@ struct CartView: View {
             } message: {
                 Text("Please wait for the export to finish before closing.")
             }
+            .alert("Sensors Initializing", isPresented: $showInitializingAlert) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text("Some sensors are still initializing. Please wait until all sensors are ready.")
+            }
             .task {
                 await supabaseManager.fetchProfiles()
                 await supabaseManager.fetchWorkoutTemplates()
@@ -332,7 +365,11 @@ struct CartView: View {
                 label: "Export \(exportManager.cartItems.count) File\(exportManager.cartItems.count == 1 ? "" : "s")",
                 color: canExport ? .purple : .gray
             ) {
-                Task { await prepareAndStartExport() }
+                if hasInitializingSensors {
+                    showInitializingAlert = true
+                } else {
+                    Task { await prepareAndStartExport() }
+                }
             }
             .disabled(!canExport)
             .padding(.horizontal)

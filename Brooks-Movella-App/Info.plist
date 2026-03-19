@@ -2,12 +2,12 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<key>NSUserNotificationsUsageDescription</key>
+	<string>Notify you when a BLE export completes in the background.</string>
 	<key>SUPABASE_ANON_KEY</key>
 	<string>eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imx6bmNiempka2JmYXJxaHlycmZoIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzE0NTQ5OTgsImV4cCI6MjA4NzAzMDk5OH0.Uwmesr8-REoFlc30ve0hc9b5CirLko3bAYZoz-s889M</string>
 	<key>SUPABASE_URL</key>
 	<string>https://lzncbzjdkbfarqhyrrfh.supabase.co</string>
-	<key>NSUserNotificationsUsageDescription</key>
-	<string>Notify you when a BLE export completes in the background.</string>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>bluetooth-central</string>

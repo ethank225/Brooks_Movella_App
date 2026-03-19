@@ -147,7 +147,7 @@ final class ExportManager: ObservableObject {
         let group = DispatchGroup()
 
         for dot in dots {
-            guard dot.isInitialized else { continue }
+            guard dot.connectionPhase == .ready, dot.isInitialized else { continue }
 
             group.enter()
             dot.getExportFileInfo { [weak self] _ in
@@ -295,8 +295,9 @@ final class ExportManager: ObservableObject {
             guard let tasksForDot = grouped[address] else {
                 semaphore.signal(); continue
             }
-            guard let dot = DotManager.shared.dot(forUuid: address), dot.isConnected else {
-                tasksForDot.forEach { setTaskStatus($0, .failed, error: "Sensor disconnected") }
+            guard let dot = DotManager.shared.dot(forUuid: address),
+                  dot.connectionPhase == .ready else {
+                tasksForDot.forEach { setTaskStatus($0, .failed, error: "Sensor not ready") }
                 semaphore.signal(); continue
             }
             exportFilesForDot(dot: dot, tasks: tasksForDot) { semaphore.signal() }

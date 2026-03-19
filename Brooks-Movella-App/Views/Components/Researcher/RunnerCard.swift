@@ -47,34 +47,103 @@ private struct EmptyDotSlot: View {
 // MARK: - Runner Card
 
 struct RunnerCard: View {
-    @Binding var runner: RunnerModel
-    var selectedDot: MockDot?
-    var onPlaceDot: (MockDot) -> Void
+    let runner: Runner
+    let phase: SessionPhase
+    let assignedDots: [Dot]
+    let hasAvailableDots: Bool
+    /// Disables start/retry buttons (e.g. when another runner is syncing).
+    let isStartDisabled: Bool
+    var selectedDotId: String?
+    var isSlotSelected: Bool
+    var onPlaceDot: () -> Void
     var onCancelSelection: () -> Void
-    var onUnassign: (MockDot) -> Void
+    var onSelectSlot: () -> Void
+    var onSelectDot: (String) -> Void
+    var onUnassign: (String) -> Void
     var onStart: () -> Void
     var onStop: () -> Void
     var onRemove: () -> Void
+    var onRename: (String) -> Void
+    var onDismissError: () -> Void
+
+    init(
+        runner: Runner,
+        phase: SessionPhase,
+        assignedDots: [Dot],
+        hasAvailableDots: Bool,
+        isStartDisabled: Bool = false,
+        selectedDotId: String? = nil,
+        isSlotSelected: Bool = false,
+        onPlaceDot: @escaping () -> Void,
+        onCancelSelection: @escaping () -> Void,
+        onSelectSlot: @escaping () -> Void = {},
+        onSelectDot: @escaping (String) -> Void,
+        onUnassign: @escaping (String) -> Void,
+        onStart: @escaping () -> Void,
+        onStop: @escaping () -> Void,
+        onRemove: @escaping () -> Void,
+        onRename: @escaping (String) -> Void,
+        onDismissError: @escaping () -> Void
+    ) {
+        self.runner = runner
+        self.phase = phase
+        self.assignedDots = assignedDots
+        self.hasAvailableDots = hasAvailableDots
+        self.isStartDisabled = isStartDisabled
+        self.selectedDotId = selectedDotId
+        self.isSlotSelected = isSlotSelected
+        self.onPlaceDot = onPlaceDot
+        self.onCancelSelection = onCancelSelection
+        self.onSelectSlot = onSelectSlot
+        self.onSelectDot = onSelectDot
+        self.onUnassign = onUnassign
+        self.onStart = onStart
+        self.onStop = onStop
+        self.onRemove = onRemove
+        self.onRename = onRename
+        self.onDismissError = onDismissError
+    }
+
+    private var canModify: Bool {
+        phase == .idle || phase.isError
+    }
+
+    private var allDotsReady: Bool {
+        !assignedDots.isEmpty && assignedDots.allSatisfy { $0.connectionPhase == .ready }
+    }
 
     private var isValidPlacementTarget: Bool {
-        selectedDot != nil && runner.status == .new && runner.assignedDots.count < 3
+        selectedDotId != nil && canModify && !selectedDotIsHere
+    }
+
+    // MARK: - Status Display
+
+    private var statusText: String {
+        switch phase {
+        case .idle:
+            return assignedDots.isEmpty ? "New" : "Ready"
+        case .syncing:             return "Syncing"
+        case .startingRecording:   return "Starting"
+        case .recording:           return "Rec"
+        case .stoppingRecording:   return "Stopping"
+        case .error:               return "Error"
+        }
+    }
+
+    private var statusColor: Color {
+        switch phase {
+        case .idle:
+            return assignedDots.isEmpty ? .blue : .green
+        case .syncing, .startingRecording, .stoppingRecording:
+            return .blue
+        case .recording:           return .red
+        case .error:               return .orange
+        }
     }
 
     private var borderColor: Color {
         if isValidPlacementTarget { return .blue }
-        switch runner.status {
-        case .new:   return Color.blue.opacity(0.4)
-        case .ready: return .green
-        case .rec:   return .red
-        }
-    }
-
-    private var avatarColor: Color {
-        switch runner.status {
-        case .new:   return .blue
-        case .ready: return .green
-        case .rec:   return .red
-        }
+        return statusColor.opacity(phase == .idle && assignedDots.isEmpty ? 0.4 : 1.0)
     }
 
     var body: some View {
@@ -94,15 +163,9 @@ struct RunnerCard: View {
             RoundedRectangle(cornerRadius: 12)
                 .strokeBorder(borderColor, lineWidth: isValidPlacementTarget ? 2 : 1.5)
         )
-        .animation(.easeInOut(duration: 0.25), value: runner.status)
+        .animation(.easeInOut(duration: 0.25), value: phase)
         .animation(.easeInOut(duration: 0.2), value: isValidPlacementTarget)
         .padding(.horizontal)
-        // Tapping a non-valid-target card while a dot is selected cancels selection
-        .onTapGesture {
-            if selectedDot != nil && !isValidPlacementTarget {
-                onCancelSelection()
-            }
-        }
     }
 
     // MARK: - Sub-views
@@ -111,24 +174,27 @@ struct RunnerCard: View {
         HStack(alignment: .center, spacing: 10) {
             ZStack {
                 Circle()
-                    .fill(avatarColor.opacity(0.18))
+                    .fill(statusColor.opacity(0.18))
                     .frame(width: 36, height: 36)
-                Text(runner.name.isEmpty ? "?" : String(runner.name.prefix(1)).uppercased())
+                Text(runner.label.isEmpty ? "?" : String(runner.label.prefix(1)).uppercased())
                     .font(.system(.subheadline, design: .rounded).weight(.bold))
-                    .foregroundColor(avatarColor)
+                    .foregroundColor(statusColor)
             }
 
-            if runner.status == .new {
-                TextField("Runner name", text: $runner.name)
-                    .font(.headline)
+            if canModify {
+                TextField("Runner name", text: Binding(
+                    get: { runner.label },
+                    set: { onRename($0) }
+                ))
+                .font(.headline)
             } else {
-                Text(runner.name.isEmpty ? "Runner" : runner.name)
+                Text(runner.label.isEmpty ? "Runner" : runner.label)
                     .font(.headline)
             }
 
             Spacer()
 
-            if runner.status != .rec {
+            if canModify {
                 Button(action: onRemove) {
                     Image(systemName: "trash")
                         .font(.caption)
@@ -137,64 +203,101 @@ struct RunnerCard: View {
                 .buttonStyle(.plain)
             }
 
-            statusBadge
+            StatusTag(text: statusText, isActive: true, color: statusColor)
         }
+    }
+
+    /// Whether the selected dot is assigned to this runner.
+    private var selectedDotIsHere: Bool {
+        guard let id = selectedDotId else { return false }
+        return assignedDots.contains { $0.address == id }
+    }
+
+    /// Whether the empty slot should show a highlighted state.
+    private var slotHighlighted: Bool {
+        isValidPlacementTarget || isSlotSelected
     }
 
     private var dotsRow: some View {
-        HStack(spacing: 8) {
-            ForEach(runner.assignedDots) { dot in
+        let emptyCount = max(0, 3 - assignedDots.count)
+        return HStack(spacing: 8) {
+            ForEach(assignedDots, id: \.address) { dot in
+                let isThisSelected = selectedDotId == dot.address
                 DotChip(
                     dot: dot,
-                    onUnassign: (runner.status == .new || runner.status == .ready) ? { onUnassign(dot) } : nil
+                    isSelected: isThisSelected,
+                    onTap: canModify ? { onSelectDot(dot.address) } : nil,
+                    onUnassign: canModify ? { onUnassign(dot.address) } : nil
                 )
+                .opacity(selectedDotId != nil && !isThisSelected ? 0.45 : 1.0)
+                .transition(.asymmetric(
+                    insertion: .scale.combined(with: .opacity),
+                    removal: .scale.combined(with: .opacity)
+                ))
             }
-            ForEach(runner.assignedDots.count..<3, id: \.self) { _ in
-                EmptyDotSlot(isHighlighted: isValidPlacementTarget) {
-                    if let dot = selectedDot, runner.status == .new {
-                        onPlaceDot(dot)
+            if emptyCount > 0 {
+                ForEach(0..<emptyCount, id: \.self) { _ in
+                    EmptyDotSlot(
+                        isHighlighted: canModify && slotHighlighted && !selectedDotIsHere
+                    ) {
+                        if selectedDotId != nil {
+                            onPlaceDot()
+                        } else {
+                            onSelectSlot()
+                        }
                     }
+                    .allowsHitTesting(canModify && !selectedDotIsHere)
+                    .opacity(canModify ? 1.0 : 0.5)
+                    .transition(.opacity)
                 }
             }
         }
-    }
-
-    @ViewBuilder
-    private var statusBadge: some View {
-        switch runner.status {
-        case .new:   StatusTag(text: "new",   isActive: true, color: .blue)
-        case .ready: StatusTag(text: "ready", isActive: true, color: .green)
-        case .rec:   StatusTag(text: "rec",   isActive: true, color: .red)
-        }
+        .animation(.spring(response: 0.35, dampingFraction: 0.8), value: assignedDots.map(\.address))
     }
 
     @ViewBuilder
     private var actionArea: some View {
-        switch runner.status {
-        case .new:
-            Text(runner.assignedDots.isEmpty
-                 ? "Select a DOT above, then tap an empty slot"
-                 : "\(3 - runner.assignedDots.count) more DOT\(3 - runner.assignedDots.count == 1 ? "" : "s") needed")
-                .font(.caption)
-                .foregroundColor(.secondary)
-        case .ready:
-            Button(action: onStart) {
-                Label(
-                    "Start \(runner.name.isEmpty ? "Runner" : runner.name)",
-                    systemImage: "play.fill"
-                )
-                .font(.subheadline.weight(.semibold))
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 10)
-                .background(Color.green)
-                .foregroundColor(.white)
-                .cornerRadius(8)
+        switch phase {
+        case .idle:
+            if assignedDots.isEmpty {
+                Text("Select a DOT above, then tap an empty slot")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            } else if !allDotsReady {
+                HStack(spacing: 6) {
+                    ProgressView()
+                        .scaleEffect(0.7)
+                    Text("Waiting for sensors to initialize...")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+            } else {
+                Button(action: onStart) {
+                    Label(
+                        "Start \(runner.label.isEmpty ? "Runner" : runner.label)",
+                        systemImage: "play.fill"
+                    )
+                    .font(.subheadline.weight(.semibold))
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 10)
+                    .background(isStartDisabled ? Color.gray : Color.green)
+                    .foregroundColor(.white)
+                    .cornerRadius(8)
+                }
+                .buttonStyle(.plain)
+                .disabled(isStartDisabled)
             }
-            .buttonStyle(.plain)
-        case .rec:
+
+        case .syncing:
+            busyRow("Syncing clocks...")
+
+        case .startingRecording:
+            busyRow("Starting recording...")
+
+        case .recording:
             Button(action: onStop) {
                 Label(
-                    "Stop \(runner.name.isEmpty ? "Runner" : runner.name)",
+                    "Stop \(runner.label.isEmpty ? "Runner" : runner.label)",
                     systemImage: "stop.fill"
                 )
                 .font(.subheadline.weight(.semibold))
@@ -205,6 +308,51 @@ struct RunnerCard: View {
                 .cornerRadius(8)
             }
             .buttonStyle(.plain)
+
+        case .stoppingRecording:
+            busyRow("Stopping recording...")
+
+        case .error(let msg):
+            VStack(spacing: 8) {
+                HStack {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundColor(.orange)
+                    Text(msg)
+                        .font(.caption)
+                        .foregroundColor(.orange)
+                    Spacer()
+                    Button { onDismissError() } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundColor(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                }
+                if allDotsReady {
+                    Button(action: onStart) {
+                        Label("Retry", systemImage: "arrow.clockwise")
+                            .font(.subheadline.weight(.semibold))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 10)
+                            .background(isStartDisabled ? Color.gray : Color.green)
+                            .foregroundColor(.white)
+                            .cornerRadius(8)
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(isStartDisabled)
+                }
+            }
         }
+    }
+
+    private func busyRow(_ text: String) -> some View {
+        HStack(spacing: 8) {
+            ProgressView()
+                .scaleEffect(0.8)
+            Text(text)
+                .font(.subheadline)
+                .foregroundColor(.secondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .center)
+        .padding(.vertical, 8)
     }
 }

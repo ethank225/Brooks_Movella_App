@@ -10,7 +10,8 @@ struct CartItem: Identifiable {
     init(recording: RecordingFile) {
         self.id = recording.id
         self.recording = recording
-        let addrSuffix = String(recording.id.prefix(4))
-        self.label = "DOT_\(addrSuffix)_file\(recording.fileIndex)"
+        let sensorName = SensorNameStore.shared.names[recording.dotAddress]
+            ?? "DOT_\(String(recording.dotAddress.prefix(4)))"
+        self.label = "\(sensorName)_file\(recording.fileIndex)"
     }
 }

@@ -5,8 +5,13 @@ import MovellaDotSdk
 struct ConnectionView: View {
 
     @ObservedObject private var manager = DotManager.shared
+    @ObservedObject private var runnerStore = RunnerStore.shared
+    @ObservedObject private var nameStore = SensorNameStore.shared
 
     @State private var identifyingUuid: String?
+    @State private var showModeToggleAlert = false
+    @State private var editingUuid: String?
+    @State private var editText: String = ""
 
     // Timer to force scan retries
     @State private var timer = Timer.publish(every: 1.0, on: .main, in: .common).autoconnect()
@@ -96,22 +101,31 @@ struct ConnectionView: View {
                             ForEach(discoveredList, id: \.uuid) { device in
                                 let uuid = device.uuid
                                 let phase = manager.connectionPhase(forUuid: uuid)
+                                let hasCustomName = nameStore.names[uuid] != nil
+                                let displayTitle = hasCustomName ? nameStore.name(for: uuid) : "DOT \(uuid)"
 
                                 DeviceRow(
-                                    title: "DOT \(uuid)",
+                                    title: displayTitle,
                                     subtitle: manager.displayAddress(for: device),
                                     phase: phase,
                                     isIdentifying: identifyingUuid == uuid,
                                     batteryLevel: manager.dot(forUuid: uuid)?.device.battery?.value as? Int,
                                     sessionBusy: manager.sessionPhase.isBusy,
-                                    onToggle: { toggleConnection(device) }
-                                )
-                                .contentShape(Rectangle())
-                                .onTapGesture {
-                                    if phase == .ready {
+                                    isEditing: editingUuid == uuid,
+                                    editText: editingUuid == uuid ? $editText : nil,
+                                    onToggle: { toggleConnection(device) },
+                                    onNameTap: phase.isConnected ? {
+                                        editingUuid = uuid
+                                        editText = hasCustomName ? nameStore.name(for: uuid) : ""
+                                    } : nil,
+                                    onNameCommit: {
+                                        nameStore.setName(editText, for: uuid)
+                                        editingUuid = nil
+                                    },
+                                    onIdentify: phase == .ready ? {
                                         triggerIdentify(uuid: uuid)
-                                    }
-                                }
+                                    } : nil
+                                )
                             }
                         }
                     }
@@ -122,6 +136,24 @@ struct ConnectionView: View {
             }
             .navigationTitle("Connect")
             .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button {
+                        if manager.connectedDots.isEmpty {
+                            runnerStore.isMultiRunnerMode.toggle()
+                        } else {
+                            showModeToggleAlert = true
+                        }
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: runnerStore.isMultiRunnerMode
+                                  ? "person.2.fill" : "person.2")
+                                .font(.subheadline)
+                            Text("Research")
+                                .font(.caption)
+                        }
+                        .foregroundColor(runnerStore.isMultiRunnerMode ? .blue : .secondary)
+                    }
+                }
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Button {
                         manager.startScan()
@@ -131,6 +163,11 @@ struct ConnectionView: View {
                     }
                     .disabled(manager.isScanning)
                 }
+            }
+            .alert("Cannot Switch Modes", isPresented: $showModeToggleAlert) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text("Disconnect all sensors before switching between single and multi-runner modes.")
             }
             .refreshable { manager.startScan() }
             .onAppear {
@@ -187,7 +224,14 @@ struct DeviceRow: View {
     var isIdentifying: Bool = false
     var batteryLevel: Int? = nil
     var sessionBusy: Bool = false
+    var isEditing: Bool = false
+    var editText: Binding<String>? = nil
     let onToggle: () -> Void
+    var onNameTap: (() -> Void)? = nil
+    var onNameCommit: (() -> Void)? = nil
+    var onIdentify: (() -> Void)? = nil
+
+    @FocusState private var isFieldFocused: Bool
 
     private var isBusy: Bool { phase.isBusy }
 
@@ -248,15 +292,42 @@ struct DeviceRow: View {
             }
 
             VStack(alignment: .leading, spacing: 4) {
-                HStack(spacing: 8) {
-                    Text(title)
-                        .font(.headline)
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-
-                    ProgressView()
-                        .scaleEffect(0.85)
-                        .opacity(isBusy ? 1 : 0)
+                HStack(spacing: 4) {
+                    if isEditing, let editText {
+                        TextField("e.g. Left Foot", text: editText)
+                            .font(.subheadline)
+                            .textFieldStyle(.plain)
+                            .focused($isFieldFocused)
+                            .onSubmit { onNameCommit?() }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    } else {
+                        Text(title)
+                            .font(.subheadline)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                            .foregroundColor(onNameTap != nil ? .primary.opacity(0.8) : .primary)
+                            .underline(onNameTap != nil, color: .secondary.opacity(0.3))
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .contentShape(Rectangle())
+                            .onTapGesture { onNameTap?() }
+                    }
+                    if isBusy {
+                        ProgressView()
+                            .scaleEffect(0.85)
+                            .fixedSize()
+                    }
+                }
+                .onChange(of: isEditing) { editing in
+                    if editing {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                            isFieldFocused = true
+                        }
+                    }
+                }
+                .onChange(of: isFieldFocused) { focused in
+                    if !focused && isEditing {
+                        onNameCommit?()
+                    }
                 }
 
                 HStack(spacing: 8) {
@@ -307,6 +378,8 @@ struct DeviceRow: View {
         .padding()
         .background(rowBackground)
         .cornerRadius(10)
+        .contentShape(Rectangle())
+        .onTapGesture(count: 2) { onIdentify?() }
         .animation(.easeInOut(duration: 0.3), value: isIdentifying)
     }
 }

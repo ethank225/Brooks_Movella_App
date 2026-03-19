@@ -29,13 +29,6 @@ final class DotRegistry {
     var syncInProgress: Bool = false
     var syncingUuids: Set<String> = []
     var isScanningInternal: Bool = false
-    /// UUIDs of every dot that was part of the most recently started recording session.
-    /// Set at recording-start success; cleared when the session ends normally.
-    /// Survives BT resets so that every reconnecting dot can take the skip-flash path.
-    var activeRecordingUuids: Set<String> = []
-    /// UUIDs of devices that individually disconnected while recording
-    /// (per-device disconnect, not a BT manager reset). Consumed on reconnect.
-    var uuidsRecordingOnDisconnect: Set<String> = []
 
     // MARK: - Snapshots
 
@@ -149,10 +142,5 @@ final class DotRegistry {
         initializationInProgress.removeAll()
         syncInProgress = false
         syncingUuids.removeAll()
-        // Per-device recording flags are irrelevant after a full BT reset —
-        // activeRecordingUuids covers all devices for that case.
-        uuidsRecordingOnDisconnect.removeAll()
-        // Note: activeRecordingUuids is intentionally NOT cleared here —
-        // every reconnecting dot needs to find its UUID in the set.
     }
 }

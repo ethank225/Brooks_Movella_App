@@ -1,142 +1,205 @@
 import SwiftUI
-import Combine
-
-// MARK: - Models
-
-enum RunnerStatus: Equatable {
-    case new, ready, rec
-}
-
-struct MockDot: Identifiable {
-    var id: String          // e.g. "9F1E·3C88"
-    var storagePercent: Int // 0–100
-}
-
-struct RunnerModel: Identifiable {
-    let id: UUID = UUID()
-    var name: String
-    var status: RunnerStatus
-    var assignedDots: [MockDot]
-}
-
-// MARK: - Session State
-
-final class ResearcherSessionState: ObservableObject {
-    @Published var runners: [RunnerModel] = []
-
-    @Published var availableDots: [MockDot] = [
-        MockDot(id: "4DD3·B9D6", storagePercent: 12),
-        MockDot(id: "23A5·F670", storagePercent: 24),
-        MockDot(id: "E495·652F", storagePercent: 79),
-        MockDot(id: "7B2C·A1D4", storagePercent: 8),
-        MockDot(id: "9F1E·3C88", storagePercent: 5),
-        MockDot(id: "C72B·04AF", storagePercent: 18)
-    ]
-
-    var liveCount: Int { runners.filter { $0.status == .rec }.count }
-
-    func assign(_ dot: MockDot, to runnerID: UUID) {
-        guard let i = runners.firstIndex(where: { $0.id == runnerID }),
-              runners[i].status == .new,
-              runners[i].assignedDots.count < 3 else { return }
-        availableDots.removeAll { $0.id == dot.id }
-        runners[i].assignedDots.append(dot)
-        if runners[i].assignedDots.count == 3 {
-            runners[i].status = .ready
-        }
-    }
-
-    func unassign(_ dot: MockDot, from runnerID: UUID) {
-        guard let i = runners.firstIndex(where: { $0.id == runnerID }),
-              runners[i].status == .new || runners[i].status == .ready else { return }
-        runners[i].assignedDots.removeAll { $0.id == dot.id }
-        availableDots.append(dot)
-        // Revert to .new if dots are now incomplete
-        if runners[i].assignedDots.count < 3 {
-            runners[i].status = .new
-        }
-    }
-
-    func start(runnerID: UUID) {
-        guard let i = runners.firstIndex(where: { $0.id == runnerID }),
-              runners[i].status == .ready else { return }
-        runners[i].status = .rec
-    }
-
-    func stop(runnerID: UUID) {
-        guard let i = runners.firstIndex(where: { $0.id == runnerID }),
-              runners[i].status == .rec else { return }
-        runners[i].status = .ready
-    }
-
-    func removeRunner(id: UUID) {
-        guard let i = runners.firstIndex(where: { $0.id == id }) else { return }
-        availableDots.append(contentsOf: runners[i].assignedDots)
-        runners.remove(at: i)
-    }
-
-    func addRunner() {
-        runners.append(RunnerModel(name: "", status: .new, assignedDots: []))
-    }
-}
-
-// MARK: - View
 
 struct ResearcherModeRecordView: View {
-    @ObservedObject var state: ResearcherSessionState
-    @State private var selectedDot: MockDot? = nil
+    @ObservedObject private var manager = DotManager.shared
+    @ObservedObject private var runnerStore = RunnerStore.shared
+
+    @State private var selectedDotId: String? = nil
+    /// Runner whose empty slot was tapped (slot-first flow). Mutually exclusive with selectedDotId.
+    @State private var selectedSlotRunnerId: String? = nil
+    @State private var showInitializingAlert = false
+
+    /// Runners to display — excludes the single-runner-mode ephemeral runner.
+    private var runners: [Runner] {
+        runnerStore.runners.filter { $0.id != DotManager.singleRunnerID }
+    }
+
+    /// Connected sensors not assigned to any multi-runner runner.
+    private var availableDots: [Dot] {
+        let allAssigned = Set(runners.flatMap { $0.sensorUuids })
+        return manager.connectedDots.filter { !allAssigned.contains($0.address) }
+    }
+
+    /// Whether the selected dot is currently assigned to some runner (not in the pool).
+    private var selectedIsAssigned: Bool {
+        guard let id = selectedDotId else { return false }
+        return runners.contains { $0.sensorUuids.contains(id) }
+    }
+
+    /// The runner that currently owns the selected dot, if any.
+    private var sourceRunner: Runner? {
+        guard let id = selectedDotId else { return nil }
+        return runners.first { $0.sensorUuids.contains(id) }
+    }
+
+    /// Connected sensors assigned to a specific runner.
+    private func assignedDots(for runner: Runner) -> [Dot] {
+        runner.sensorUuids.compactMap { uuid in
+            manager.connectedDots.first { $0.address == uuid }
+        }
+    }
+
+    /// Phase for a runner, defaulting to idle.
+    private func phase(for runner: Runner) -> SessionPhase {
+        manager.runnerPhases[runner.id] ?? .idle
+    }
 
     var body: some View {
         VStack(spacing: 0) {
             AvailableDots(
-                dots: state.availableDots,
-                selectedDot: selectedDot,
+                dots: availableDots,
+                selectedDotId: selectedDotId,
+                selectedIsAssigned: selectedIsAssigned,
+                slotIsActive: selectedSlotRunnerId != nil,
                 onTapDot: { dot in
-                    // Re-tap selected chip → cancel; otherwise select
-                    if selectedDot?.id == dot.id {
-                        selectedDot = nil
-                    } else {
-                        selectedDot = dot
+                    // Slot-first: a slot is waiting, assign this dot there
+                    if let runnerId = selectedSlotRunnerId {
+                        withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+                            runnerStore.assignSensor(uuid: dot.address, to: runnerId)
+                            selectedSlotRunnerId = nil
+                        }
+                        return
+                    }
+                    // Dot-first: toggle selection
+                    withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+                        if selectedDotId == dot.address {
+                            selectedDotId = nil
+                        } else {
+                            selectedDotId = dot.address
+                            selectedSlotRunnerId = nil
+                        }
+                    }
+                },
+                onReturnToPool: {
+                    guard let uuid = selectedDotId,
+                          let source = sourceRunner else { return }
+                    withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+                        runnerStore.unassignSensor(uuid: uuid, from: source.id)
+                        selectedDotId = nil
                     }
                 }
             )
             .padding(.top, 8)
 
-            ScrollView {
-                VStack(spacing: 12) {
-                    ForEach($state.runners) { $runner in
-                        RunnerCard(
-                            runner: $runner,
-                            selectedDot: selectedDot,
-                            onPlaceDot: { dot in
-                                state.assign(dot, to: runner.id)
-                                selectedDot = nil
-                            },
-                            onCancelSelection: { selectedDot = nil },
-                            onUnassign: { dot in state.unassign(dot, from: runner.id) },
-                            onStart:    { state.start(runnerID: runner.id) },
-                            onStop:     { state.stop(runnerID: runner.id) },
-                            onRemove: {
-                                state.removeRunner(id: runner.id)
-                                selectedDot = nil
-                            }
-                        )
-                    }
-
-                    AddRunnerButton { state.addRunner() }
-                        .padding(.top, 4)
-                        .padding(.bottom, 24)
-                }
-                .padding(.top, 12)
-            }
-            // Tapping the scroll background cancels selection
-            .simultaneousGesture(TapGesture().onEnded {
-                if selectedDot != nil { selectedDot = nil }
-            })
+            runnerList
         }
+        .alert("Sensors Initializing", isPresented: $showInitializingAlert) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text("Some sensors are still initializing. Please wait until all sensors are ready.")
+        }
+    }
+
+    // MARK: - Runner List
+
+    private var runnerList: some View {
+        ScrollView(.vertical, showsIndicators: true) {
+            VStack(spacing: 12) {
+                ForEach(runners) { runner in
+                    runnerCard(for: runner)
+                        .transition(.asymmetric(
+                            insertion: .move(edge: .top).combined(with: .opacity),
+                            removal: .move(edge: .top).combined(with: .opacity)
+                        ))
+                }
+
+                AddRunnerButton {
+                    withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+                        _ = runnerStore.addRunner(label: "")
+                    }
+                }
+                .padding(.top, 4)
+                .padding(.bottom, 24)
+            }
+            .padding(.top, 12)
+        }
+        .onTapGesture {
+            withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+                if selectedDotId != nil { selectedDotId = nil }
+                if selectedSlotRunnerId != nil { selectedSlotRunnerId = nil }
+            }
+        }
+    }
+
+    private func runnerCard(for runner: Runner) -> some View {
+        RunnerCard(
+            runner: runner,
+            phase: phase(for: runner),
+            assignedDots: assignedDots(for: runner),
+            hasAvailableDots: !availableDots.isEmpty,
+            isStartDisabled: manager.isAnySyncing && phase(for: runner) != .syncing,
+            selectedDotId: selectedDotId,
+            isSlotSelected: selectedSlotRunnerId == runner.id,
+            onPlaceDot: {
+                guard let uuid = selectedDotId else { return }
+                withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+                    // If the dot is assigned to another runner, move it
+                    if let source = sourceRunner, source.id != runner.id {
+                        runnerStore.unassignSensor(uuid: uuid, from: source.id)
+                    }
+                    runnerStore.assignSensor(uuid: uuid, to: runner.id)
+                    selectedDotId = nil
+                }
+            },
+            onCancelSelection: {
+                withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+                    selectedDotId = nil
+                    selectedSlotRunnerId = nil
+                }
+            },
+            onSelectSlot: {
+                withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+                    if selectedSlotRunnerId == runner.id {
+                        selectedSlotRunnerId = nil
+                    } else {
+                        selectedSlotRunnerId = runner.id
+                        selectedDotId = nil
+                    }
+                }
+            },
+            onSelectDot: { uuid in
+                withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+                    if selectedDotId == uuid {
+                        selectedDotId = nil
+                    } else {
+                        selectedDotId = uuid
+                        selectedSlotRunnerId = nil
+                    }
+                }
+            },
+            onUnassign: { uuid in
+                withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+                    runnerStore.unassignSensor(uuid: uuid, from: runner.id)
+                }
+            },
+            onStart: {
+                let allReady = assignedDots(for: runner).allSatisfy { $0.connectionPhase == .ready }
+                if !allReady {
+                    showInitializingAlert = true
+                } else {
+                    manager.beginSession(runnerId: runner.id)
+                }
+            },
+            onStop: {
+                manager.endSession(runnerId: runner.id)
+            },
+            onRemove: {
+                withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+                    runnerStore.removeRunner(id: runner.id)
+                    selectedDotId = nil
+                    selectedSlotRunnerId = nil
+                }
+            },
+            onRename: { newName in
+                runnerStore.updateLabel(runnerId: runner.id, label: newName)
+            },
+            onDismissError: {
+                manager.dismissError(runnerId: runner.id)
+            }
+        )
     }
 }
 
 #Preview {
-    ResearcherModeRecordView(state: ResearcherSessionState())
+    ResearcherModeRecordView()
 }

@@ -2,20 +2,19 @@ import SwiftUI
 
 struct SyncView: View {
     @ObservedObject private var manager = DotManager.shared
+    @ObservedObject private var runnerStore = RunnerStore.shared
 
     @State private var isErasing = false
     @State private var showEraseConfirmation = false
     @State private var eraseResult: String = ""
-    @State private var researcherMode = false
-    @StateObject private var researcherState = ResearcherSessionState()
 
     private var phase: SessionPhase { manager.sessionPhase }
 
     var body: some View {
         NavigationView {
             Group {
-                if researcherMode {
-                    ResearcherModeRecordView(state: researcherState)
+                if runnerStore.isMultiRunnerMode {
+                    ResearcherModeRecordView()
                 } else {
                     ScrollView {
                         VStack(spacing: 16) {
@@ -143,15 +142,7 @@ struct SyncView: View {
             .navigationTitle("Record")
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
-                    HStack(spacing: 10) {
-                        LiveBadge(count: researcherState.liveCount)
-                        Toggle("Researcher", isOn: $researcherMode)
-                            .toggleStyle(.switch)
-                            .labelsHidden()
-                        Text("Researcher")
-                            .font(.subheadline)
-                            .foregroundColor(.secondary)
-                    }
+                    LiveBadge(count: manager.runnerPhases.values.filter { $0 == .recording }.count)
                 }
             }
             .onAppear {
@@ -308,6 +299,7 @@ struct DotStatusRow: View {
     @ObservedObject var dot: Dot
     var sessionPhase: SessionPhase = .idle
 
+    @ObservedObject private var nameStore = SensorNameStore.shared
     @State private var breathe = false
     @State private var eraseBreathe = false
 
@@ -325,7 +317,7 @@ struct DotStatusRow: View {
             }
 
             VStack(alignment: .leading, spacing: 4) {
-                Text("DOT " + dot.address)
+                Text(nameStore.name(for: dot.address))
                     .font(.headline)
                     .lineLimit(1)
                     .truncationMode(.tail)

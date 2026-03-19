@@ -2,6 +2,22 @@ import Foundation
 import Combine
 import MovellaDotSdk
 
+// MARK: - Debug Log (temporary — remove later)
+
+func debugLog(_ message: String) {
+    let ts = ISO8601DateFormatter().string(from: Date())
+    let line = "[\(ts)] \(message)\n"
+    guard let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else { return }
+    let url = dir.appendingPathComponent("debug_log.txt")
+    if let handle = try? FileHandle(forWritingTo: url) {
+        handle.seekToEndOfFile()
+        handle.write(line.data(using: .utf8)!)
+        handle.closeFile()
+    } else {
+        try? line.data(using: .utf8)?.write(to: url)
+    }
+}
+
 // MARK: - Session Phase
 
 /// Tracks the lifecycle of a recording session.
@@ -134,7 +150,6 @@ final class DotManager: NSObject, ObservableObject {
     func activate() {
         DotConnectionManager.setConnectionDelegate(self)
         DotReconnectManager.setEnable(true)
-        restoreRecoveryState()
     }
 
     // MARK: - Published State (UI-facing)
@@ -143,7 +158,26 @@ final class DotManager: NSObject, ObservableObject {
     @Published private(set) var discovered: [DotDevice] = []
     @Published private(set) var dots: [Dot] = []
     @Published private(set) var connectedDots: [Dot] = []
-    @Published private(set) var sessionPhase: SessionPhase = .idle
+    /// Shadow copy on stateQueue. Source of truth for phase logic.
+    private var runnerPhasesInternal: [String: SessionPhase] = [:]
+    /// Published for SwiftUI. Updated on main thread from runnerPhasesInternal.
+    @Published private(set) var runnerPhases: [String: SessionPhase] = [:]
+
+    /// Aggregate phase across all runners. Used by views that need a single "is the system busy" answer.
+    var sessionPhase: SessionPhase {
+        let p = runnerPhases.values
+        if p.contains(.syncing) { return .syncing }
+        if p.contains(.startingRecording) { return .startingRecording }
+        if p.contains(.stoppingRecording) { return .stoppingRecording }
+        if p.contains(.recording) { return .recording }
+        if let e = p.first(where: { $0.isError }) { return e }
+        return .idle
+    }
+    /// True when any runner is in a syncing phase. Used to disable start buttons on other runners.
+    var isAnySyncing: Bool {
+        runnerPhases.values.contains { $0.isSyncActive }
+    }
+
     @Published private(set) var hasPendingConnections: Bool = false
 
     @Published var selectedOutputRate: Int = 120
@@ -223,7 +257,7 @@ final class DotManager: NSObject, ObservableObject {
     /// Refused if a sync is in progress to prevent corrupting `DotSyncManager` state.
     func disconnect(_ dot: Dot) {
         stateQueue.async {
-            guard !self.sessionPhase.isSyncActive else {
+            guard !self.registry.syncInProgress else {
                 print("⚠️ Disconnect refused — sync in progress")
                 return
             }
@@ -250,29 +284,54 @@ final class DotManager: NSObject, ObservableObject {
 
     // MARK: - Session (Unified Sync + Record)
 
-    /// Start a recording session.
+    /// Start a recording session for a specific runner.
     ///
-    /// If two or more sensors are connected, clocks are synchronized first to
-    /// align multi-sensor data. With a single sensor, recording starts immediately.
+    /// If two or more of the runner's sensors are connected, clocks are
+    /// synchronized first to align multi-sensor data. With a single sensor,
+    /// recording starts immediately.
     ///
     /// Flow: `idle` → `syncing` → `startingRecording` → `recording`
-    func beginSession() {
+    func beginSession(runnerId: String) {
         stateQueue.async {
-            guard self.sessionPhase == .idle || self.sessionPhase.isError else { return }
+            let currentPhase = self.runnerPhasesInternal[runnerId] ?? .idle
+            guard currentPhase == .idle || currentPhase.isError else { return }
 
             guard self.registry.connectQueue.isEmpty && self.registry.connectInProgress == nil else {
-                print("⛔ beginSession() blocked — connections still pending (queue=\(self.registry.connectQueue.count), inProgress=\(self.registry.connectInProgress ?? "nil"))")
+                print("⛔ beginSession(\(runnerId)) blocked — connections still pending (queue=\(self.registry.connectQueue.count), inProgress=\(self.registry.connectInProgress ?? "nil"))")
                 return
             }
 
-            let dots = self.registry.connectedDots.filter { dot in
-                let uuid = dot.address
-                let phase = self.registry.byUuid[uuid]?.connectionPhase ?? .idle
-                return phase == .ready
+            // DotSyncManager cannot handle concurrent sync calls.
+            let anotherSyncing = self.runnerPhasesInternal.contains { key, phase in
+                key != runnerId && phase.isSyncActive
+            }
+            if anotherSyncing {
+                print("⛔ beginSession(\(runnerId)) blocked — another runner is currently syncing")
+                self.setPhase(.error("Another session is syncing — please wait."), forRunner: runnerId)
+                return
+            }
+
+            guard let runner = RunnerStore.shared.runner(forId: runnerId) else {
+                print("⛔ beginSession(\(runnerId)) — runner not found")
+                return
+            }
+
+            let dots = runner.sensorUuids.compactMap { uuid -> Dot? in
+                guard let dotState = self.registry.byUuid[uuid],
+                      dotState.connectionPhase == .ready,
+                      let dot = dotState.dot else { return nil }
+                return dot
             }
             guard !dots.isEmpty else { return }
 
-            print("▶️ beginSession(): \(dots.count) dot(s) ready")
+            // Guard: none of these sensors are already recording
+            for dot in dots where dot.isRecording {
+                print("⛔ beginSession(\(runnerId)) blocked — sensor \(dot.address) is already recording")
+                self.setPhase(.error("Sensor \(dot.address) is already recording."), forRunner: runnerId)
+                return
+            }
+
+            print("▶️ beginSession(\(runnerId)): \(dots.count) dot(s) ready")
             for dot in dots {
                 let uuid = dot.address
                 let phase = self.registry.byUuid[uuid]?.connectionPhase ?? .idle
@@ -286,31 +345,37 @@ final class DotManager: NSObject, ObservableObject {
             }
 
             if dots.count >= 2 {
-                self.registry.syncingUuids = Set(dots.map { $0.device.uuid })
-                self.setPhase(.syncing)
-                self.performSync(dots: dots) { [weak self] success, errorMsg in
+                self.registry.syncingUuids.formUnion(dots.map { $0.device.uuid })
+                self.setPhase(.syncing, forRunner: runnerId)
+                self.performSync(dots: dots, runnerId: runnerId) { [weak self] success, errorMsg in
                     guard let self else { return }
                     if success {
-                        self.performStartRecording(dots: dots)
+                        self.performStartRecording(dots: dots, runnerId: runnerId)
                     } else {
-                        self.setPhase(.error(errorMsg ?? "Sync failed. Please try again."))
+                        self.setPhase(.error(errorMsg ?? "Sync failed. Please try again."), forRunner: runnerId)
                     }
                 }
             } else {
-                self.performStartRecording(dots: dots)
+                self.performStartRecording(dots: dots, runnerId: runnerId)
             }
         }
     }
 
-    /// Stop the active recording session.
+    /// Stop the recording session for a specific runner.
     ///
     /// Flow: `recording` → `stoppingRecording` → `idle`
-    func endSession() {
+    func endSession(runnerId: String) {
         stateQueue.async {
-            guard self.sessionPhase == .recording else { return }
+            guard self.runnerPhasesInternal[runnerId] == .recording else { return }
 
-            let dots = self.registry.connectedDots
-            self.setPhase(.stoppingRecording)
+            guard let runner = RunnerStore.shared.runner(forId: runnerId) else { return }
+            let dots = runner.sensorUuids.compactMap { uuid -> Dot? in
+                guard let dot = self.registry.dot(forUuid: uuid),
+                      dot.isConnected else { return nil }
+                return dot
+            }
+
+            self.setPhase(.stoppingRecording, forRunner: runnerId)
 
             self.operations.runAll(
                 dots: dots,
@@ -319,53 +384,92 @@ final class DotManager: NSObject, ObservableObject {
                 guard let self else { return }
                 self.stateQueue.async {
                     if success {
-                        self.registry.activeRecordingUuids.removeAll()
-                        self.setPhase(.idle)
-                        self.clearRecoveryState()
+                        self.setPhase(.idle, forRunner: runnerId)
                     } else {
-                        self.setPhase(.error("Failed to stop recording. Please try again."))
+                        self.setPhase(.error("Failed to stop recording. Please try again."), forRunner: runnerId)
                     }
                 }
             }
         }
     }
 
-    /// Clear an error state, returning to `idle` so the user can retry.
-    func dismissError() {
+    /// Clear an error state for a specific runner, returning to `idle` so the user can retry.
+    func dismissError(runnerId: String) {
         stateQueue.async {
-            if self.sessionPhase.isError {
-                self.setPhase(.idle)
+            if self.runnerPhasesInternal[runnerId]?.isError == true {
+                self.setPhase(.idle, forRunner: runnerId)
             }
         }
     }
 
-    /// Restore the `recording` phase after an app relaunch.
+    /// Restore `.recording` phase for runners whose sensors are still recording.
     ///
-    /// Called from `SyncView.onAppear` when the manager is `idle` but one or
+    /// Called from `SyncView.onAppear` when the manager is idle but one or
     /// more dots report `isRecording == true` (the sensors kept recording while
     /// the app was killed).
     func resumeRecordingSession() {
         stateQueue.async {
-            if self.sessionPhase == .idle {
-                self.setPhase(.recording)
+            for dot in self.registry.connectedDots where dot.isRecording {
+                if let runner = RunnerStore.shared.runner(forSensorUuid: dot.address) {
+                    let phase = self.runnerPhasesInternal[runner.id] ?? .idle
+                    if phase == .idle {
+                        self.setPhase(.recording, forRunner: runner.id)
+                    }
+                }
             }
         }
     }
 
+    // MARK: - Single-Runner Convenience
+
+    /// Fixed runner ID used in single-runner mode.
+    static let singleRunnerID = "__single__"
+
+    /// Single-runner mode: creates an ephemeral runner from all ready connected
+    /// sensors, then delegates to `beginSession(runnerId:)`.
+    func beginSession() {
+        stateQueue.async {
+            let readyUuids = self.registry.connectedDots
+                .filter { self.registry.byUuid[$0.address]?.connectionPhase == .ready }
+                .map { $0.address }
+            guard !readyUuids.isEmpty else { return }
+
+            DispatchQueue.main.async {
+                RunnerStore.shared.setRunner(
+                    Runner(id: Self.singleRunnerID, label: "Session", sensorUuids: readyUuids)
+                )
+                self.beginSession(runnerId: Self.singleRunnerID)
+            }
+        }
+    }
+
+    /// Single-runner mode: stops the ephemeral session.
+    func endSession() {
+        endSession(runnerId: Self.singleRunnerID)
+    }
+
+    /// Single-runner mode: clears the error on the ephemeral runner.
+    func dismissError() {
+        dismissError(runnerId: Self.singleRunnerID)
+    }
+
     // MARK: - Session Helpers
 
-    /// Single writer for `sessionPhase`. Must be called on `stateQueue`.
+    /// Single writer for per-runner session phase. Must be called on `stateQueue`.
     ///
     /// Also keeps `registry.syncInProgress` in lockstep — the registry flag is
     /// read by `dequeueNextConnection` to block new connections during sync, and
     /// is cheaper to check than dispatching to main for the published property.
-    private func setPhase(_ phase: SessionPhase) {
-        registry.syncInProgress = phase.isSyncActive
+    private func setPhase(_ phase: SessionPhase, forRunner runnerId: String) {
+        runnerPhasesInternal[runnerId] = phase
+        registry.syncInProgress = runnerPhasesInternal.values.contains { $0.isSyncActive }
         if !phase.isSyncActive {
-            registry.syncingUuids.removeAll()
+            let sensorUuids = Set(RunnerStore.shared.runner(forId: runnerId)?.sensorUuids ?? [])
+            registry.syncingUuids.subtract(sensorUuids)
         }
+        let snapshot = runnerPhasesInternal
         DispatchQueue.main.async {
-            self.sessionPhase = phase
+            self.runnerPhases = snapshot
         }
         notify()
     }
@@ -375,7 +479,7 @@ final class DotManager: NSObject, ObservableObject {
     /// The SDK internally disconnects and reconnects each device during sync;
     /// delegate methods suppress those events when `isSyncActive` is true.
     /// Completion is dispatched back to `stateQueue`.
-    private func performSync(dots: [Dot], completion: @escaping (Bool, String?) -> Void) {
+    private func performSync(dots: [Dot], runnerId: String, completion: @escaping (Bool, String?) -> Void) {
         // Snapshot device references now (on stateQueue) before sync mutates anything.
         // The registry freezes these references while syncInProgress is true.
         let devices = dots.map { $0.device }
@@ -430,11 +534,10 @@ final class DotManager: NSObject, ObservableObject {
 
     /// Issue start-recording to each dot sequentially. Must be called on `stateQueue`.
     /// `0xFFFF` tells the sensor to record indefinitely until explicitly stopped.
-    private func performStartRecording(dots: [Dot]) {
-        setPhase(.startingRecording)
-        print("🎙️ performStartRecording(): \(dots.map { $0.address })")
+    private func performStartRecording(dots: [Dot], runnerId: String) {
+        setPhase(.startingRecording, forRunner: runnerId)
+        print("🎙️ performStartRecording(\(runnerId)): \(dots.map { $0.address })")
 
-        let recordingUuids = Set(dots.map { $0.address })
         operations.runAll(
             dots: dots,
             operation: { dot, done in dot.startRecording(seconds: 0xFFFF, completion: done) }
@@ -442,11 +545,9 @@ final class DotManager: NSObject, ObservableObject {
             guard let self else { return }
             self.stateQueue.async {
                 if success {
-                    self.registry.activeRecordingUuids = recordingUuids
-                    self.setPhase(.recording)
-                    self.syncRecoveryPersistence()
+                    self.setPhase(.recording, forRunner: runnerId)
                 } else {
-                    self.setPhase(.error("Recording failed to start. Please try again."))
+                    self.setPhase(.error("Recording failed to start. Please try again."), forRunner: runnerId)
                 }
             }
         }
@@ -457,7 +558,7 @@ final class DotManager: NSObject, ObservableObject {
     /// Erase recorded data on every connected sensor. Only allowed when idle.
     func eraseAllFlash(completion: @escaping (Bool) -> Void) {
         stateQueue.async {
-            guard self.sessionPhase == .idle else {
+            guard self.runnerPhasesInternal.values.allSatisfy({ $0 == .idle || $0.isError }) else {
                 DispatchQueue.main.async { completion(false) }
                 return
             }
@@ -489,6 +590,7 @@ final class DotManager: NSObject, ObservableObject {
             self?.stateQueue.async {
                 guard let self else { return }
                 let uuid = dot.device.uuid
+                debugLog("RECONNECT: refreshStorage completed uuid=\(uuid) success=\(success)")
                 self.registry.initializationInProgress.remove(uuid)
 
                 guard success else {
@@ -505,9 +607,58 @@ final class DotManager: NSObject, ObservableObject {
                 // SDK does not push this automatically, so isRecording stays stale otherwise.
                 dot.refreshRecordingStatus()
 
+                // If the sensor is still recording (e.g. after BT reset or app relaunch),
+                // restore the runner's phase so the UI reflects the active session.
+                if dot.isRecording,
+                   let runner = RunnerStore.shared.runner(forSensorUuid: uuid) {
+                    let phase = self.runnerPhasesInternal[runner.id] ?? .idle
+                    if phase == .idle || phase.isError {
+                        print("🔄 [\(uuid)] Restoring .recording for runner \(runner.id)")
+                        self.setPhase(.recording, forRunner: runner.id)
+                    }
+                }
+
                 self.notify()
             }
         } completion: {}
+    }
+
+    /// Check if a sensor is still recording after reconnect and either skip
+    /// flash queries (recording sensors won't respond) or run the normal
+    /// `refreshStorage` path. Must be called on `stateQueue`.
+    ///
+    /// Uses `checkRecordingStatus(completion:)` which waits for the SDK callback
+    /// before returning — avoids the race where `refreshRecordingStatus()` is async
+    /// and `isRecording` hasn't updated by the time we check it.
+    private func initializeAfterConnect(dot: Dot, settleDelay: TimeInterval = 0) {
+        let uuid = dot.address
+
+        dot.checkRecordingStatus { [weak self] isRecording in
+            guard let self else { return }
+            self.stateQueue.async {
+                debugLog("RECONNECT: uuid=\(uuid) isRecording=\(isRecording)")
+
+                if isRecording {
+                    debugLog("RECONNECT: taking recording path")
+                    print("⏳ [\(uuid)] Still recording — skipping flash query")
+                    self.registry.initializationInProgress.remove(uuid)
+                    self.registry.setConnectionPhase(uuid, .ready)
+                    print("✅ [\(uuid)] phase now .ready (recording device, flash skipped)")
+
+                    if let runner = RunnerStore.shared.runner(forSensorUuid: uuid) {
+                        let phase = self.runnerPhasesInternal[runner.id] ?? .idle
+                        if phase == .idle || phase.isError {
+                            print("🔄 [\(uuid)] Restoring .recording for runner \(runner.id)")
+                            self.setPhase(.recording, forRunner: runner.id)
+                        }
+                    }
+                    self.notify()
+                } else {
+                    debugLog("RECONNECT: taking refreshStorage path")
+                    self.refreshStorage(dots: [dot], settleDelay: settleDelay)
+                }
+            }
+        }
     }
 
     /// Snapshot registry state and push it to `@Published` properties on the main thread.
@@ -619,7 +770,8 @@ extension DotManager: DotConnectionDelegate {
             // During sync the SDK internally reconnects each sensor.
             // Update the device reference but skip the full initialization
             // path — the dots were never shown as disconnected to the user.
-            if self.sessionPhase.isSyncActive {
+            // Only suppress sensors that are part of the active sync operation.
+            if self.registry.syncInProgress && self.registry.syncingUuids.contains(device.uuid) {
                 self.registry.recordReconnection(device)
                 return
             }
@@ -642,18 +794,7 @@ extension DotManager: DotConnectionDelegate {
                 }
 
                 if let dot = self.registry.dot(forUuid: device.uuid) {
-                    if self.registry.uuidsRecordingOnDisconnect.contains(device.uuid) {
-                        // Device is still recording — getFlashInfo won't respond.
-                        // Mark ready immediately; sessionPhase stays .recording.
-                        print("⏳ [\(device.uuid)] Was recording before disconnect — skipping flash query (auto-reconnect)")
-                        self.registry.uuidsRecordingOnDisconnect.remove(device.uuid)
-                        self.registry.setConnectionPhase(device.uuid, .ready)
-                        print("✅ [\(device.uuid)] phase now .ready (recording device, flash skipped)")
-                        dot.refreshRecordingStatus()
-                        self.syncRecoveryPersistence()
-                    } else {
-                        self.refreshStorage(dots: [dot])
-                    }
+                    self.initializeAfterConnect(dot: dot)
                 }
                 self.notify()
                 return
@@ -677,37 +818,7 @@ extension DotManager: DotConnectionDelegate {
             }
 
             if let dot = self.registry.dot(forUuid: device.uuid) {
-                if self.registry.uuidsRecordingOnDisconnect.contains(device.uuid) {
-                    // Per-device disconnect path — device is still recording.
-                    // sessionPhase remains .recording (was never cleared), so no restore needed.
-                    print("⏳ [\(device.uuid)] Was recording before disconnect — skipping flash query")
-                    self.registry.uuidsRecordingOnDisconnect.remove(device.uuid)
-                    self.registry.initializationInProgress.remove(device.uuid)
-                    self.registry.setConnectionPhase(device.uuid, .ready)
-                    print("✅ [\(device.uuid)] phase now .ready (recording device, flash skipped)")
-                    dot.refreshRecordingStatus()
-                    self.syncRecoveryPersistence()
-                } else if self.registry.activeRecordingUuids.contains(device.uuid) {
-                    // Recording session reconnect — BT reset or app relaunch while recording.
-                    // Device is still recording; getFlashInfo won't respond. Skip it.
-                    // Every dot in the session uses this path independently, so no
-                    // flag is consumed here — activeRecordingUuids stays intact until endSession.
-                    print("⏳ [\(device.uuid)] Part of active recording session — skipping flash query")
-                    self.registry.initializationInProgress.remove(device.uuid)
-                    self.registry.setConnectionPhase(device.uuid, .ready)
-                    print("✅ [\(device.uuid)] phase now .ready (recording device, flash skipped)")
-                    dot.refreshRecordingStatus()
-                    print("🔄 Restoring recording session phase after reconnect")
-                    self.setPhase(.recording)
-                } else {
-                    if isReconnect {
-                        print("⏳ [\(device.uuid)] Reconnect — will settle \(settleDelay)s after isInitialized")
-                    } else {
-                        print("⏳ [\(device.uuid)] Queuing initialization & storage refresh...")
-                    }
-                    // refreshStorage will set phase to .ready on completion
-                    self.refreshStorage(dots: [dot], settleDelay: settleDelay)
-                }
+                self.initializeAfterConnect(dot: dot, settleDelay: settleDelay)
 
                 self.registry.advanceConnectQueue()
                 self.processConnectQueue()
@@ -719,8 +830,9 @@ extension DotManager: DotConnectionDelegate {
     func onDeviceConnectFailed(_ device: DotDevice) {
         print("❌ Connect failed: \(device.uuid)")
         stateQueue.async {
-            // During sync the SDK manages connections itself — don't interfere.
-            if self.sessionPhase.isSyncActive { return }
+            // During sync the SDK manages connections itself — don't interfere
+            // with sensors that are part of the active sync operation.
+            if self.registry.syncInProgress && self.registry.syncingUuids.contains(device.uuid) { return }
             self.cancelConnectTimer(device.uuid)
             self.registry.setConnectionPhase(device.uuid, .failed("Connection failed"))
             self.registry.advanceConnectQueue()
@@ -733,21 +845,10 @@ extension DotManager: DotConnectionDelegate {
         guard !device.uuid.isEmpty else { return }
         print("⛓️‍💥 Disconnected: \(device.uuid)")
         stateQueue.async {
-            if self.sessionPhase.isSyncActive {
+            if self.registry.syncInProgress && self.registry.syncingUuids.contains(device.uuid) {
                 // SDK-managed disconnect during sync — ignore entirely.
                 // The dots remain visually "connected" throughout the sync process.
                 return
-            }
-
-            // Capture per-device recording state before clearing it.
-            // This is the per-device path; the BT-manager-reset path uses
-            // wasRecordingBeforeDisconnect set in onManagerStateUpdate instead.
-            if self.sessionPhase == .recording,
-               let dot = self.registry.dot(forUuid: device.uuid),
-               dot.isRecording {
-                self.registry.uuidsRecordingOnDisconnect.insert(device.uuid)
-                print("📝 [\(device.uuid)] Was recording on disconnect — flagged for recording-aware reconnect")
-                self.syncRecoveryPersistence()
             }
 
             self.registry.recordDisconnection(device.uuid)
@@ -786,10 +887,11 @@ extension DotManager: DotConnectionDelegate {
             case .poweredOff, .resetting:
                 print("⚠️ Bluetooth powered OFF/RESET")
                 self.cancelAllConnectTimers()
-                self.registry.clearBusyFlags()   // clears uuidsRecordingOnDisconnect; activeRecordingUuids survives
+                self.registry.clearBusyFlags()
                 self.registry.markAllDisconnected()
-                self.setPhase(.error("Bluetooth disconnected."))
-                self.syncRecoveryPersistence()   // persists activeRecordingUuids so every dot can recover
+                for (runnerId, phase) in self.runnerPhasesInternal where phase != .idle {
+                    self.setPhase(.error("Bluetooth disconnected."), forRunner: runnerId)
+                }
 
             case .unauthorized, .unsupported:
                 print("❌ Bluetooth Error: \(managerState.rawValue)")
@@ -801,79 +903,3 @@ extension DotManager: DotConnectionDelegate {
     }
 }
 
-// MARK: - Persistence
-
-/// Minimal persistence for reconnect recovery state.
-///
-/// Two values survive app kills:
-///   - `activeRecordingUuids`       — all dots in the current recording session.
-///                                    Used by every reconnecting dot (BT reset or relaunch).
-///   - `uuidsRecordingOnDisconnect` — dots that individually disconnected mid-session.
-///                                    Used by per-device disconnect reconnect path.
-///
-/// The file is written atomically after every mutation and deleted when the session
-/// ends normally or both sets are empty.
-extension DotManager {
-
-    private struct SessionRecoveryState: Codable {
-        var activeRecordingUuids: [String]
-        var uuidsRecordingOnDisconnect: [String]
-    }
-
-    private var recoveryStateURL: URL? {
-        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first?
-            .appendingPathComponent("session_recovery.json")
-    }
-
-    /// Snapshot both sets and write (or delete) the JSON file.
-    /// Must be called on `stateQueue` — reads registry directly without locking.
-    func syncRecoveryPersistence() {
-        let active = registry.activeRecordingUuids
-        let onDisconnect = registry.uuidsRecordingOnDisconnect
-        guard let url = recoveryStateURL else { return }
-
-        guard !active.isEmpty || !onDisconnect.isEmpty else {
-            // Nothing to recover — remove any stale file.
-            DispatchQueue.global(qos: .utility).async {
-                try? FileManager.default.removeItem(at: url)
-            }
-            return
-        }
-
-        let state = SessionRecoveryState(
-            activeRecordingUuids: Array(active),
-            uuidsRecordingOnDisconnect: Array(onDisconnect)
-        )
-        guard let data = try? JSONEncoder().encode(state) else { return }
-        DispatchQueue.global(qos: .utility).async {
-            try? data.write(to: url, options: .atomic)
-        }
-    }
-
-    /// Read the persisted file and apply recovery state to the registry.
-    /// Called once from `activate()` before any connections are made.
-    func restoreRecoveryState() {
-        guard let url = recoveryStateURL,
-              let data = try? Data(contentsOf: url),
-              let state = try? JSONDecoder().decode(SessionRecoveryState.self, from: data)
-        else { return }
-
-        stateQueue.async {
-            if !state.activeRecordingUuids.isEmpty {
-                self.registry.activeRecordingUuids.formUnion(state.activeRecordingUuids)
-            }
-            if !state.uuidsRecordingOnDisconnect.isEmpty {
-                self.registry.uuidsRecordingOnDisconnect.formUnion(state.uuidsRecordingOnDisconnect)
-            }
-            print("🔄 Restored recovery state: active=\(state.activeRecordingUuids) onDisconnect=\(state.uuidsRecordingOnDisconnect)")
-        }
-    }
-
-    /// Delete the persisted recovery file. Called when recording ends normally.
-    func clearRecoveryState() {
-        guard let url = recoveryStateURL else { return }
-        DispatchQueue.global(qos: .utility).async {
-            try? FileManager.default.removeItem(at: url)
-        }
-    }
-}

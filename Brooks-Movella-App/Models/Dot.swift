@@ -63,6 +63,9 @@ final class Dot: ObservableObject, Identifiable {
     private var flashInfoInFlight = false
     private var flashInfoWaiters: [(Bool) -> Void] = []
 
+    /// One-shot completion for the next recording status query. Accessed only on `sdkQueue`.
+    private var recordingStatusCompletion: ((Bool) -> Void)?
+
     /// Single-flight guard for `getExportFileInfo`. Accessed only on `sdkQueue`.
     private var exportFileInfoInFlight = false
 
@@ -96,13 +99,19 @@ final class Dot: ObservableObject, Identifiable {
         let device = self.device
         device.recording.updateRecordingStatus = { [weak self] status in
             guard let self else { return }
+            let isRec: Bool
             switch status {
-            case .isRecording:
-                self.setOnMain { self.isRecording = true }
-            case .isRecordingStopped, .isIdle:
-                self.setOnMain { self.isRecording = false }
-            default:
-                break
+            case .isRecording: isRec = true
+            case .isRecordingStopped, .isIdle: isRec = false
+            default: return
+            }
+            self.setOnMain { self.isRecording = isRec }
+            // Fire one-shot completion if pending
+            self.sdkQueue.async {
+                if let cb = self.recordingStatusCompletion {
+                    self.recordingStatusCompletion = nil
+                    cb(isRec)
+                }
             }
         }
     }
@@ -150,6 +159,30 @@ final class Dot: ObservableObject, Identifiable {
     /// Polls the SDK for the current recording state (push isn't always reliable).
     func refreshRecordingStatus() {
         sdkQueue.async { self.device.getRecordingStatus() }
+    }
+
+    /// Queries the SDK for current recording state and calls completion with the result.
+    /// Completion fires on `sdkQueue`. Includes a 3s timeout (assumes not recording on timeout).
+    func checkRecordingStatus(completion: @escaping (Bool) -> Void) {
+        sdkQueue.async {
+            var hasCompleted = false
+            self.recordingStatusCompletion = { isRec in
+                guard !hasCompleted else { return }
+                hasCompleted = true
+                completion(isRec)
+            }
+            self.device.getRecordingStatus()
+
+            // Timeout — if SDK doesn't respond, assume not recording
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
+                self?.sdkQueue.async {
+                    guard !hasCompleted else { return }
+                    hasCompleted = true
+                    self?.recordingStatusCompletion = nil
+                    completion(false)
+                }
+            }
+        }
     }
 
     // MARK: - Flash Storage

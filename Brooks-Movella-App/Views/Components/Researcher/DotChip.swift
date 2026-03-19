@@ -1,15 +1,16 @@
 import SwiftUI
 
 struct DotChip: View {
-    let dot: MockDot
+    @ObservedObject var dot: Dot
     var isSelected: Bool = false
+    var onTap: (() -> Void)? = nil
     var onUnassign: (() -> Void)? = nil
 
+    @ObservedObject private var nameStore = SensorNameStore.shared
     @State private var isIdentifying = false
-    @State private var blinkPhase = false
 
     private var storageColor: Color {
-        dot.storagePercent >= 70 ? .orange : .green
+        dot.storagePercentageUsed >= 70 ? .orange : .green
     }
 
     private var borderColor: Color {
@@ -23,7 +24,7 @@ struct DotChip: View {
                 Circle()
                     .fill(Color.blue.opacity(0.7))
                     .frame(width: 6, height: 6)
-                Text(dot.id)
+                Text(nameStore.name(for: dot.address))
                     .font(.system(.caption, design: .monospaced))
                     .lineLimit(1)
                     .minimumScaleFactor(0.7)
@@ -44,12 +45,13 @@ struct DotChip: View {
                         .fill(Color.gray.opacity(0.25))
                     RoundedRectangle(cornerRadius: 2)
                         .fill(storageColor)
-                        .frame(width: geo.size.width * CGFloat(dot.storagePercent) / 100)
+                        .frame(width: geo.size.width * min(dot.storagePercentageUsed / 100, 1.0))
                 }
             }
             .frame(height: 4)
 
-            Text("\(dot.storagePercent)%\(dot.storagePercent >= 70 ? "!" : "")")
+            let pct = Int(dot.storagePercentageUsed)
+            Text("\(pct)%\(pct >= 70 ? "!" : "")")
                 .font(.system(.caption2, design: .monospaced))
                 .foregroundColor(storageColor)
         }
@@ -58,7 +60,7 @@ struct DotChip: View {
         .frame(width: 92)
         .background(
             isIdentifying
-                ? Color.orange.opacity(blinkPhase ? 0.85 : 0.25)
+                ? Color.orange.opacity(0.25)
                 : Color(.tertiarySystemBackground)
         )
         .cornerRadius(8)
@@ -72,6 +74,10 @@ struct DotChip: View {
         .shadow(color: isSelected ? Color.blue.opacity(0.35) : .clear, radius: 5, x: 0, y: 0)
         .scaleEffect(isSelected ? 1.06 : 1.0)
         .animation(.easeInOut(duration: 0.2), value: isSelected)
+        .animation(.easeInOut(duration: 0.3), value: isIdentifying)
+        .onTapGesture {
+            onTap?()
+        }
         .gesture(
             TapGesture(count: 2).onEnded { triggerIdentify() }
         )
@@ -80,12 +86,9 @@ struct DotChip: View {
     private func triggerIdentify() {
         guard !isIdentifying else { return }
         isIdentifying = true
-        withAnimation(.easeInOut(duration: 0.3).repeatForever(autoreverses: true)) {
-            blinkPhase = true
-        }
+        dot.identify()
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
-            isIdentifying = false
-            blinkPhase = false
+            if isIdentifying { isIdentifying = false }
         }
     }
 }
