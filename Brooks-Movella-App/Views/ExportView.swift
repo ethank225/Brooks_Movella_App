@@ -23,25 +23,47 @@ struct ExportView: View {
 
     var body: some View {
         NavigationView {
-            ScrollView {
-                VStack(spacing: 16) {
-                    if exportManager.hasRestoredTasks {
-                        RestoredTasksBanner(exportManager: exportManager) {
-                            showCart = true
+            VStack(spacing: 0) {
+                ScrollView {
+                    VStack(spacing: 16) {
+                        if exportManager.hasRestoredTasks {
+                            RestoredTasksBanner(exportManager: exportManager) {
+                                showCart = true
+                            }
+                            .padding(.horizontal)
+                        }
+                        recordingsContent
+                        Spacer()
+                    }
+                    .padding(.top)
+                }
+                .refreshable {
+                    guard !isAnyRecording else { return }
+                    if hasInitializingSensors {
+                        showInitializingAlert = true
+                    } else {
+                        exportManager.fetchRecordings(for: connectedDots)
+                    }
+                }
+
+                if !exportManager.selectedIDs.isEmpty {
+                    VStack(spacing: 0) {
+                        Divider()
+                        FullWidthButton(
+                            icon: "cart.badge.plus",
+                            label: "Add \(exportManager.selectedIDs.count) to Cart",
+                            color: .purple
+                        ) {
+                            if exportManager.hasRestoredTasks {
+                                showClearConfirmation = true
+                            } else {
+                                exportManager.buildCart()
+                            }
                         }
                         .padding(.horizontal)
+                        .padding(.vertical, 12)
                     }
-                    recordingsContent
-                    Spacer()
-                }
-                .padding(.top)
-            }
-            .refreshable {
-                guard !isAnyRecording else { return }
-                if hasInitializingSensors {
-                    showInitializingAlert = true
-                } else {
-                    exportManager.fetchRecordings(for: connectedDots)
+                    .background(.ultraThinMaterial)
                 }
             }
             .alert("Clear Previous Results?", isPresented: $showClearConfirmation) {
@@ -81,9 +103,9 @@ struct ExportView: View {
             .navigationTitle("Export")
             .toolbar {
                 #if DEBUG
-                
+
                 //If you just want to sample the export, then uncomment this
-                
+
                 ToolbarItem(placement: .navigationBarLeading) {
                     Button {
                         showMockTest = true
@@ -172,21 +194,6 @@ struct ExportView: View {
                     )
                     .animation(.easeInOut(duration: 0.25), value: files == nil)
                 }
-            }
-
-            if !exportManager.selectedIDs.isEmpty {
-                FullWidthButton(
-                    icon: "cart.badge.plus",
-                    label: "Add \(exportManager.selectedIDs.count) to Cart",
-                    color: .purple
-                ) {
-                    if exportManager.hasRestoredTasks {
-                        showClearConfirmation = true
-                    } else {
-                        exportManager.buildCart()
-                    }
-                }
-                .padding(.horizontal)
             }
         }
     }
