@@ -6,7 +6,6 @@ struct DotChip: View {
     var onTap: (() -> Void)? = nil
     var onUnassign: (() -> Void)? = nil
 
-    @ObservedObject private var nameStore = SensorNameStore.shared
     @State private var isIdentifying = false
 
     private var storageColor: Color {
@@ -24,7 +23,7 @@ struct DotChip: View {
                 Circle()
                     .fill(Color.blue.opacity(0.7))
                     .frame(width: 6, height: 6)
-                Text(nameStore.name(for: dot.address))
+                Text(dot.displayName)
                     .font(.system(.caption, design: .monospaced))
                     .lineLimit(1)
                     .minimumScaleFactor(0.7)

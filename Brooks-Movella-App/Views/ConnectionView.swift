@@ -17,6 +17,18 @@ struct ConnectionView: View {
     // Timer to force scan retries
     @State private var timer = Timer.publish(every: 1.0, on: .main, in: .common).autoconnect()
 
+    // Erase state
+    @State private var eraseTargetUuid: String?
+    @State private var showEraseConfirmation = false
+    @State private var showEraseAllConfirmation = false
+    @State private var erasingUuids: Set<String> = []
+
+    private var canEraseAll: Bool {
+        manager.connectedDots.contains { $0.connectionPhase == .ready }
+        && manager.sessionPhase == .idle
+        && !manager.isErasing
+    }
+
     private var discoveredList: [DotDevice] {
         manager.discovered.sorted { left, right in
             manager.displayAddress(for: left) < manager.displayAddress(for: right)
@@ -49,6 +61,67 @@ struct ConnectionView: View {
             ScrollView {
                 VStack(spacing: 16) {
 
+                    // MARK: - Control Bar
+
+                    HStack {
+                        // Research Mode toggle
+                        Button {
+                            if !runnerStore.isMultiRunnerMode {
+                                if runnerStore.runners.contains(where: { $0.id == DotManager.singleRunnerID }) {
+                                    let newId = UUID().uuidString
+                                    manager.promoteSingleRunner(to: newId, label: "Runner A")
+                                }
+                                runnerStore.isMultiRunnerMode = true
+                            } else {
+                                let hasRealRunners = runnerStore.runners.contains { $0.id != DotManager.singleRunnerID }
+                                let hasActivePhase = manager.runnerPhases.contains { $0.key != DotManager.singleRunnerID && $0.value != .idle }
+                                if hasRealRunners || hasActivePhase {
+                                    modeToggleAlertMessage = "Remove all runners before switching to single runner mode."
+                                    showModeToggleAlert = true
+                                } else {
+                                    runnerStore.isMultiRunnerMode = false
+                                }
+                            }
+                        } label: {
+                            HStack(spacing: 4) {
+                                Image(systemName: runnerStore.isMultiRunnerMode
+                                      ? "person.2.fill" : "person.2")
+                                    .font(.subheadline)
+                                Text("Research")
+                                    .font(.subheadline)
+                            }
+                            .foregroundColor(runnerStore.isMultiRunnerMode ? .blue : .secondary)
+                        }
+                        .frame(minWidth: 0, maxWidth: .infinity)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 10)
+                        .background(.ultraThinMaterial)
+                        .cornerRadius(10)
+
+                        Spacer()
+
+                        // Erase All
+                        Button {
+                            showEraseAllConfirmation = true
+                        } label: {
+                            HStack(spacing: 4) {
+                                Image(systemName: "trash")
+                                    .font(.subheadline)
+                                Text("Erase All")
+                                    .font(.subheadline)
+                            }
+                            .foregroundColor(.red)
+                        }
+                        .disabled(!canEraseAll)
+                        .opacity(canEraseAll ? 1 : 0.4)
+                        .frame(minWidth: 0, maxWidth: .infinity)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 10)
+                        .background(.ultraThinMaterial)
+                        .cornerRadius(10)
+                    }
+                    .padding(.horizontal)
+
                     // MARK: - Session Busy Banner
 
                     if manager.sessionPhase.isBusy {
@@ -63,6 +136,24 @@ struct ConnectionView: View {
                         }
                         .padding()
                         .background(sessionBusyColor.opacity(0.1))
+                        .cornerRadius(8)
+                        .padding(.horizontal)
+                    }
+
+                    // MARK: - Erasing Banner
+
+                    if manager.isErasing {
+                        HStack(spacing: 8) {
+                            ProgressView()
+                                .progressViewStyle(CircularProgressViewStyle(tint: .pink))
+                                .scaleEffect(0.8)
+                            Text("Erasing flash storage…")
+                                .font(.subheadline)
+                                .foregroundColor(.pink)
+                            Spacer()
+                        }
+                        .padding()
+                        .background(Color.pink.opacity(0.1))
                         .cornerRadius(8)
                         .padding(.horizontal)
                     }
@@ -102,22 +193,34 @@ struct ConnectionView: View {
                             ForEach(discoveredList, id: \.uuid) { device in
                                 let uuid = device.uuid
                                 let phase = manager.connectionPhase(forUuid: uuid)
-                                let hasCustomName = nameStore.names[uuid] != nil
-                                let displayTitle = hasCustomName ? nameStore.name(for: uuid) : "DOT \(uuid)"
+                                let dot = manager.dot(forUuid: uuid)
+                                let displayTitle = dot?.displayName
+                                    ?? nameStore.names[uuid]
+                                    ?? Self.shortMac(from: manager.displayAddress(for: device))
+                                let isErasing = erasingUuids.contains(uuid)
+                                let canErase = phase == .ready
+                                    && !(dot?.isRecording ?? false)
+                                    && !isErasing
+                                    && !manager.sessionPhase.isBusy
 
                                 DeviceRow(
                                     title: displayTitle,
-                                    subtitle: manager.displayAddress(for: device),
                                     phase: phase,
                                     isIdentifying: identifyingUuid == uuid,
-                                    batteryLevel: manager.dot(forUuid: uuid)?.device.battery?.value as? Int,
+                                    dot: dot,
                                     sessionBusy: manager.sessionPhase.isBusy,
+                                    isErasing: isErasing,
+                                    canErase: canErase,
                                     isEditing: editingUuid == uuid,
                                     editText: editingUuid == uuid ? $editText : nil,
                                     onToggle: { toggleConnection(device) },
+                                    onErase: {
+                                        eraseTargetUuid = uuid
+                                        showEraseConfirmation = true
+                                    },
                                     onNameTap: phase.isConnected ? {
                                         editingUuid = uuid
-                                        editText = hasCustomName ? nameStore.name(for: uuid) : ""
+                                        editText = nameStore.names[uuid] ?? ""
                                     } : nil,
                                     onNameCommit: {
                                         nameStore.setName(editText, for: uuid)
@@ -137,37 +240,6 @@ struct ConnectionView: View {
             }
             .navigationTitle("Connect")
             .toolbar {
-                ToolbarItem(placement: .navigationBarLeading) {
-                    Button {
-                        if !runnerStore.isMultiRunnerMode {
-                            // single → multi: always allowed
-                            if runnerStore.runners.contains(where: { $0.id == DotManager.singleRunnerID }) {
-                                let newId = UUID().uuidString
-                                manager.promoteSingleRunner(to: newId, label: "Runner A")
-                            }
-                            runnerStore.isMultiRunnerMode = true
-                        } else {
-                            // multi → single: blocked if real runners exist or any phase is active
-                            let hasRealRunners = runnerStore.runners.contains { $0.id != DotManager.singleRunnerID }
-                            let hasActivePhase = manager.runnerPhases.contains { $0.key != DotManager.singleRunnerID && $0.value != .idle }
-                            if hasRealRunners || hasActivePhase {
-                                modeToggleAlertMessage = "Remove all runners before switching to single runner mode."
-                                showModeToggleAlert = true
-                            } else {
-                                runnerStore.isMultiRunnerMode = false
-                            }
-                        }
-                    } label: {
-                        HStack(spacing: 4) {
-                            Image(systemName: runnerStore.isMultiRunnerMode
-                                  ? "person.2.fill" : "person.2")
-                                .font(.subheadline)
-                            Text("Research")
-                                .font(.caption)
-                        }
-                        .foregroundColor(runnerStore.isMultiRunnerMode ? .blue : .secondary)
-                    }
-                }
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Button {
                         manager.startScan()
@@ -175,13 +247,18 @@ struct ConnectionView: View {
                         if manager.isScanning { ProgressView() }
                         else { Image(systemName: "arrow.clockwise") }
                     }
-                    .disabled(manager.isScanning)
+                    .disabled(manager.isScanning || manager.sessionPhase.isBusy || manager.isErasing)
                 }
             }
             .alert("Cannot Switch Modes", isPresented: $showModeToggleAlert) {
                 Button("OK", role: .cancel) {}
             } message: {
                 Text(modeToggleAlertMessage)
+            }
+            .onChange(of: editText) { newValue in
+                if let uuid = editingUuid {
+                    nameStore.setName(newValue, for: uuid)
+                }
             }
             .refreshable { manager.startScan() }
             .onAppear {
@@ -197,7 +274,27 @@ struct ConnectionView: View {
                     manager.startScan()
                 }
             }
+            .confirmationDialog("Erase flash storage?", isPresented: $showEraseConfirmation, titleVisibility: .visible) {
+                Button("Erase", role: .destructive) { eraseSingle() }
+                Button("Cancel", role: .cancel) { eraseTargetUuid = nil }
+            } message: {
+                Text("This will permanently delete all recorded data on this sensor.")
+            }
+            .confirmationDialog("Erase all flash storage?", isPresented: $showEraseAllConfirmation, titleVisibility: .visible) {
+                Button("Erase All", role: .destructive) { eraseAll() }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("This will permanently delete all recorded data on every connected sensor.")
+            }
         }
+    }
+
+    private static func shortMac(from mac: String) -> String {
+        let octets = mac.split(separator: ":")
+        if octets.count >= 3 {
+            return octets.suffix(3).joined(separator: ":")
+        }
+        return mac
     }
 
     private func toggleConnection(_ device: DotDevice) {
@@ -227,173 +324,203 @@ struct ConnectionView: View {
             }
         }
     }
+
+    private func eraseSingle() {
+        guard let uuid = eraseTargetUuid,
+              let dot = manager.dot(forUuid: uuid) else { return }
+        erasingUuids.insert(uuid)
+        manager.isErasing = true
+        dot.eraseFlash { _ in
+            DispatchQueue.main.async {
+                self.erasingUuids.remove(uuid)
+                self.manager.isErasing = false
+            }
+        }
+        eraseTargetUuid = nil
+    }
+
+    private func eraseAll() {
+        let readyUuids = manager.connectedDots
+            .filter { $0.connectionPhase == .ready }
+            .map(\.address)
+        erasingUuids.formUnion(readyUuids)
+        manager.eraseAllFlash { _ in
+            DispatchQueue.main.async { erasingUuids.removeAll() }
+        }
+    }
 }
 
 // MARK: - Device Row
 
 struct DeviceRow: View {
     let title: String
-    let subtitle: String
     let phase: ConnectionPhase
     var isIdentifying: Bool = false
-    var batteryLevel: Int? = nil
+    var dot: Dot? = nil
     var sessionBusy: Bool = false
+    var isErasing: Bool = false
+    var canErase: Bool = false
     var isEditing: Bool = false
     var editText: Binding<String>? = nil
     let onToggle: () -> Void
+    var onErase: (() -> Void)? = nil
     var onNameTap: (() -> Void)? = nil
     var onNameCommit: (() -> Void)? = nil
     var onIdentify: (() -> Void)? = nil
 
     @FocusState private var isFieldFocused: Bool
+    @State private var eraseBreathe = false
 
     private var isBusy: Bool { phase.isBusy }
 
-    private func batteryIcon(for level: Int) -> String {
-        switch level {
-        case 75...: return "battery.100"
-        case 50..<75: return "battery.75"
-        case 25..<50: return "battery.50"
-        default: return "battery.25"
+    @ViewBuilder
+    private var rowBackgroundView: some View {
+        if isErasing {
+            Color.pink
+                .opacity(eraseBreathe ? 0.25 : 0.06)
+                .onAppear {
+                    withAnimation(.easeInOut(duration: 1.2).repeatForever(autoreverses: true)) {
+                        eraseBreathe = true
+                    }
+                }
+        } else if isIdentifying {
+            Color.orange.opacity(0.08)
+        } else if phase.isFailed {
+            Color.orange.opacity(0.06)
+        } else if phase.isConnected {
+            Color.green.opacity(0.06)
+        } else {
+            Color.gray.opacity(0.1)
         }
-    }
-
-    private func batteryColor(for level: Int) -> Color {
-        if level <= 15 { return .red }
-        if level <= 30 { return .orange }
-        return .secondary
-    }
-
-    private var statusText: String? {
-        if isIdentifying { return "Identifying…" }
-        switch phase {
-        case .connecting: return "Connecting…"
-        case .initializing: return "Initializing…"
-        case .ready: return nil
-        case .failed(let msg): return msg
-        case .idle: return nil
-        }
-    }
-
-    private var rowBackground: Color {
-        if isIdentifying {
-            return Color.orange.opacity(0.08)
-        }
-        if phase.isFailed {
-            return Color.orange.opacity(0.06)
-        }
-        if phase.isConnected {
-            return Color.green.opacity(0.06)
-        }
-        return Color.gray.opacity(0.1)
     }
 
     var body: some View {
-        HStack(spacing: 12) {
-            if isIdentifying {
-                Image(systemName: "light.beacon.max.fill")
-                    .foregroundColor(.orange)
-                    .font(.caption)
-                    .symbolEffect(.pulse)
-            } else if phase.isFailed {
-                Image(systemName: "exclamationmark.triangle.fill")
-                    .foregroundColor(.orange)
-                    .font(.caption)
-            } else {
-                Circle()
-                    .fill(phase.isConnected ? Color.green : Color.gray.opacity(0.3))
-                    .frame(width: 12, height: 12)
-            }
+        VStack(alignment: .leading, spacing: 10) {
+            // MARK: Top line — status dot + name + trash + toggle
+            HStack(spacing: 10) {
+                if isIdentifying {
+                    Image(systemName: "light.beacon.max.fill")
+                        .foregroundColor(.orange)
+                        .font(.system(size: 10))
+                        .symbolEffect(.pulse)
+                } else if phase.isFailed {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundColor(.orange)
+                        .font(.system(size: 10))
+                } else {
+                    Circle()
+                        .fill(phase.isConnected ? Color.green : Color.gray.opacity(0.3))
+                        .frame(width: 10, height: 10)
+                }
 
-            VStack(alignment: .leading, spacing: 4) {
-                HStack(spacing: 4) {
-                    if isEditing, let editText {
-                        TextField("e.g. Left Foot", text: editText)
-                            .font(.subheadline)
-                            .textFieldStyle(.plain)
-                            .focused($isFieldFocused)
-                            .onSubmit { onNameCommit?() }
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    } else {
-                        Text(title)
-                            .font(.subheadline)
-                            .lineLimit(1)
-                            .truncationMode(.tail)
-                            .foregroundColor(onNameTap != nil ? .primary.opacity(0.8) : .primary)
-                            .underline(onNameTap != nil, color: .secondary.opacity(0.3))
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .contentShape(Rectangle())
+                if isEditing, let editText {
+                    TextField("e.g. Left Foot", text: editText)
+                        .font(.headline)
+                        .textFieldStyle(.plain)
+                        .focused($isFieldFocused)
+                        .onSubmit { onNameCommit?() }
+                } else {
+                    Text(title)
+                        .font(.headline)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .contentShape(Rectangle())
+                        .onTapGesture { onNameTap?() }
+
+                    if onNameTap != nil && !isBusy {
+                        Image(systemName: "pencil")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
                             .onTapGesture { onNameTap?() }
                     }
-                    if isBusy {
+                }
+
+                if isBusy {
+                    ProgressView()
+                        .scaleEffect(0.75)
+                        .fixedSize()
+                }
+
+                Spacer()
+
+                if phase.isConnected {
+                    if isErasing {
                         ProgressView()
-                            .scaleEffect(0.85)
-                            .fixedSize()
-                    }
-                }
-                .onChange(of: isEditing) { editing in
-                    if editing {
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                            isFieldFocused = true
+                            .scaleEffect(0.75)
+                            .frame(width: 20)
+                    } else {
+                        Button {
+                            onErase?()
+                        } label: {
+                            Image(systemName: "trash")
+                                .font(.caption)
+                                .foregroundColor(canErase ? .red : .gray.opacity(0.4))
                         }
-                    }
-                }
-                .onChange(of: isFieldFocused) { focused in
-                    if !focused && isEditing {
-                        onNameCommit?()
+                        .disabled(!canErase)
+                        .buttonStyle(.plain)
                     }
                 }
 
-                HStack(spacing: 8) {
-                    Text(subtitle)
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                        .lineLimit(1)
-
-                    if let batteryLevel {
-                        HStack(spacing: 2) {
-                            Image(systemName: batteryIcon(for: batteryLevel))
-                                .font(.caption2)
-                                .foregroundColor(batteryColor(for: batteryLevel))
-                            Text("\(batteryLevel)%")
-                                .font(.caption2)
-                                .foregroundColor(batteryColor(for: batteryLevel))
-                        }
-                    }
-                }
-
-                HStack(spacing: 8) {
-                    StatusTag(
-                        text: "Connected",
-                        isActive: phase.isConnected,
-                        color: .green
-                    )
-
-                    Text(statusText ?? "Identifying…")
-                        .font(.caption)
-                        .foregroundColor(isIdentifying || phase.isFailed ? .orange : .secondary)
-                        .opacity(statusText != nil ? 1 : 0)
-                }
-                .lineLimit(1)
-            }
-            .layoutPriority(1)
-
-            Spacer()
-
-            if !(sessionBusy && phase.isConnected) {
                 Toggle("", isOn: Binding(
                     get: { phase.isConnected },
                     set: { _ in onToggle() }
                 ))
                 .labelsHidden()
-                .disabled(isBusy || sessionBusy)
+                .disabled(isBusy || sessionBusy || isErasing)
+            }
+            .onChange(of: isEditing) { editing in
+                if editing {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                        isFieldFocused = true
+                    }
+                }
+            }
+            .onChange(of: isFieldFocused) { focused in
+                if !focused && isEditing {
+                    onNameCommit?()
+                }
+            }
+
+            // MARK: Bottom line — Storage + Battery mini bars
+            HStack(spacing: 12) {
+                if let dot = dot {
+                    LiveMiniBar(
+                        label: "Storage",
+                        dot: dot,
+                        valueKeyPath: \.storagePercentageUsed,
+                        colorFor: { pct in
+                            if pct > 90 { return .red }
+                            if pct > 70 { return .orange }
+                            return .blue
+                        },
+                        isConnected: phase.isConnected
+                    )
+                    LiveMiniBar(
+                        label: "Battery",
+                        dot: dot,
+                        valueKeyPath: \.batteryPercentage,
+                        colorFor: { pct in
+                            if pct < 10 { return .red }
+                            if pct < 20 { return .orange }
+                            return .green
+                        },
+                        isConnected: phase.isConnected
+                    )
+                } else {
+                    MiniBarPlaceholder(label: "Storage")
+                    MiniBarPlaceholder(label: "Battery")
+                }
             }
         }
         .padding()
-        .background(rowBackground)
+        .background(rowBackgroundView)
         .cornerRadius(10)
         .contentShape(Rectangle())
         .onTapGesture(count: 2) { onIdentify?() }
         .animation(.easeInOut(duration: 0.3), value: isIdentifying)
+        .onChange(of: isErasing) { erasing in
+            if !erasing { eraseBreathe = false }
+        }
     }
 }
+

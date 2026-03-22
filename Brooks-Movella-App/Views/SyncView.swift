@@ -4,10 +4,6 @@ struct SyncView: View {
     @ObservedObject private var manager = DotManager.shared
     @ObservedObject private var runnerStore = RunnerStore.shared
 
-    @State private var isErasing = false
-    @State private var showEraseConfirmation = false
-    @State private var eraseResult: String = ""
-
     private var phase: SessionPhase { manager.sessionPhase }
 
     var body: some View {
@@ -18,6 +14,24 @@ struct SyncView: View {
                 } else {
                     ScrollView {
                         VStack(spacing: 16) {
+
+                            // MARK: - Erasing Banner
+
+                            if manager.isErasing {
+                                HStack(spacing: 8) {
+                                    ProgressView()
+                                        .progressViewStyle(CircularProgressViewStyle(tint: .pink))
+                                        .scaleEffect(0.8)
+                                    Text("Erasing flash storage…")
+                                        .font(.subheadline)
+                                        .foregroundColor(.pink)
+                                    Spacer()
+                                }
+                                .padding()
+                                .background(Color.pink.opacity(0.1))
+                                .cornerRadius(8)
+                                .padding(.horizontal)
+                            }
 
                             // MARK: - Sensor Status
 
@@ -86,7 +100,7 @@ struct SyncView: View {
                                     handlePrimaryAction()
                                 } label: {
                                     HStack {
-                                        if phase.isBusy {
+                                        if phase.isBusy || manager.isErasing {
                                             ProgressView()
                                                 .progressViewStyle(CircularProgressViewStyle(tint: .white))
                                         } else {
@@ -101,36 +115,6 @@ struct SyncView: View {
                                     .cornerRadius(10)
                                 }
                                 .disabled(primaryButtonDisabled)
-                            }
-
-                            // MARK: - Storage Management
-
-                            SectionCard(title: "Storage", icon: "internaldrive") {
-                                Button {
-                                    showEraseConfirmation = true
-                                } label: {
-                                    HStack {
-                                        if isErasing {
-                                            ProgressView()
-                                                .progressViewStyle(CircularProgressViewStyle(tint: .white))
-                                        }
-                                        Image(systemName: "trash")
-                                        Text(isErasing ? "Erasing..." : "Erase All Flash")
-                                    }
-                                    .frame(maxWidth: .infinity)
-                                    .padding()
-                                    .background(isErasing ? Color.gray : Color.purple)
-                                    .foregroundColor(.white)
-                                    .cornerRadius(10)
-                                }
-                                .disabled(isErasing || manager.connectedDots.isEmpty || phase != .idle)
-
-                                if !eraseResult.isEmpty {
-                                    Text(eraseResult)
-                                        .font(.subheadline)
-                                        .foregroundColor(.secondary)
-                                        .padding(.top, 4)
-                                }
                             }
 
                             Spacer()
@@ -151,12 +135,6 @@ struct SyncView: View {
                     manager.resumeRecordingSession()
                 }
             }
-            .confirmationDialog("Erase all flash storage?", isPresented: $showEraseConfirmation, titleVisibility: .visible) {
-                Button("Erase All", role: .destructive) { eraseFlash() }
-                Button("Cancel", role: .cancel) {}
-            } message: {
-                Text("This will permanently delete all recorded data on every connected sensor.")
-            }
         }
     }
 
@@ -174,6 +152,7 @@ struct SyncView: View {
         case .idle:                return noSensors ? "No Sensors Connected"
                                           : sensorsInitializing ? "Sensors Initializing..."
                                           : manager.hasPendingConnections ? "Connecting..."
+                                          : manager.isErasing ? "Erasing Flash..."
                                           : "Start Recording"
         case .syncing:             return "Syncing Sensors..."
         case .startingRecording:   return "Starting..."
@@ -182,6 +161,7 @@ struct SyncView: View {
         case .error:               return noSensors ? "No Sensors Connected"
                                           : sensorsInitializing ? "Sensors Initializing..."
                                           : manager.hasPendingConnections ? "Connecting..."
+                                          : manager.isErasing ? "Erasing Flash..."
                                           : "Start Recording"
         }
     }
@@ -195,18 +175,18 @@ struct SyncView: View {
 
     private var primaryButtonColor: Color {
         switch phase {
-        case .idle:                return (noSensors || sensorsInitializing || manager.hasPendingConnections) ? .gray : .green
+        case .idle:                return (noSensors || sensorsInitializing || manager.hasPendingConnections) ? .gray : manager.isErasing ? .pink : .green
         case .recording:           return noSensors ? .gray : .red
-        case .error:               return (noSensors || sensorsInitializing || manager.hasPendingConnections) ? .gray : .green
+        case .error:               return (noSensors || sensorsInitializing || manager.hasPendingConnections) ? .gray : manager.isErasing ? .pink : .green
         default:                   return .gray
         }
     }
 
     private var primaryButtonDisabled: Bool {
         switch phase {
-        case .idle:    return noSensors || sensorsInitializing || manager.hasPendingConnections
+        case .idle:    return noSensors || sensorsInitializing || manager.hasPendingConnections || manager.isErasing
         case .recording: return false
-        case .error:   return noSensors || sensorsInitializing || manager.hasPendingConnections
+        case .error:   return noSensors || sensorsInitializing || manager.hasPendingConnections || manager.isErasing
         default:       return true
         }
     }
@@ -243,17 +223,6 @@ struct SyncView: View {
         }
     }
 
-    private func eraseFlash() {
-        isErasing = true
-        eraseResult = "Erasing flash..."
-
-        manager.eraseAllFlash { success in
-            DispatchQueue.main.async {
-                isErasing = false
-                eraseResult = success ? "Flash erased" : "Erase failed"
-            }
-        }
-    }
 }
 
 // MARK: - Section Card
@@ -299,61 +268,73 @@ struct DotStatusRow: View {
     @ObservedObject var dot: Dot
     var sessionPhase: SessionPhase = .idle
 
-    @ObservedObject private var nameStore = SensorNameStore.shared
     @State private var breathe = false
     @State private var eraseBreathe = false
 
     var body: some View {
-        HStack {
-            if sessionPhase.isSyncActive {
-                Image(systemName: "arrow.triangle.2.circlepath")
-                    .foregroundColor(.blue)
-                    .font(.caption)
-                    .symbolEffect(.rotate)
-            } else {
-                Circle()
-                    .fill(dot.isConnected ? (sessionPhase == .recording ? Color.red : Color.green) : Color.gray)
-                    .frame(width: 12, height: 12)
-            }
+        VStack(alignment: .leading, spacing: 10) {
+            // Top line: status dot + name + spacer + badges
+            HStack(spacing: 8) {
+                if sessionPhase.isSyncActive {
+                    Image(systemName: "arrow.triangle.2.circlepath")
+                        .foregroundColor(.blue)
+                        .font(.caption)
+                        .symbolEffect(.rotate)
+                } else {
+                    Circle()
+                        .fill(dot.isConnected ? (sessionPhase == .recording ? Color.red : Color.green) : Color.gray)
+                        .frame(width: 12, height: 12)
+                }
 
-            VStack(alignment: .leading, spacing: 4) {
-                Text(nameStore.name(for: dot.address))
+                Text(dot.displayName)
                     .font(.headline)
                     .lineLimit(1)
                     .truncationMode(.tail)
 
-                HStack(spacing: 8) {
-                    StatusTag(text: "Connected", isActive: dot.isConnected, color: .green)
-                    StatusTag(text: "Recording", isActive: sessionPhase == .recording, color: .red)
-                }
+                Spacer()
 
-                // Storage bar
-                VStack(alignment: .leading, spacing: 2) {
-                    HStack {
-                        Text("Storage")
-                            .font(.caption)
-                            .foregroundColor(.gray)
-                        Spacer()
-                        Text(String(format: "%.1f%%", dot.storagePercentageUsed))
-                            .font(.caption)
-                            .foregroundColor(.gray)
-                    }
+                Text("Connected")
+                    .font(.system(size: 10))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 2)
+                    .background(dot.isConnected ? Color.green.opacity(0.2) : Color.gray.opacity(0.2))
+                    .foregroundColor(dot.isConnected ? .green : .gray)
+                    .cornerRadius(4)
 
-                    GeometryReader { geo in
-                        ZStack(alignment: .leading) {
-                            RoundedRectangle(cornerRadius: 2)
-                                .fill(Color.gray.opacity(0.3))
-                            RoundedRectangle(cornerRadius: 2)
-                                .fill(storageColor(for: dot.storagePercentageUsed))
-                                .frame(width: geo.size.width * min(dot.storagePercentageUsed / 100, 1.0))
-                        }
-                    }
-                    .frame(height: 6)
-                }
-                .padding(.top, 4)
+                Text("Recording")
+                    .font(.system(size: 10))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 2)
+                    .background(sessionPhase == .recording ? Color.red.opacity(0.2) : Color.gray.opacity(0.2))
+                    .foregroundColor(sessionPhase == .recording ? .red : .gray)
+                    .cornerRadius(4)
             }
 
-            Spacer()
+            // Bottom line: Storage + Battery mini bars (full width)
+            HStack(spacing: 12) {
+                LiveMiniBar(
+                    label: "Storage",
+                    dot: dot,
+                    valueKeyPath: \.storagePercentageUsed,
+                    colorFor: { pct in
+                        if pct > 90 { return .red }
+                        if pct > 70 { return .orange }
+                        return .blue
+                    },
+                    isConnected: dot.isConnected
+                )
+                LiveMiniBar(
+                    label: "Battery",
+                    dot: dot,
+                    valueKeyPath: \.batteryPercentage,
+                    colorFor: { pct in
+                        if pct < 10 { return .red }
+                        if pct < 20 { return .orange }
+                        return .green
+                    },
+                    isConnected: dot.isConnected
+                )
+            }
         }
         .padding()
         .background(rowBackgroundView)
@@ -396,11 +377,6 @@ struct DotStatusRow: View {
         }
     }
 
-    private func storageColor(for percentage: Double) -> Color {
-        if percentage > 90 { return .red }
-        if percentage > 70 { return .orange }
-        return .blue
-    }
 }
 
 // MARK: - Status Tag

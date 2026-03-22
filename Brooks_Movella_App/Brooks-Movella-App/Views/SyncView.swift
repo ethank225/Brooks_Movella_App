@@ -3,10 +3,6 @@ import SwiftUI
 struct SyncView: View {
     @ObservedObject private var manager = DotManager.shared
 
-    @State private var isErasing = false
-    @State private var showEraseConfirmation = false
-    @State private var eraseResult: String = ""
-
     private var phase: SessionPhase { manager.sessionPhase }
 
     var body: some View {
@@ -98,36 +94,6 @@ struct SyncView: View {
                     .disabled(primaryButtonDisabled)
                 }
 
-                // MARK: - Storage Management
-
-                SectionCard(title: "Storage", icon: "internaldrive") {
-                    Button {
-                        showEraseConfirmation = true
-                    } label: {
-                        HStack {
-                            if isErasing {
-                                ProgressView()
-                                    .progressViewStyle(CircularProgressViewStyle(tint: .white))
-                            }
-                            Image(systemName: "trash")
-                            Text(isErasing ? "Erasing..." : "Erase All Flash")
-                        }
-                        .frame(maxWidth: .infinity)
-                        .padding()
-                        .background(isErasing ? Color.gray : Color.purple)
-                        .foregroundColor(.white)
-                        .cornerRadius(10)
-                    }
-                    .disabled(isErasing || manager.connectedDots.isEmpty || phase != .idle)
-
-                    if !eraseResult.isEmpty {
-                        Text(eraseResult)
-                            .font(.subheadline)
-                            .foregroundColor(.secondary)
-                            .padding(.top, 4)
-                    }
-                }
-
                 Spacer()
             }
             .padding(.top)
@@ -138,12 +104,6 @@ struct SyncView: View {
             if manager.sessionPhase == .idle && manager.connectedDots.contains(where: { $0.isRecording }) {
                 manager.resumeRecordingSession()
             }
-        }
-        .confirmationDialog("Erase all flash storage?", isPresented: $showEraseConfirmation, titleVisibility: .visible) {
-            Button("Erase All", role: .destructive) { eraseFlash() }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text("This will permanently delete all recorded data on every connected sensor.")
         }
         }
     }
@@ -231,17 +191,6 @@ struct SyncView: View {
         }
     }
 
-    private func eraseFlash() {
-        isErasing = true
-        eraseResult = "Erasing flash..."
-
-        manager.eraseAllFlash { success in
-            DispatchQueue.main.async {
-                isErasing = false
-                eraseResult = success ? "Flash erased" : "Erase failed"
-            }
-        }
-    }
 }
 
 // MARK: - Section Card

@@ -81,6 +81,22 @@ struct ResearcherModeRecordView: View {
             )
             .padding(.top, 8)
 
+            if manager.isErasing {
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .progressViewStyle(CircularProgressViewStyle(tint: .pink))
+                        .scaleEffect(0.8)
+                    Text("Erasing flash storage…")
+                        .font(.subheadline)
+                        .foregroundColor(.pink)
+                    Spacer()
+                }
+                .padding()
+                .background(Color.pink.opacity(0.1))
+                .cornerRadius(8)
+                .padding(.horizontal)
+            }
+
             runnerList
         }
         .alert("Sensors Initializing", isPresented: $showInitializingAlert) {
@@ -127,7 +143,7 @@ struct ResearcherModeRecordView: View {
             phase: phase(for: runner),
             assignedDots: assignedDots(for: runner),
             hasAvailableDots: !availableDots.isEmpty,
-            isStartDisabled: manager.isAnySyncing && phase(for: runner) != .syncing,
+            isStartDisabled: (manager.isAnySyncing && phase(for: runner) != .syncing) || manager.isErasing,
             selectedDotId: selectedDotId,
             isSlotSelected: selectedSlotRunnerId == runner.id,
             onPlaceDot: {

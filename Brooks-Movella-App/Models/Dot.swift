@@ -21,6 +21,22 @@ final class Dot: ObservableObject, Identifiable {
     var address: String { device.uuid }
     var id: String { device.uuid }
 
+    /// Centralized display name: custom name → last 3 MAC octets → last 4 UUID chars.
+    var displayName: String {
+        let uuid = device.uuid
+        if let custom = SensorNameStore.shared.names[uuid] {
+            return custom
+        }
+        let mac = device.macAddress
+        if !mac.isEmpty {
+            let octets = mac.split(separator: ":")
+            if octets.count >= 3 {
+                return octets.suffix(3).joined(separator: ":")
+            }
+        }
+        return String(uuid.suffix(4))
+    }
+
     // MARK: - Published State (UI-facing)
 
     @Published private(set) var connectionPhase: ConnectionPhase = .idle
@@ -36,11 +52,14 @@ final class Dot: ObservableObject, Identifiable {
     /// at render time is unreliable — the SDK can mutate them between frames.
     @Published private(set) var flashUsedBytes: Int = 0
     @Published private(set) var flashTotalBytes: Int = 1  // default 1 to avoid divide-by-zero
+    @Published private(set) var batteryLevel: Int = 0
 
     var storagePercentageUsed: Double {
         guard flashTotalBytes > 0 else { return 0 }
         return (Double(flashUsedBytes) / Double(flashTotalBytes)) * 100.0
     }
+
+    var batteryPercentage: Double { Double(batteryLevel) }
     
     var negotiatedMTU: Int {
         device.peripheral.maximumWriteValueLength(for: .withoutResponse)
@@ -69,11 +88,17 @@ final class Dot: ObservableObject, Identifiable {
     /// Single-flight guard for `getExportFileInfo`. Accessed only on `sdkQueue`.
     private var exportFileInfoInFlight = false
 
+    /// Re-publishes when sensor names change so views pick up `displayName` updates.
+    private var nameStoreSubscription: AnyCancellable?
+
     // MARK: - Init
 
     init(device: DotDevice, sdkQueue: DispatchQueue) {
         self.device = device
         self.sdkQueue = sdkQueue
+        nameStoreSubscription = SensorNameStore.shared.$names
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.objectWillChange.send() }
         sdkQueue.async {
             self.installRecordingStatusHandler()
         }
@@ -243,10 +268,18 @@ final class Dot: ObservableObject, Identifiable {
     }
 
     private func setFlashSnapshot(usedBytes: Int, totalBytes: Int) {
+        let battery: Int = device.battery?.value ?? 0
         setOnMain {
             self.flashUsedBytes = usedBytes
             self.flashTotalBytes = max(totalBytes, 1)
+            self.batteryLevel = battery
         }
+    }
+
+    /// Reads the current battery level from the SDK and publishes it.
+    func refreshBattery() {
+        let battery: Int = device.battery?.value ?? 0
+        setOnMain { self.batteryLevel = battery }
     }
 
     // MARK: - Recording

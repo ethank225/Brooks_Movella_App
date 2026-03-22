@@ -138,6 +138,7 @@ final class ExportManager: ObservableObject {
     /// Fetch recording file metadata from each connected dot.
     func fetchRecordings(for dots: [Dot]) {
         guard !isFetching else { return }
+        guard !DotManager.shared.isErasing else { return }
         setOnMain {
             self.isFetching = true
             self.exportPhase = .fetching

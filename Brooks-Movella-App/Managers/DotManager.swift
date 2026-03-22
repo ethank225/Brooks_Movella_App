@@ -180,6 +180,8 @@ final class DotManager: NSObject, ObservableObject {
 
     @Published private(set) var hasPendingConnections: Bool = false
 
+    @Published var isErasing: Bool = false
+
     @Published var selectedOutputRate: Int = 120
     @Published var selectedFilterIndex: Int = 0
     
@@ -592,11 +594,15 @@ final class DotManager: NSObject, ObservableObject {
                 return
             }
             let dotsSnapshot = self.registry.connectedDots
+            DispatchQueue.main.async { self.isErasing = true }
 
             self.operations.runAll(
                 dots: dotsSnapshot,
                 operation: { dot, done in dot.eraseFlash(completion: done) },
-                completion: completion
+                completion: { success in
+                    DispatchQueue.main.async { self.isErasing = false }
+                    completion(success)
+                }
             )
         }
     }
@@ -631,6 +637,7 @@ final class DotManager: NSObject, ObservableObject {
 
                 self.registry.setConnectionPhase(uuid, .ready)
                 print("✅ [\(uuid)] phase now .ready")
+                dot.refreshBattery()
 
                 // Re-query actual recording state after reconnect.
                 // SDK does not push this automatically, so isRecording stays stale otherwise.
@@ -673,6 +680,7 @@ final class DotManager: NSObject, ObservableObject {
                     self.registry.initializationInProgress.remove(uuid)
                     self.registry.setConnectionPhase(uuid, .ready)
                     print("✅ [\(uuid)] phase now .ready (recording device, flash skipped)")
+                    dot.refreshBattery()
 
                     if let runner = RunnerStore.shared.runner(forSensorUuid: uuid) {
                         let phase = self.runnerPhasesInternal[runner.id] ?? .idle

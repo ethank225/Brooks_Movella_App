@@ -9,7 +9,6 @@ struct RecordingListSection: View {
     let onSelectAll: () -> Void
     let onDeselectAll: () -> Void
 
-    @ObservedObject private var nameStore = SensorNameStore.shared
     @State private var isExpanded = false
 
     private var allSelected: Bool {
@@ -30,7 +29,7 @@ struct RecordingListSection: View {
                     .fill(dot.isConnected ? Color.green : Color.gray.opacity(0.4))
                     .frame(width: 12, height: 12)
 
-                Text(nameStore.name(for: dot.id))
+                Text(dot.displayName)
                     .font(.headline)
                     .lineLimit(1)
                     .truncationMode(.tail)

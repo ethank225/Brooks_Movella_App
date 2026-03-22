@@ -39,11 +39,11 @@ final class DotRegistry {
     }
 
     var dots: [Dot] {
-        byUuid.values.compactMap { $0.dot }
+        byUuid.values.compactMap { $0.dot }.sorted { $0.device.macAddress < $1.device.macAddress }
     }
 
     var connectedDots: [Dot] {
-        byUuid.values.filter { $0.connectionPhase.isConnected }.compactMap { $0.dot }
+        byUuid.values.filter { $0.connectionPhase.isConnected }.compactMap { $0.dot }.sorted { $0.device.macAddress < $1.device.macAddress }
     }
 
     func dot(forUuid uuid: String) -> Dot? {
