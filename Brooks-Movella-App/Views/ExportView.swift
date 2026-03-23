@@ -102,18 +102,18 @@ struct ExportView: View {
             }
             .navigationTitle("Export")
             .toolbar {
-                #if DEBUG
-
-                //If you just want to sample the export, then uncomment this
-
-                ToolbarItem(placement: .navigationBarLeading) {
-                    Button {
-                        showMockTest = true
-                    } label: {
-                        Label("Mock Upload", systemImage: "flask")
-                    }
-                }
-                #endif
+//                #if DEBUG
+//
+//                //If you just want to sample the export, then uncomment this
+//
+//                ToolbarItem(placement: .navigationBarLeading) {
+//                    Button {
+//                        showMockTest = true
+//                    } label: {
+//                        Label("Mock Upload", systemImage: "flask")
+//                    }
+//                }
+//                #endif
                 ToolbarItem(placement: .navigationBarTrailing) {
                     CartBadgeButton(count: cartCount) { showCart = true }
                 }
@@ -121,11 +121,11 @@ struct ExportView: View {
             .sheet(isPresented: $showCart) {
                 CartView()
             }
-            #if DEBUG
-            .sheet(isPresented: $showMockTest) {
-                MockUploadTestView()
-            }
-            #endif
+//            #if DEBUG
+//            .sheet(isPresented: $showMockTest) {
+//                MockUploadTestView()
+//            }
+//            #endif
         }
     }
 
