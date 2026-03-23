@@ -348,19 +348,7 @@ struct RunnerCard: View {
 
         case .error(let msg):
             VStack(spacing: 8) {
-                HStack {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .foregroundColor(.orange)
-                    Text(msg)
-                        .font(.caption)
-                        .foregroundColor(.orange)
-                    Spacer()
-                    Button { onDismissError() } label: {
-                        Image(systemName: "xmark.circle.fill")
-                            .foregroundColor(.secondary)
-                    }
-                    .buttonStyle(.plain)
-                }
+                SessionErrorBanner(message: msg, onDismiss: onDismissError)
                 if allDotsReady {
                     Button(action: onStart) {
                         Label("Retry", systemImage: "arrow.clockwise")

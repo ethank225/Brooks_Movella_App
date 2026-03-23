@@ -21,18 +21,6 @@ final class ExportManager: ObservableObject {
 
     private init() {
         restorePersistedTasks()
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(appWillResignActive),
-            name: UIApplication.willResignActiveNotification,
-            object: nil
-        )
-//        NotificationCenter.default.addObserver(
-//            self,
-//            selector: #selector(appDidEnterBackground),
-//            name: UIApplication.didEnterBackgroundNotification,
-//            object: nil
-//        )
 
         // Prune recordings and cart items when sensors disconnect.
         DotManager.shared.$connectedDots
@@ -95,19 +83,6 @@ final class ExportManager: ObservableObject {
 
     /// Called on the main thread immediately after each file's BLE transfer succeeds.
     var onTaskCompleted: ((ExportTask) -> Void)?
-
-    // MARK: - App State Handling
-
-    @objc private func appWillResignActive() {
-        // bluetooth-central background mode keeps BLE callbacks alive — no action needed.
-    }
-
-//    @objc private func appDidEnterBackground() {
-//        guard exportPhase == .exporting else { return }
-//        // The Movella SDK's export packet callbacks stop firing when the app is backgrounded.
-//        // Cancel immediately so tasks show .canceled rather than hanging until the 10s watchdog.
-//        cancelExport()
-//    }
 
     // MARK: - Disconnection Pruning
 
@@ -430,7 +405,7 @@ final class ExportManager: ObservableObject {
 
                 if FileManager.default.fileExists(atPath: csv.path) {
                     // Deletion failed but file is intact — treat as successfully exported.
-                    self.setOnMain {
+                    setOnMain {
                         task.status = .success
                         task.subphase = .complete
                         task.progress = 1.0
@@ -443,7 +418,7 @@ final class ExportManager: ObservableObject {
                     // and group.notify fires on main only after all blocks call leave().
                     fullPipeline.append(task)
                     self.setTaskStatus(task, .queued)
-                    self.setOnMain { task.progress = 0; task.error = nil; task.subphase = .idle; task.hasPacketLoss = false }
+                    setOnMain { task.progress = 0; task.error = nil; task.subphase = .idle; task.hasPacketLoss = false }
                 }
                 group.leave()
             }
@@ -737,10 +712,6 @@ final class ExportManager: ObservableObject {
 
     // MARK: - Helpers
 
-    func setOnMain(_ work: @escaping () -> Void) {
-        if Thread.isMainThread { work() }
-        else { DispatchQueue.main.async(execute: work) }
-    }
 
     func setTaskStatus(_ task: ExportTask, _ status: ExportStatus, error: String? = nil) {
         setOnMain {

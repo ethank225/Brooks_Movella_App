@@ -130,7 +130,7 @@ final class Dot: ObservableObject, Identifiable {
             case .isRecordingStopped, .isIdle: isRec = false
             default: return
             }
-            self.setOnMain { self.isRecording = isRec }
+            setOnMain { self.isRecording = isRec }
             // Fire one-shot completion if pending
             self.sdkQueue.async {
                 if let cb = self.recordingStatusCompletion {
@@ -142,12 +142,6 @@ final class Dot: ObservableObject, Identifiable {
     }
 
     // MARK: - Thread-safe Setters
-
-    /// Ensures `@Published` mutations happen on the main thread.
-    private func setOnMain(_ work: @escaping () -> Void) {
-        if Thread.isMainThread { work() }
-        else { DispatchQueue.main.async(execute: work) }
-    }
 
     func setConnectionPhase(_ phase: ConnectionPhase) {
         setOnMain { self.connectionPhase = phase }
@@ -177,7 +171,7 @@ final class Dot: ObservableObject, Identifiable {
     func refreshSyncStatus() {
         sdkQueue.async {
             let synced = self.device.isSynced()
-            self.setOnMain { self.sessionSynced = synced }
+            setOnMain { self.sessionSynced = synced }
         }
     }
 
@@ -393,7 +387,7 @@ final class Dot: ObservableObject, Identifiable {
                     print("   📄 [\(self.address)] listPos=\(i) size=\(f.fileSize) ts=\(f.timeStamap)")
                 }
                 
-                self.setOnMain { self.recordingFiles = files }
+                setOnMain { self.recordingFiles = files }
                 self.sdkQueue.async {
                     self.device.setExportFileInfoDone(nil)
                     self.exportFileInfoInFlight = false
@@ -429,7 +423,7 @@ final class Dot: ObservableObject, Identifiable {
             self.device.setEraseDataDoneBlock { [weak self] success in
                 let ok = success != 0
                 print("🗑️ [\(self?.address ?? "?")] Erase: \(ok ? "success" : "failed")")
-                self?.setOnMain { self?.isErasing = false }
+                setOnMain { self?.isErasing = false }
                 self?.getFlashInfo { _ in }
                 completion(ok)
             }

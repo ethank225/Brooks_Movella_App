@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sync Flow — Brooks Movella App</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<nav class="top-nav">
+  <span class="brand">Brooks Movella</span>
+  <a href="index.html">Home</a>
+  <a href="overview.html">Overview</a>
+  <a href="queues.html">Queues</a>
+  <a href="connections.html">Connections</a>
+  <a href="sync.html" class="active">Sync</a>
+  <a href="registry.html">Registry</a>
+  <a href="operations.html">Operations</a>
+  <a href="export.html">Export</a>
+  <a href="tests.html">Tests</a>
+</nav>
+
+<div class="container">
+  <h1>Deep Dive: Sync Flow</h1>
+  <p class="subtitle">Clock synchronization, per-UUID suppression, and device reference freezing.</p>
+
+  <h2>Entry: <code>beginSession(runnerId:)</code></h2>
+
+  <p>Called when the user taps "Start" on a runner card. Runs on <code>stateQueue</code>:</p>
+
+<pre><code>beginSession(runnerId:)
+    &boxur;&boxh; stateQueue.async
+        &boxvr;&boxh; Guard: runnerPhasesInternal[runnerId] is .idle or .error
+        &boxvr;&boxh; Guard: connectQueue is empty AND connectInProgress is nil
+        &boxv;     (can't sync while connections are in flight)
+        &boxvr;&boxh; Guard: no other runner is in .syncing phase (isAnySyncing == false)
+        &boxvr;&boxh; Guard: runner exists in RunnerStore with sensor UUIDs
+        &boxvr;&boxh; Collect dots in .ready phase for this runner's UUIDs
+        &boxvr;&boxh; Guard: none of the dots are currently recording
+        &boxv;
+        &boxvr;&boxh; Configure each dot: dot.configure(outputRate:, filterIndex:)
+        &boxvr;&boxh; setPhase(runnerId, .syncing)
+        &boxv;
+        &boxvr;&boxh; if dots.count &ge; 2:
+        &boxv;     &boxvr;&boxh; registry.syncingUuids = Set(uuids)  // freeze these UUIDs
+        &boxv;     &boxur;&boxh; performSync(dots: dots) { success, error in
+        &boxv;            if success:
+        &boxv;                performStartRecording(runnerId:, dots:)
+        &boxv;            else:
+        &boxv;                setPhase(runnerId, .error(error))
+        &boxv;         }
+        &boxv;
+        &boxur;&boxh; if dots.count == 1:
+              &boxur;&boxh; performStartRecording(runnerId:, dots:)
+                  // Single sensor doesn't need sync</code></pre>
+
+  <h2><code>performSync(dots:completion:)</code></h2>
+
+<pre><code>performSync(dots:, completion:)
+    &boxur;&boxh; stateQueue (capture device references while state is stable)
+        &boxvr;&boxh; Snapshot: devices = dots.map { $0.device }
+        &boxv;     (must capture BEFORE dispatching to sdkQueue, because
+        &boxv;      the SDK will disconnect/reconnect and device refs change)
+        &boxv;
+        &boxur;&boxh; sdkQueue.async {
+               DotSyncManager.startSync(devices) { results in
+                   stateQueue.async {
+                       // Parse results array
+                       // Each result has .success boolean
+                       // Mark dots as sessionSynced = true
+                       // Clear syncingUuids for these UUIDs
+                       // Call refreshStorage to re-fetch flash info
+                       //   (flash info may be stale after SDK reconnect)
+                       completion(allSucceeded, errorMessage)
+                   }
+               }
+           }</code></pre>
+
+  <h2>Per-UUID Suppression via <code>syncingUuids</code></h2>
+
+  <p>During sync, the SDK internally disconnects and reconnects each sensor. This fires <code>onDeviceDisconnected</code> and <code>onDeviceConnectSucceeded</code> delegate callbacks. Without suppression, DotManager would:</p>
+  <ul>
+    <li>Mark the sensor as disconnected (clear phase, update UI)</li>
+    <li>Try to re-initialize it (flash queries, bind device)</li>
+    <li>Corrupt the sync by interfering with the SDK's internal reconnection</li>
+  </ul>
+
+  <p>The fix is <code>syncingUuids: Set&lt;String&gt;</code> on <code>DotRegistry</code>:</p>
+
+<pre><code>// In onDeviceDisconnected:
+if registry.syncingUuids.contains(uuid) {
+    return  // Suppress &mdash; SDK is managing this device
+}
+
+// In onDeviceConnectSucceeded:
+if registry.syncInProgress &amp;&amp; registry.syncingUuids.contains(uuid) {
+    registry.recordReconnection(device)  // lightweight, no phase change
+    return  // Don't initialize &mdash; SDK is managing this device
+}</code></pre>
+
+  <p><strong>Why per-UUID, not a global flag?</strong> If Runner A (sensors 1, 2, 3) is syncing and Runner B (sensors 4, 5, 6) has a sensor disconnect, a global <code>syncInProgress</code> flag would suppress Runner B's disconnect handling too. Per-UUID suppression only affects the sensors actually involved in the sync.</p>
+
+  <h2>Device Reference Freezing</h2>
+
+  <p><code>syncingUuids</code> also prevents device reference updates during sync. Both <code>recordDiscovery()</code> and <code>recordReconnection()</code> check:</p>
+
+<pre><code>func recordDiscovery(_ device: DotDevice) {
+    let uuid = device.uuid
+    if syncingUuids.contains(uuid) { return }  // Don't update device ref
+    byUuid[uuid]?.device = device
+    // ...
+}</code></pre>
+
+  <p>This is critical because <code>performSync</code> captures device references before dispatching to <code>sdkQueue</code>. If a discovery event updated the registry's device reference mid-sync, the captured references would be stale but the registry's would be new &mdash; causing the sync completion handler to operate on mismatched state.</p>
+
+  <h2><code>setPhase</code> and Sync Flag Maintenance</h2>
+
+<pre><code>private func setPhase(_ runnerId: String, _ phase: SessionPhase) {
+    // Must be on stateQueue
+    runnerPhasesInternal[runnerId] = phase
+
+    // Keep syncInProgress in lockstep
+    registry.syncInProgress = runnerPhasesInternal.values.contains { $0.isSyncActive }
+
+    // If this runner is no longer syncing, release its UUIDs
+    if !phase.isSyncActive, let runner = runnerStore.runner(forId: runnerId) {
+        for uuid in runner.sensorUuids {
+            registry.syncingUuids.remove(uuid)
+        }
+    }
+
+    // Snapshot to main thread
+    let snapshot = runnerPhasesInternal
+    DispatchQueue.main.async { self.runnerPhases = snapshot }
+    notify()
+}</code></pre>
+
+  <div class="page-nav">
+    <a href="connections.html">&larr; Connections</a>
+    <a href="registry.html">DotRegistry &rarr;</a>
+  </div>
+</div>
+
+</body>
+</html>

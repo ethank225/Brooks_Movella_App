@@ -34,6 +34,19 @@
             default = "YES">
          </TestPlanReference>
       </TestPlans>
+      <Testables>
+         <TestableReference
+            skipped = "NO"
+            parallelizable = "YES">
+            <BuildableReference
+               BuildableIdentifier = "primary"
+               BlueprintIdentifier = "AA9B5FB12F70C82800035CE5"
+               BuildableName = "Brooks-Movella-AppTests.xctest"
+               BlueprintName = "Brooks-Movella-AppTests"
+               ReferencedContainer = "container:Brooks-Movella-App.xcodeproj">
+            </BuildableReference>
+         </TestableReference>
+      </Testables>
    </TestAction>
    <LaunchAction
       buildConfiguration = "Debug"

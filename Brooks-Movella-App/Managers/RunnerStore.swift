@@ -12,12 +12,10 @@ final class RunnerStore: ObservableObject {
     private let lock = NSLock()
     private var _runnersSnapshot: [Runner] = []
 
-    private let fileURL: URL? = {
-        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first?
-            .appendingPathComponent("runners.json")
-    }()
+    let fileURL: URL?
 
-    private init() {
+    init(fileURL: URL? = nil) {
+        self.fileURL = fileURL ?? FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first?.appendingPathComponent("runners.json")
         isMultiRunnerMode = UserDefaults.standard.bool(forKey: "multi_runner_mode")
         load()
     }

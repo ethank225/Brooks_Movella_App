@@ -4,12 +4,16 @@ import Combine
 class SensorNameStore: ObservableObject {
     static let shared = SensorNameStore()
 
-    private static let defaultsKey = "dot_names"
+    static let defaultsKey = "dot_names"
+    private let defaults: UserDefaults
+    private let storeKey: String
 
     @Published private(set) var names: [String: String]
 
-    private init() {
-        names = UserDefaults.standard.dictionary(forKey: Self.defaultsKey) as? [String: String] ?? [:]
+    init(defaults: UserDefaults = .standard, key: String = "dot_names") {
+        self.defaults = defaults
+        self.storeKey = key
+        names = defaults.dictionary(forKey: key) as? [String: String] ?? [:]
     }
 
     func name(for uuid: String) -> String {
@@ -32,6 +36,6 @@ class SensorNameStore: ObservableObject {
     }
 
     private func persist() {
-        UserDefaults.standard.set(names, forKey: Self.defaultsKey)
+        defaults.set(names, forKey: storeKey)
     }
 }

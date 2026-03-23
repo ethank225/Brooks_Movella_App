@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Connections &amp; Reconnect — Brooks Movella App</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<nav class="top-nav">
+  <span class="brand">Brooks Movella</span>
+  <a href="index.html">Home</a>
+  <a href="overview.html">Overview</a>
+  <a href="queues.html">Queues</a>
+  <a href="connections.html" class="active">Connections</a>
+  <a href="sync.html">Sync</a>
+  <a href="registry.html">Registry</a>
+  <a href="operations.html">Operations</a>
+  <a href="export.html">Export</a>
+  <a href="tests.html">Tests</a>
+</nav>
+
+<div class="container">
+  <h1>Deep Dive: Connection Queue &amp; Reconnect Logic</h1>
+  <p class="subtitle">Serial connection queue, timeout handling, and four reconnection paths.</p>
+
+  <h2>Connection Queue</h2>
+
+  <p>The connection queue ensures only one BLE connection attempt happens at a time. The SDK can't reliably handle concurrent <code>connect()</code> calls.</p>
+
+  <h3>State (lives in DotRegistry, accessed on stateQueue)</h3>
+
+<pre><code>var connectQueue: [String]       // FIFO array of UUIDs waiting to connect
+var connectInProgress: String?   // UUID currently being connected (nil = idle)</code></pre>
+
+  <h3>Flow</h3>
+
+  <p><strong>1. User taps Connect &rarr; <code>connectByUuid(_:)</code></strong></p>
+
+<pre><code>connectByUuid(uuid)
+    &boxur;&boxh; stateQueue.async
+        &boxvr;&boxh; Guard: uuid exists in registry.byUuid
+        &boxvr;&boxh; Guard: not a duplicate (uuid not already in connectQueue or connectInProgress)
+        &boxvr;&boxh; registry.setConnectionPhase(uuid, .connecting)
+        &boxvr;&boxh; registry.connectQueue.append(uuid)
+        &boxvr;&boxh; startConnectTimer(uuid)   // 10-second timeout on main thread
+        &boxvr;&boxh; notify()
+        &boxur;&boxh; processConnectQueue()</code></pre>
+
+  <p><strong>2. <code>processConnectQueue()</code> dequeues one device</strong></p>
+
+<pre><code>processConnectQueue()
+    &boxur;&boxh; stateQueue (already on it)
+        &boxvr;&boxh; device = registry.dequeueNextConnection()
+        &boxv;     &boxvr;&boxh; Guard: connectInProgress == nil (no active connection)
+        &boxv;     &boxvr;&boxh; Guard: !syncInProgress (sync blocks connections)
+        &boxv;     &boxvr;&boxh; Find first UUID in connectQueue that exists in byUuid
+        &boxv;     &boxvr;&boxh; Remove from connectQueue
+        &boxv;     &boxvr;&boxh; Set connectInProgress = uuid
+        &boxv;     &boxur;&boxh; Return device
+        &boxv;
+        &boxvr;&boxh; if device == nil &rarr; return (queue empty or blocked)
+        &boxv;
+        &boxur;&boxh; sdkQueue.async {
+               DotConnectionManager.connect(device)
+           }</code></pre>
+
+  <p><strong>3. Connection succeeds or fails &rarr; advance queue</strong></p>
+
+  <p>Both <code>onDeviceConnectSucceeded</code> and <code>onDeviceConnectFailed</code> call <code>advanceConnectQueue()</code>:</p>
+
+<pre><code>advanceConnectQueue()
+    &boxur;&boxh; stateQueue (already on it)
+        &boxvr;&boxh; registry.connectInProgress = nil
+        &boxur;&boxh; processConnectQueue()   // try next in queue</code></pre>
+
+  <p><strong>4. Timeout (10 seconds, no SDK callback)</strong></p>
+
+  <p><code>startConnectTimer(uuid)</code> creates a <code>DispatchWorkItem</code> scheduled on main thread. If it fires:</p>
+  <ul>
+    <li>Sets connection phase to <code>.failed("Connection timed out")</code></li>
+    <li>Calls <code>advanceConnectQueue()</code> to move on</li>
+  </ul>
+
+  <p>If the SDK callback arrives before timeout, the timer is cancelled via <code>connectTimers[uuid]?.cancel()</code>.</p>
+
+  <h3>Why One at a Time</h3>
+
+  <p>The Movella SDK's <code>DotConnectionManager.connect()</code> uses shared internal state. Calling it for device B while device A's connection is in-flight can cause A's callback to never fire or fire with B's device reference. The serial queue pattern avoids this entirely.</p>
+
+  <hr>
+
+  <h2>Reconnect Logic</h2>
+
+  <p><code>onDeviceConnectSucceeded</code> handles three distinct reconnection scenarios, each with different initialization paths.</p>
+
+  <h3>Entry Point: <code>onDeviceConnectSucceeded(_ device: DotDevice)</code></h3>
+
+  <p>Everything below runs on <code>stateQueue</code>:</p>
+
+<pre><code>func onDeviceConnectSucceeded(_ device: DotDevice) {
+    stateQueue.async { [self] in
+        let uuid = device.uuid
+
+        // Cancel timeout timer
+        connectTimers[uuid]?.cancel()
+        connectTimers[uuid] = nil
+
+        // PATH 1: Sync reconnect
+        if registry.syncInProgress &amp;&amp; registry.syncingUuids.contains(uuid) {
+            registry.recordReconnection(device)  // lightweight update, no phase change
+            advanceConnectQueue()
+            notify()
+            return
+        }
+
+        let alreadyKnown = registry.byUuid[uuid]?.dot != nil
+        let wasQueued = registry.connectInProgress == uuid
+
+        if alreadyKnown &amp;&amp; !wasQueued {
+            // PATH 2: Auto-reconnect (iOS reconnected without us asking)
+            registry.recordReconnection(device)
+            registry.setConnectionPhase(uuid, .initializing)
+            initializeAfterConnect(uuid: uuid)
+
+        } else if alreadyKnown &amp;&amp; wasQueued {
+            // PATH 3: BT-reset reconnect (we re-queued after BT power cycle)
+            registry.recordConnection(device)
+            advanceConnectQueue()
+            initializeAfterConnect(uuid: uuid, settleDelay: 2.0)
+
+        } else {
+            // PATH 4: First-time connection
+            registry.recordConnection(device)
+            advanceConnectQueue()
+            sdkQueue.async { DotDevicePool.bindDevice(device) }
+            initializeAfterConnect(uuid: uuid)
+        }
+
+        notify()
+    }
+}</code></pre>
+
+  <h3><code>initializeAfterConnect(uuid:settleDelay:)</code></h3>
+
+  <p>This method decides whether to query flash storage or skip straight to <code>.ready</code>:</p>
+
+<pre><code>func initializeAfterConnect(uuid: String, settleDelay: TimeInterval = 0) {
+    guard let dot = registry.dot(forUuid: uuid) else { return }
+
+    dot.checkRecordingStatus { [weak self] isRecording in
+        guard let self else { return }
+        self.stateQueue.async {
+            if isRecording {
+                // Sensor is mid-recording &mdash; skip flash query (it won't respond)
+                self.registry.setConnectionPhase(uuid, .ready)
+                self.registry.initializationInProgress.remove(uuid)
+                self.restoreRecordingPhase(for: uuid)
+                self.notify()
+            } else {
+                // Safe to query flash
+                self.refreshStorage(uuids: [uuid], settleDelay: settleDelay)
+            }
+        }
+    }
+}</code></pre>
+
+  <p><strong><code>checkRecordingStatus</code></strong> (on <code>Dot</code>): Installs a one-shot callback via <code>recordingStatusCompletion</code>, then calls <code>device.getRecordingStatus()</code> on <code>sdkQueue</code>. The callback fires when the SDK pushes the status. A 3-second timeout ensures the completion always fires (with <code>false</code> if SDK doesn't respond).</p>
+
+  <p><strong><code>refreshStorage</code></strong>: Delegates to <code>DotOperationRunner.refreshStorage()</code> which calls <code>dot.getFlashInfo()</code> for each UUID. On completion, marks the dot <code>.ready</code> and calls <code>notify()</code>.</p>
+
+  <h3><code>restoreRecordingPhase(for: uuid)</code></h3>
+
+  <p>When a reconnected sensor is still recording, this method looks up which runner owns that sensor (via <code>RunnerStore</code>) and sets that runner's phase to <code>.recording</code> if it isn't already. This restores the UI without any persistence file &mdash; the sensor's own <code>isRecording</code> state is the source of truth.</p>
+
+  <h3>The Settle Delay</h3>
+
+  <p>After a Bluetooth power-off/reset, iOS reconnects devices but the SDK's internal BLE handshake isn't fully complete when <code>onDeviceConnectSucceeded</code> fires. <code>bindDevice()</code> returns immediately and <code>device.isInitialized</code> reports <code>true</code>, but <code>getFlashInfo()</code> never gets a callback because the underlying GATT services aren't ready.</p>
+
+  <p>The 2-second <code>settleDelay</code> (passed through to <code>DotOperationRunner.waitForInitialization</code>) adds a pause after <code>isInitialized</code> returns <code>true</code> but before calling <code>getFlashInfo()</code>. This gives the SDK time to finish its internal re-initialization.</p>
+
+  <div class="page-nav">
+    <a href="queues.html">&larr; Queue Architecture</a>
+    <a href="sync.html">Sync Flow &rarr;</a>
+  </div>
+</div>
+
+</body>
+</html>

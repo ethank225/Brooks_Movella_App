@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DotRegistry — Brooks Movella App</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<nav class="top-nav">
+  <span class="brand">Brooks Movella</span>
+  <a href="index.html">Home</a>
+  <a href="overview.html">Overview</a>
+  <a href="queues.html">Queues</a>
+  <a href="connections.html">Connections</a>
+  <a href="sync.html">Sync</a>
+  <a href="registry.html" class="active">Registry</a>
+  <a href="operations.html">Operations</a>
+  <a href="export.html">Export</a>
+  <a href="tests.html">Tests</a>
+</nav>
+
+<div class="container">
+  <h1>Deep Dive: DotRegistry</h1>
+  <p class="subtitle">The non-thread-safe state container protected by stateQueue.</p>
+
+  <p><code>DotRegistry</code> (<code>Managers/DotRegistry.swift</code>) is a plain class (not <code>ObservableObject</code>) that holds all mutable sensor state. It exists as a separate type for a single reason: <strong>it is not thread-safe and must only be accessed on <code>stateQueue</code></strong>.</p>
+
+  <p>By isolating all mutable state into DotRegistry, the threading contract is clear: if you're touching a <code>DotRegistry</code> property, you must be on <code>stateQueue</code>. DotManager enforces this by only accessing <code>registry</code> inside <code>stateQueue.async</code> or <code>stateQueue.sync</code> blocks.</p>
+
+  <h2>What It Stores</h2>
+
+<pre><code>class DotRegistry {
+    // Master dictionary &mdash; all known sensors
+    var byUuid: [String: DotState] = [:]
+
+    // Connection serialization
+    var connectQueue: [String] = []
+    var connectInProgress: String? = nil
+    var initializationInProgress: Set&lt;String&gt; = []
+
+    // Sync coordination
+    var syncInProgress: Bool = false
+    var syncingUuids: Set&lt;String&gt; = []
+
+    // Scan state
+    var isScanningInternal: Bool = false
+}</code></pre>
+
+  <p><code>DotState</code> bundles a device reference, its <code>Dot</code> model, last-seen time, and connection phase:</p>
+
+<pre><code>struct DotState {
+    var device: DotDevice
+    var dot: Dot?
+    var lastSeen: Date
+    var connectionPhase: ConnectionPhase = .idle
+}</code></pre>
+
+  <h2>Computed Snapshot Properties</h2>
+
+  <p>These are read by <code>notify()</code> on <code>stateQueue</code> and copied to main:</p>
+
+  <ul>
+    <li><strong><code>discovered</code></strong> &mdash; All devices sorted by <code>lastSeen</code> descending (most recent first), mapped to <code>DotDevice</code></li>
+    <li><strong><code>dots</code></strong> &mdash; All <code>Dot</code> models (any sensor that has been connected at least once)</li>
+    <li><strong><code>connectedDots</code></strong> &mdash; Dots with <code>connectionPhase.isConnected</code> (<code>.initializing</code> or <code>.ready</code>)</li>
+    <li><strong><code>previouslyConnectedUuids</code></strong> &mdash; UUIDs with non-nil <code>Dot</code> (for re-queueing after BT reset)</li>
+  </ul>
+
+  <h2>Mutation Methods</h2>
+
+  <table>
+    <thead>
+      <tr><th>Method</th><th>Called When</th><th>What It Does</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>recordDiscovery(device)</code></td>
+        <td>SDK discovers a sensor via scan</td>
+        <td>Adds/updates <code>byUuid</code> entry, updates <code>lastSeen</code>. Skips device ref update if <code>syncingUuids</code> contains UUID.</td>
+      </tr>
+      <tr>
+        <td><code>recordConnection(device)</code></td>
+        <td>First connect or BT-reset reconnect</td>
+        <td>Updates/creates <code>DotState</code>, creates <code>Dot</code> if needed or calls <code>dot.updateDevice()</code>, adds UUID to <code>initializationInProgress</code>, sets phase to <code>.initializing</code>.</td>
+      </tr>
+      <tr>
+        <td><code>recordReconnection(device)</code></td>
+        <td>Auto-reconnect or sync reconnect</td>
+        <td>Lightweight: updates device ref and <code>lastSeen</code>, calls <code>dot.updateDevice()</code>. Does NOT change phase. Skips device ref update for syncing UUIDs.</td>
+      </tr>
+      <tr>
+        <td><code>recordDisconnection(uuid)</code></td>
+        <td>Sensor disconnects</td>
+        <td>Sets phase to <code>.idle</code>, clears <code>sessionSynced</code>, removes from <code>initializationInProgress</code>.</td>
+      </tr>
+      <tr>
+        <td><code>setConnectionPhase(uuid, phase)</code></td>
+        <td>Various state transitions</td>
+        <td>Updates phase in both <code>DotState</code> and the <code>Dot</code> model simultaneously.</td>
+      </tr>
+      <tr>
+        <td><code>markAllDisconnected()</code></td>
+        <td>BT powers off</td>
+        <td>Sets all UUIDs to <code>.idle</code> phase.</td>
+      </tr>
+      <tr>
+        <td><code>clearBusyFlags()</code></td>
+        <td>BT resets</td>
+        <td>Clears <code>isScanningInternal</code>, <code>connectInProgress</code>, <code>initializationInProgress</code>, <code>syncInProgress</code>, <code>syncingUuids</code>.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>The Snapshot/Notify Bridge</h2>
+
+  <p>DotRegistry never publishes state directly. Instead, DotManager's <code>notify()</code> method:</p>
+  <ol>
+    <li>Reads registry's computed properties on <code>stateQueue</code> (producing value-type snapshots)</li>
+    <li>Dispatches those snapshots to <code>@Published</code> properties on <code>main</code></li>
+  </ol>
+
+  <p>This means SwiftUI views never access DotRegistry directly &mdash; they observe DotManager's <code>@Published</code> properties, which are always safe to read on main.</p>
+
+  <div class="page-nav">
+    <a href="sync.html">&larr; Sync Flow</a>
+    <a href="operations.html">DotOperationRunner &rarr;</a>
+  </div>
+</div>
+
+</body>
+</html>

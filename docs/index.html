@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Architecture — Brooks Movella App</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<nav class="top-nav">
+  <span class="brand">Brooks Movella</span>
+  <a href="index.html" class="active">Home</a>
+  <a href="overview.html">Overview</a>
+  <a href="queues.html">Queues</a>
+  <a href="connections.html">Connections</a>
+  <a href="sync.html">Sync</a>
+  <a href="registry.html">Registry</a>
+  <a href="operations.html">Operations</a>
+  <a href="export.html">Export</a>
+  <a href="tests.html">Tests</a>
+</nav>
+
+<div class="container">
+  <h1>Brooks Movella App</h1>
+  <p class="subtitle">Architecture &amp; Design Decisions</p>
+
+  <p>iOS app for capturing motion data from Movella DOT wearable sensors. Connects sensors via Bluetooth, records synchronized motion data, exports CSV files, and uploads to Supabase.</p>
+
+  <h2>Reference</h2>
+  <div class="card-grid">
+    <a class="card" href="overview.html">
+      <h3>Overview &amp; Concepts</h3>
+      <p>Sensor basics, synchronization, threading model, connection lifecycle, recording, runners, export, persistence, and key lessons.</p>
+    </a>
+  </div>
+
+  <h2>Deep Dives</h2>
+  <div class="card-grid">
+    <a class="card" href="queues.html">
+      <h3>Queue Architecture</h3>
+      <p>stateQueue, sdkQueue, and the three patterns every code path follows. Queue ownership rules and the shared sdkQueue.</p>
+    </a>
+    <a class="card" href="connections.html">
+      <h3>Connections &amp; Reconnect</h3>
+      <p>Serial connection queue, timeout handling, four reconnection paths, initialization flow, and the settle delay.</p>
+    </a>
+    <a class="card" href="sync.html">
+      <h3>Sync Flow</h3>
+      <p>beginSession entry point, performSync, per-UUID suppression via syncingUuids, device reference freezing, and phase management.</p>
+    </a>
+    <a class="card" href="registry.html">
+      <h3>DotRegistry</h3>
+      <p>The non-thread-safe state container. DotState, computed snapshots, mutation methods, and the snapshot/notify bridge.</p>
+    </a>
+    <a class="card" href="operations.html">
+      <h3>DotOperationRunner</h3>
+      <p>Sequential bulk operations, refreshStorage, waitForInitialization polling, and asyncAfter queue yielding.</p>
+    </a>
+    <a class="card" href="export.html">
+      <h3>Export Pipeline</h3>
+      <p>Three-queue architecture, per-file BLE transfer, generation IDs, watchdog timers, packet validation, cancel, and retry.</p>
+    </a>
+  </div>
+
+  <h2>Testing</h2>
+  <div class="card-grid">
+    <a class="card" href="tests.html">
+      <h3>Unit Tests</h3>
+      <p>Test target structure, what's covered, testability patterns, and how to run.</p>
+    </a>
+  </div>
+</div>
+
+</body>
+</html>

@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Queue Architecture — Brooks Movella App</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<nav class="top-nav">
+  <span class="brand">Brooks Movella</span>
+  <a href="index.html">Home</a>
+  <a href="overview.html">Overview</a>
+  <a href="queues.html" class="active">Queues</a>
+  <a href="connections.html">Connections</a>
+  <a href="sync.html">Sync</a>
+  <a href="registry.html">Registry</a>
+  <a href="operations.html">Operations</a>
+  <a href="export.html">Export</a>
+  <a href="tests.html">Tests</a>
+</nav>
+
+<div class="container">
+  <h1>Deep Dive: Queue Architecture</h1>
+  <p class="subtitle">The two serial queues that underpin every code path in the app.</p>
+
+  <p>DotManager declares two serial queues (<code>DotManager.swift</code>):</p>
+
+<pre><code>stateQueue = DispatchQueue(label: "DotManager.stateQueue")
+sdkQueue   = DispatchQueue(label: "DotManager.sdkQueue", qos: .userInitiated)</code></pre>
+
+  <p>Every code path in the app follows one of these patterns:</p>
+
+  <h2>Pattern 1: SDK Delegate Callback &rarr; State Mutation &rarr; UI Update</h2>
+
+  <p>SDK delegate methods (<code>onDeviceConnectSucceeded</code>, <code>onDeviceDisconnected</code>, <code>onScanCompleted</code>, etc.) fire on arbitrary threads. The first line of every delegate method dispatches to <code>stateQueue</code>:</p>
+
+<pre><code>func onDeviceConnectSucceeded(_ device: DotDevice) {
+    stateQueue.async { [self] in
+        // All state mutation happens here:
+        // - registry.recordConnection(device)
+        // - registry.setConnectionPhase(uuid, .initializing)
+        // ...
+        notify()  // snapshots state &rarr; dispatches to main thread
+    }
+}</code></pre>
+
+  <p><code>notify()</code> is the single bridge from <code>stateQueue</code> to main. It captures snapshots of registry state while still on <code>stateQueue</code>, then dispatches those immutable copies to <code>@Published</code> properties on main:</p>
+
+<pre><code>private func notify() {
+    // Already on stateQueue &mdash; safe to read registry
+    let scanning   = registry.isScanningInternal
+    let discovered = registry.discovered       // [DotDevice]
+    let dots       = registry.dots             // [Dot]
+    let connected  = registry.connectedDots    // [Dot]
+    let pending    = registry.connectInProgress != nil || !registry.connectQueue.isEmpty
+
+    DispatchQueue.main.async {
+        self.isScanning          = scanning
+        self.discovered          = discovered
+        self.dots                = dots
+        self.connectedDots       = connected
+        self.hasPendingConnections = pending
+    }
+}</code></pre>
+
+  <p>This ensures SwiftUI never sees partially-updated state &mdash; all five properties update atomically.</p>
+
+  <h2>Pattern 2: State Decision &rarr; SDK Call</h2>
+
+  <p>When DotManager needs to call the SDK (connect a device, start a scan, begin sync), it reads state on <code>stateQueue</code> first, then dispatches the SDK call to <code>sdkQueue</code>:</p>
+
+<pre><code>// Inside stateQueue.async { ... }
+let device = registry.dequeueNextConnection()
+sdkQueue.async {
+    DotConnectionManager.connect(device)
+}</code></pre>
+
+  <p>The two queues must <strong>never</strong> synchronously dispatch to each other. <code>stateQueue.sync { sdkQueue.sync { ... } }</code> or the reverse would deadlock. All cross-queue dispatches are <code>.async</code>.</p>
+
+  <h2>Pattern 3: SDK Call with Completion &rarr; State Update</h2>
+
+  <p>Operations like <code>performSync</code> dispatch to <code>sdkQueue</code> for the SDK call, then hop back to <code>stateQueue</code> in the completion:</p>
+
+<pre><code>sdkQueue.async {
+    DotSyncManager.startSync(devices) { results in
+        stateQueue.async {
+            // Parse results, update registry
+            notify()
+        }
+    }
+}</code></pre>
+
+  <h2>Queue Ownership Summary</h2>
+
+  <table>
+    <thead>
+      <tr><th>Queue</th><th>Owns</th><th>Never Do</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>stateQueue</code></td>
+        <td><code>DotRegistry</code> (all fields), <code>runnerPhasesInternal</code>, <code>syncingUuids</code>, connect timers</td>
+        <td>Call SDK methods, <code>.sync</code> to sdkQueue</td>
+      </tr>
+      <tr>
+        <td><code>sdkQueue</code></td>
+        <td>All <code>DotConnectionManager</code> / <code>DotSyncManager</code> / device API calls, <code>ExportManager</code> SDK calls</td>
+        <td>Mutate registry, <code>.sync</code> to stateQueue</td>
+      </tr>
+      <tr>
+        <td>Main thread</td>
+        <td>All <code>@Published</code> properties, SwiftUI binding</td>
+        <td>Long-running work, SDK calls</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>Shared sdkQueue</h2>
+
+  <p><code>ExportManager</code> accesses the same queue via a computed property:</p>
+
+<pre><code>var sdkQueue: DispatchQueue { DotManager.shared.sdkQueue }</code></pre>
+
+  <p>This is critical &mdash; if ExportManager had its own queue, concurrent SDK calls from export and connection would corrupt SDK state.</p>
+
+  <div class="page-nav">
+    <a href="overview.html">&larr; Overview</a>
+    <a href="connections.html">Connections &rarr;</a>
+  </div>
+</div>
+
+</body>
+</html>

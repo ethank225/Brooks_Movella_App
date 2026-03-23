@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DotOperationRunner — Brooks Movella App</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<nav class="top-nav">
+  <span class="brand">Brooks Movella</span>
+  <a href="index.html">Home</a>
+  <a href="overview.html">Overview</a>
+  <a href="queues.html">Queues</a>
+  <a href="connections.html">Connections</a>
+  <a href="sync.html">Sync</a>
+  <a href="registry.html">Registry</a>
+  <a href="operations.html" class="active">Operations</a>
+  <a href="export.html">Export</a>
+  <a href="tests.html">Tests</a>
+</nav>
+
+<div class="container">
+  <h1>Deep Dive: DotOperationRunner</h1>
+  <p class="subtitle">Sequential bulk operations across multiple sensors.</p>
+
+  <p><code>DotOperationRunner</code> (<code>Managers/DotOperationRunner.swift</code>) serializes bulk operations across multiple sensors. It's a stateless helper &mdash; all state comes from its arguments.</p>
+
+  <h2>Core Method: <code>runAll(dots:operation:completion:)</code></h2>
+
+  <p>Runs a closure on each dot sequentially (not concurrently), collecting success/failure:</p>
+
+<pre><code>func runAll(
+    dots: [Dot],
+    operation: @escaping (Dot, @escaping (Bool) -> Void) -> Void,
+    completion: @escaping (Bool) -> Void
+) {
+    executeSequentially(items: dots, operation: operation) { allSuccess in
+        DispatchQueue.main.async { completion(allSuccess) }
+    }
+}</code></pre>
+
+  <p><strong>Used by DotManager for:</strong></p>
+  <ul>
+    <li><code>startRecording</code> &mdash; calls <code>dot.startRecording(seconds: 0xFFFF)</code> on each dot</li>
+    <li><code>stopRecording</code> &mdash; calls <code>dot.stopRecording()</code> on each dot</li>
+    <li><code>eraseAllFlash</code> &mdash; calls <code>dot.eraseFlash()</code> on each dot</li>
+  </ul>
+
+  <h2><code>executeSequentially(items:operation:completion:)</code></h2>
+
+  <p>Generic recursive helper:</p>
+
+<pre><code>private func executeSequentially&lt;T&gt;(
+    items: [T],
+    operation: @escaping (T, @escaping (Bool) -> Void) -> Void,
+    completion: @escaping (Bool) -> Void
+) {
+    var index = 0
+    var allSuccess = true
+
+    func next() {
+        guard index &lt; items.count else { completion(allSuccess); return }
+        let item = items[index]
+        index += 1
+        operation(item) { success in
+            if !success { allSuccess = false }
+            next()  // recurse to next item
+        }
+    }
+    next()
+}</code></pre>
+
+  <p>Operations run on <code>sdkQueue</code> because the <code>operation</code> closures (e.g., <code>dot.startRecording</code>) dispatch there internally. The recursive <code>next()</code> call happens in the operation's completion, which fires on <code>sdkQueue</code> or main depending on the specific operation.</p>
+
+  <h2><code>refreshStorage(dots:settleDelay:onDotComplete:completion:)</code></h2>
+
+  <p>Specialized bulk operation for fetching flash info after connection or sync:</p>
+
+<pre><code>func refreshStorage(
+    dots: [Dot],
+    settleDelay: TimeInterval = 0,
+    onDotComplete: ((Dot, Bool) -> Void)? = nil,
+    completion: @escaping () -> Void
+) {
+    executeSequentially(items: dots) { dot, done in
+        self.waitForInitialization(dot: dot, timeout: 5.0, settleDelay: settleDelay) {
+            dot.getFlashInfo { success in
+                onDotComplete?(dot, success)
+                done(success)
+            }
+        }
+    } completion: { _ in
+        completion()
+    }
+}</code></pre>
+
+  <h2><code>waitForInitialization(dot:timeout:settleDelay:completion:)</code></h2>
+
+  <p>Polls <code>dot.isInitialized</code> every 0.2 seconds on <code>sdkQueue</code> (using <code>asyncAfter</code> to yield the queue between checks). After <code>isInitialized</code> returns <code>true</code>, waits an additional <code>settleDelay</code> before completing:</p>
+
+<pre><code>private func waitForInitialization(dot: Dot, timeout: TimeInterval,
+                                    settleDelay: TimeInterval,
+                                    completion: @escaping () -> Void) {
+    let deadline = Date().addingTimeInterval(timeout)
+
+    func poll() {
+        sdkQueue.asyncAfter(deadline: .now() + 0.2) {
+            if dot.isInitialized {
+                if settleDelay > 0 {
+                    self.sdkQueue.asyncAfter(deadline: .now() + settleDelay) {
+                        completion()
+                    }
+                } else {
+                    completion()
+                }
+            } else if Date() > deadline {
+                completion()  // timeout &mdash; proceed anyway
+            } else {
+                poll()  // recurse
+            }
+        }
+    }
+    poll()
+}</code></pre>
+
+  <p>The <code>asyncAfter</code> pattern is important: it yields <code>sdkQueue</code> between polls so other SDK operations (like packet callbacks during export) aren't starved.</p>
+
+  <div class="page-nav">
+    <a href="registry.html">&larr; DotRegistry</a>
+    <a href="export.html">Export Pipeline &rarr;</a>
+  </div>
+</div>
+
+</body>
+</html>

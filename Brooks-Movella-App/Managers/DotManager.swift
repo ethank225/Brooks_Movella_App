@@ -2,21 +2,6 @@ import Foundation
 import Combine
 import MovellaDotSdk
 
-// MARK: - Debug Log (temporary — remove later)
-
-func debugLog(_ message: String) {
-    let ts = ISO8601DateFormatter().string(from: Date())
-    let line = "[\(ts)] \(message)\n"
-    guard let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else { return }
-    let url = dir.appendingPathComponent("debug_log.txt")
-    if let handle = try? FileHandle(forWritingTo: url) {
-        handle.seekToEndOfFile()
-        handle.write(line.data(using: .utf8)!)
-        handle.closeFile()
-    } else {
-        try? line.data(using: .utf8)?.write(to: url)
-    }
-}
 
 // MARK: - Session Phase
 
@@ -165,7 +150,13 @@ final class DotManager: NSObject, ObservableObject {
 
     /// Aggregate phase across all runners. Used by views that need a single "is the system busy" answer.
     var sessionPhase: SessionPhase {
-        let p = runnerPhases.values
+        Self.aggregateSessionPhase(from: runnerPhases)
+    }
+
+    /// Pure function that reduces per-runner phases into a single aggregate phase.
+    /// Extracted so it can be unit-tested without instantiating DotManager.
+    static func aggregateSessionPhase(from phases: [String: SessionPhase]) -> SessionPhase {
+        let p = phases.values
         if p.contains(.syncing) { return .syncing }
         if p.contains(.startingRecording) { return .startingRecording }
         if p.contains(.stoppingRecording) { return .stoppingRecording }
@@ -625,7 +616,7 @@ final class DotManager: NSObject, ObservableObject {
             self?.stateQueue.async {
                 guard let self else { return }
                 let uuid = dot.device.uuid
-                debugLog("RECONNECT: refreshStorage completed uuid=\(uuid) success=\(success)")
+
                 self.registry.initializationInProgress.remove(uuid)
 
                 guard success else {
@@ -672,10 +663,8 @@ final class DotManager: NSObject, ObservableObject {
         dot.checkRecordingStatus { [weak self] isRecording in
             guard let self else { return }
             self.stateQueue.async {
-                debugLog("RECONNECT: uuid=\(uuid) isRecording=\(isRecording)")
 
                 if isRecording {
-                    debugLog("RECONNECT: taking recording path")
                     print("⏳ [\(uuid)] Still recording — skipping flash query")
                     self.registry.initializationInProgress.remove(uuid)
                     self.registry.setConnectionPhase(uuid, .ready)
@@ -691,7 +680,7 @@ final class DotManager: NSObject, ObservableObject {
                     }
                     self.notify()
                 } else {
-                    debugLog("RECONNECT: taking refreshStorage path")
+
                     self.refreshStorage(dots: [dot], settleDelay: settleDelay)
                 }
             }

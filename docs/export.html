@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Export Pipeline — Brooks Movella App</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<nav class="top-nav">
+  <span class="brand">Brooks Movella</span>
+  <a href="index.html">Home</a>
+  <a href="overview.html">Overview</a>
+  <a href="queues.html">Queues</a>
+  <a href="connections.html">Connections</a>
+  <a href="sync.html">Sync</a>
+  <a href="registry.html">Registry</a>
+  <a href="operations.html">Operations</a>
+  <a href="export.html" class="active">Export</a>
+  <a href="tests.html">Tests</a>
+</nav>
+
+<div class="container">
+  <h1>Deep Dive: Export Pipeline</h1>
+  <p class="subtitle">Three-queue architecture, BLE transfer, watchdogs, and retry logic.</p>
+
+  <p>ExportManager (<code>Managers/ExportManager.swift</code>, <code>ExportManager+BLETransfer.swift</code>, <code>ExportManager+Persistence.swift</code>) manages the full export lifecycle with three private queues plus the shared <code>sdkQueue</code>.</p>
+
+  <h2>Queue Architecture</h2>
+
+  <table>
+    <thead>
+      <tr><th>Queue</th><th>Purpose</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>sdkQueue</code> (shared from DotManager)</td>
+        <td>All SDK device calls + receives BLE packet callbacks</td>
+      </tr>
+      <tr>
+        <td><code>fileQueue</code> (serial, <code>.userInitiated</code>)</td>
+        <td>CSV file I/O &mdash; open, write batches, close handles</td>
+      </tr>
+      <tr>
+        <td><code>exportSequenceQueue</code> (serial, <code>.userInitiated</code>)</td>
+        <td>Waits on semaphore for all devices to complete</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>Export Flow</h2>
+
+<pre><code>fetchRecordings(for: dots)
+    &boxur;&boxh; For each dot (DispatchGroup):
+        dot.getExportFileInfo &rarr; recordings[dot.address] = files
+    &boxur;&boxh; group.notify(queue: .main):
+        exportPhase = .ready
+
+buildCart()
+    &boxur;&boxh; Selected files &rarr; CartItems with auto-session grouping (20min window)
+
+startExport()
+    &boxur;&boxh; Create ExportTasks from CartItems
+    &boxur;&boxh; Group tasks by dot address
+    &boxur;&boxh; For each dot (concurrent):
+        exportFilesForDot(dot, tasks) &rarr; semaphore.signal()
+    &boxur;&boxh; exportSequenceQueue.async:
+        for _ in 0..&lt;deviceCount: semaphore.wait()
+        &rarr; exportPhase = .done</code></pre>
+
+  <h2>Per-File BLE Transfer (<code>exportFilesForDot</code>)</h2>
+
+  <p>For each file within a dot, files are exported sequentially:</p>
+
+<pre><code>1. fileQueue.async:
+      Create CSV file, write header, open FileHandle
+
+2. sdkQueue.async:
+      device.stopExportFileData()        // reset prior state
+      device.exportDataFormat = Data(...) // timestamp, euler, accel, angvel
+      device.recording.exportFileList = [fileIndex]
+
+      // Install packet callback (fires on sdkQueue)
+      device.setDidParseExportFileDataBlock { plotData in
+          watchdog.beat()                 // reset stall timer
+          Format CSV row from plotData fields
+          Append to batch buffer
+          if packetsReceived % 200 == 0:
+              let captured = batch
+              fileQueue.async { fileHandle.write(captured) }
+          Update progress every 100 packets or 0.5s
+      }
+
+      // Install done callback (fires on sdkQueue)
+      device.recording.exportFileDone = { ... in
+          doneFired = true
+          // Watchdog will handle finalization
+      }
+
+      // Install watchdog (10s stall detection)
+      ExportWatchdog(timeout: 10, queue: sdkQueue) {
+          if doneFired:
+              Flush final batch &rarr; validate &rarr; success or fail
+          else:
+              Genuine stall &rarr; fail, delete partial CSV
+      }
+
+      device.startExportFileData()       // begin BLE transfer</code></pre>
+
+  <h2>Generation IDs</h2>
+
+  <p><code>exportFileGenerations: [String: Int]</code> (keyed by dot address) guards against stale SDK callbacks:</p>
+
+<pre><code>// Before each file export:
+exportFileGenerations[dot.address, default: 0] += 1
+let generation = exportFileGenerations[dot.address, default: 0]
+
+// Inside every callback:
+guard exportFileGenerations[dot.address] == generation else { return }</code></pre>
+
+  <p>Bumped on: export start, cancel, watchdog timeout. If a callback from a prior attempt fires after the generation was bumped, the guard rejects it.</p>
+
+  <h2>Watchdog</h2>
+
+  <p><code>ExportWatchdog</code> runs a <code>DispatchSourceTimer</code> on <code>sdkQueue</code>, firing every 1 second. It checks <code>Date().timeIntervalSince(lastPacketAt) &gt; timeout</code>. The packet callback calls <code>watchdog.beat()</code> to reset <code>lastPacketAt</code>.</p>
+
+  <p>On timeout, the watchdog handles two cases:</p>
+  <ul>
+    <li><strong><code>doneFired == true</code></strong>: The SDK signaled completion but the stream was still draining. Flush the final batch, validate packet continuity, and mark success or fail.</li>
+    <li><strong><code>doneFired == false</code></strong>: Genuine stall (no packets for 10+ seconds). Stop the export, delete the partial CSV, mark failed.</li>
+  </ul>
+
+  <h2>Packet Count Validation</h2>
+
+  <p>After each file completes, <code>validatePacketCount(csvURL:)</code> reads the CSV, extracts the <code>packet_counter</code> column, and checks that <code>(lastCounter - firstCounter + 1) == rowCount</code>. Any gap means BLE packets were lost. Failed validation marks the task with <code>hasPacketLoss = true</code> and status <code>.failed</code>.</p>
+
+  <h2>Progress Estimation</h2>
+
+  <p>SDK provides no total packet count. Estimated from file size:</p>
+
+<pre><code>let estimatedDuration = max(Double(fileSize) / (88.0 * 33.0), 1.0)
+// ~88 bytes per on-device packet, ~33 packets per second over BLE
+let progress = min(elapsedTime / estimatedDuration, 0.99)</code></pre>
+
+  <p>Progress caps at 0.99 until <code>exportFileDone</code> fires, then jumps to 1.0.</p>
+
+  <h2>Cancel Flow</h2>
+
+  <p><code>cancelExport()</code> must unwind all concurrent state:</p>
+  <ol>
+    <li>Bump <code>exportSequenceGeneration</code> (makes the sequence completion handler a no-op)</li>
+    <li>Bump all per-file <code>exportFileGenerations</code> (makes packet/done callbacks no-ops)</li>
+    <li>Stop all watchdogs</li>
+    <li>Close all file handles on <code>fileQueue</code></li>
+    <li>Call <code>device.stopExportFileData()</code> on <code>sdkQueue</code> for all actively-transferring dots</li>
+    <li>Mark all running/queued tasks as <code>.canceled</code>, delete partial CSVs</li>
+    <li>Signal the semaphore for each pending device (unblocks <code>exportSequenceQueue</code>)</li>
+  </ol>
+
+  <h2>Retry Logic</h2>
+
+  <p><code>retryFailed()</code> inspects disk state before deciding what to re-export:</p>
+  <ul>
+    <li>If CSV exists and wasn't marked with packet loss &rarr; mark success (already done)</li>
+    <li>If CSV exists but has packet loss &rarr; delete CSV, re-export from scratch</li>
+    <li>If no CSV exists &rarr; full BLE re-export</li>
+  </ul>
+
+  <p>There is no partial resume &mdash; the streaming pipeline has no intermediate binary format to resume from.</p>
+
+  <h2>Persistence</h2>
+
+  <p>Tasks are saved to <code>Documents/export_records.json</code> whenever status changes to <code>.success</code>, <code>.failed</code>, or <code>.canceled</code>. On next app launch, <code>restorePersistedTasks()</code> rehydrates tasks, verifies CSV files still exist on disk, and deletes orphaned partial CSVs from the export directory.</p>
+
+  <div class="page-nav">
+    <a href="operations.html">&larr; DotOperationRunner</a>
+    <a href="tests.html">Unit Tests &rarr;</a>
+  </div>
+</div>
+
+</body>
+</html>

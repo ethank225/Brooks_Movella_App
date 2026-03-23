@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Unit Tests — Brooks Movella App</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<nav class="top-nav">
+  <span class="brand">Brooks Movella</span>
+  <a href="index.html">Home</a>
+  <a href="overview.html">Overview</a>
+  <a href="queues.html">Queues</a>
+  <a href="connections.html">Connections</a>
+  <a href="sync.html">Sync</a>
+  <a href="registry.html">Registry</a>
+  <a href="operations.html">Operations</a>
+  <a href="export.html">Export</a>
+  <a href="tests.html" class="active">Tests</a>
+</nav>
+
+<div class="container">
+  <h1>Unit Tests</h1>
+  <p class="subtitle">Test target structure, coverage, and testability patterns.</p>
+
+  <h2>Running Tests</h2>
+
+  <p>Tests live in the <code>Brooks-Movella-AppTests</code> target. Run from Xcode via <strong>Product &rarr; Test</strong> (&#8984;U), or from the command line:</p>
+
+<pre><code>xcodebuild test \
+  -scheme "Brooks-Movella-App" \
+  -destination 'platform=iOS Simulator,name=iPhone 15'</code></pre>
+
+  <p>No SDK or Bluetooth is needed &mdash; all tests exercise pure logic extracted from the managers.</p>
+
+  <h2>Test Files</h2>
+
+  <h3>SessionPhaseTests.swift</h3>
+  <p>Tests the <code>SessionPhase</code> enum's computed properties.</p>
+  <table>
+    <thead><tr><th>Test</th><th>What It Verifies</th></tr></thead>
+    <tbody>
+      <tr><td><code>testIsBusyTrueForSyncing</code></td><td><code>.syncing.isBusy == true</code></td></tr>
+      <tr><td><code>testIsBusyTrueForStartingRecording</code></td><td><code>.startingRecording.isBusy == true</code></td></tr>
+      <tr><td><code>testIsBusyTrueForStoppingRecording</code></td><td><code>.stoppingRecording.isBusy == true</code></td></tr>
+      <tr><td><code>testIsBusyFalseForIdle</code></td><td><code>.idle.isBusy == false</code></td></tr>
+      <tr><td><code>testIsBusyFalseForRecording</code></td><td><code>.recording.isBusy == false</code></td></tr>
+      <tr><td><code>testIsBusyFalseForError</code></td><td><code>.error("...").isBusy == false</code></td></tr>
+      <tr><td><code>testIsErrorTrueOnlyForErrorCase</code></td><td><code>isError</code> true for <code>.error</code>, false for all others</td></tr>
+      <tr><td><code>testIsSyncActiveTrueOnlyForSyncing</code></td><td><code>isSyncActive</code> true only for <code>.syncing</code></td></tr>
+    </tbody>
+  </table>
+
+  <h3>ConnectionPhaseTests.swift</h3>
+  <p>Tests the <code>ConnectionPhase</code> enum's computed properties.</p>
+  <table>
+    <thead><tr><th>Test</th><th>What It Verifies</th></tr></thead>
+    <tbody>
+      <tr><td><code>testIsBusyTrueForConnecting</code></td><td><code>.connecting.isBusy == true</code></td></tr>
+      <tr><td><code>testIsBusyTrueForInitializing</code></td><td><code>.initializing.isBusy == true</code></td></tr>
+      <tr><td><code>testIsBusyFalseForIdle</code></td><td><code>.idle.isBusy == false</code></td></tr>
+      <tr><td><code>testIsBusyFalseForReady</code></td><td><code>.ready.isBusy == false</code></td></tr>
+      <tr><td><code>testIsBusyFalseForFailed</code></td><td><code>.failed("...").isBusy == false</code></td></tr>
+      <tr><td><code>testIsFailedTrueOnlyForFailedCase</code></td><td><code>isFailed</code> true only for <code>.failed</code></td></tr>
+      <tr><td><code>testIsConnectedTrueForInitializing</code></td><td><code>.initializing.isConnected == true</code></td></tr>
+      <tr><td><code>testIsConnectedTrueForReady</code></td><td><code>.ready.isConnected == true</code></td></tr>
+      <tr><td><code>testIsConnectedFalseForIdle</code></td><td><code>.idle.isConnected == false</code></td></tr>
+      <tr><td><code>testIsConnectedFalseForConnecting</code></td><td><code>.connecting.isConnected == false</code></td></tr>
+      <tr><td><code>testIsConnectedFalseForFailed</code></td><td><code>.failed("...").isConnected == false</code></td></tr>
+    </tbody>
+  </table>
+
+  <h3>AggregateSessionPhaseTests.swift</h3>
+  <p>Tests <code>DotManager.aggregateSessionPhase(from:)</code> &mdash; the static function extracted from the computed <code>sessionPhase</code> property so it can be tested without instantiating DotManager.</p>
+  <table>
+    <thead><tr><th>Test</th><th>What It Verifies</th></tr></thead>
+    <tbody>
+      <tr><td><code>testAllIdleReturnsIdle</code></td><td>All runners idle &rarr; <code>.idle</code></td></tr>
+      <tr><td><code>testOneRecordingReturnsRecording</code></td><td>One recording, others idle &rarr; <code>.recording</code></td></tr>
+      <tr><td><code>testOneSyncingReturnsSyncing</code></td><td>One syncing, others idle &rarr; <code>.syncing</code></td></tr>
+      <tr><td><code>testSyncingTakesPriorityOverRecording</code></td><td>One syncing + one recording &rarr; <code>.syncing</code></td></tr>
+      <tr><td><code>testErrorBubblesUp</code></td><td>One error, others idle &rarr; the error</td></tr>
+      <tr><td><code>testEmptyDictionaryReturnsIdle</code></td><td>No runners &rarr; <code>.idle</code></td></tr>
+    </tbody>
+  </table>
+
+  <h3>RunnerStoreTests.swift</h3>
+  <p>Tests <code>RunnerStore</code> CRUD operations and persistence. Each test uses a unique temp file to avoid cross-test interference.</p>
+  <table>
+    <thead><tr><th>Test</th><th>What It Verifies</th></tr></thead>
+    <tbody>
+      <tr><td><code>testAddRunnerCreatesRunnerWithCorrectLabel</code></td><td>Label matches, count increments</td></tr>
+      <tr><td><code>testRemoveRunnerDeletesTheRunner</code></td><td>Runner removed from array</td></tr>
+      <tr><td><code>testAssignSensorAddsUUIDToRunner</code></td><td>UUID appears in runner's <code>sensorUuids</code></td></tr>
+      <tr><td><code>testAssignSensorRemovesUUIDFromPreviousRunner</code></td><td>Uniqueness enforced across runners</td></tr>
+      <tr><td><code>testUnassignSensorRemovesUUIDFromRunner</code></td><td>UUID removed, runner kept</td></tr>
+      <tr><td><code>testRunnerForSensorUuidReturnsCorrectRunner</code></td><td>Thread-safe lookup by sensor UUID</td></tr>
+      <tr><td><code>testRunnerForSensorUuidReturnsNilForUnassignedUUID</code></td><td>Returns nil for unknown UUID</td></tr>
+      <tr><td><code>testSaveAndLoadRoundTrip</code></td><td>JSON on disk decodes to identical data</td></tr>
+      <tr><td><code>testClearAllRemovesEverything</code></td><td>Array empty after clear</td></tr>
+    </tbody>
+  </table>
+
+  <h3>SensorNameStoreTests.swift</h3>
+  <p>Tests <code>SensorNameStore</code> naming logic. Uses an isolated <code>UserDefaults</code> suite per test run.</p>
+  <table>
+    <thead><tr><th>Test</th><th>What It Verifies</th></tr></thead>
+    <tbody>
+      <tr><td><code>testNameReturnsUUIDWhenNoCustomNameSet</code></td><td>Falls back to UUID string</td></tr>
+      <tr><td><code>testSetNameThenNameReturnsCustomName</code></td><td>Custom name stored and retrieved</td></tr>
+      <tr><td><code>testClearNameRevertsToUUID</code></td><td>Clearing returns to UUID fallback</td></tr>
+    </tbody>
+  </table>
+
+  <h3>RunnerCodableTests.swift</h3>
+  <p>Tests <code>Runner</code> struct Codable conformance.</p>
+  <table>
+    <thead><tr><th>Test</th><th>What It Verifies</th></tr></thead>
+    <tbody>
+      <tr><td><code>testRunnerRoundTripsWithAllFields</code></td><td>Encode/decode with id, label, sensorUuids</td></tr>
+      <tr><td><code>testRunnerRoundTripsWithEmptySensorUuids</code></td><td>Encode/decode with empty sensor array</td></tr>
+      <tr><td><code>testRunnerArrayRoundTrips</code></td><td>Array of runners survives JSON round-trip</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Testability Patterns</h2>
+
+  <h3>Dependency injection for isolation</h3>
+  <p>Both <code>RunnerStore</code> and <code>SensorNameStore</code> are singletons with <code>static let shared</code>. To test without polluting the shared instance:</p>
+  <ul>
+    <li><code>RunnerStore</code> accepts an optional <code>fileURL</code> in its initializer. Tests pass a temp file path; production uses the default <code>Documents/runners.json</code>.</li>
+    <li><code>SensorNameStore</code> accepts a <code>UserDefaults</code> instance and key. Tests pass <code>UserDefaults(suiteName:)</code> for isolation; production uses <code>.standard</code>.</li>
+  </ul>
+
+  <h3>Extracted static functions</h3>
+  <p><code>DotManager.aggregateSessionPhase(from:)</code> was extracted from a computed property into a static function. This lets tests call it with arbitrary <code>[String: SessionPhase]</code> dictionaries without needing to instantiate DotManager (which requires the Movella SDK).</p>
+
+  <h3>Pure enums</h3>
+  <p><code>SessionPhase</code> and <code>ConnectionPhase</code> are <code>nonisolated</code> enums with no SDK dependencies. Their computed properties (<code>isBusy</code>, <code>isError</code>, <code>isSyncActive</code>, <code>isFailed</code>, <code>isConnected</code>) can be tested directly with zero setup.</p>
+
+  <div class="page-nav">
+    <a href="export.html">&larr; Export Pipeline</a>
+    <a href="index.html">Home &rarr;</a>
+  </div>
+</div>
+
+</body>
+</html>

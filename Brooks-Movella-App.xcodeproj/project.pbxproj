@@ -10,8 +10,28 @@
 		AA316F2D2F468BE200AF15AB /* Supabase in Frameworks */ = {isa = PBXBuildFile; productRef = AA316F2C2F468BE200AF15AB /* Supabase */; };
 /* End PBXBuildFile section */
 
+/* Begin PBXContainerItemProxy section */
+		AA9B5FB62F70C82800035CE5 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = AA4A46CC2F2D48F800CA4F7C /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = AA4A46D32F2D48F800CA4F7C;
+			remoteInfo = "Brooks-Movella-App";
+		};
+/* End PBXContainerItemProxy section */
+
 /* Begin PBXCopyFilesBuildPhase section */
 		AA4A47332F3054DB00CA4F7C /* Embed Frameworks */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 10;
+			files = (
+			);
+			name = "Embed Frameworks";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		AA9B5FC32F70C8D300035CE5 /* Embed Frameworks */ = {
 			isa = PBXCopyFilesBuildPhase;
 			buildActionMask = 2147483647;
 			dstPath = "";
@@ -25,6 +45,7 @@
 
 /* Begin PBXFileReference section */
 		AA4A46D42F2D48F800CA4F7C /* Brooks-Movella-App.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Brooks-Movella-App.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+		AA9B5FB22F70C82800035CE5 /* Brooks-Movella-AppTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = "Brooks-Movella-AppTests.xctest"; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
@@ -34,6 +55,16 @@
 				Info.plist,
 			);
 			target = AA4A46D32F2D48F800CA4F7C /* Brooks-Movella-App */;
+		};
+		AA9B5FC42F70C8D300035CE5 /* Exceptions for "Brooks-Movella-App" folder in "Brooks-Movella-AppTests" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				MovellaDotSdk.framework,
+			);
+			platformFiltersByRelativePath = {
+				MovellaDotSdk.framework = (ios, );
+			};
+			target = AA9B5FB12F70C82800035CE5 /* Brooks-Movella-AppTests */;
 		};
 /* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
 
@@ -48,6 +79,16 @@
 				MovellaDotSdk.framework,
 			);
 		};
+		AA9B5FC52F70C8D300035CE5 /* Exceptions for "Brooks-Movella-App" folder in "Embed Frameworks" phase from "Brooks-Movella-AppTests" target */ = {
+			isa = PBXFileSystemSynchronizedGroupBuildPhaseMembershipExceptionSet;
+			attributesByRelativePath = {
+				MovellaDotSdk.framework = (CodeSignOnCopy, RemoveHeadersOnCopy, );
+			};
+			buildPhase = AA9B5FC32F70C8D300035CE5 /* Embed Frameworks */;
+			membershipExceptions = (
+				MovellaDotSdk.framework,
+			);
+		};
 /* End PBXFileSystemSynchronizedGroupBuildPhaseMembershipExceptionSet section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -56,8 +97,15 @@
 			exceptions = (
 				AA316F242F4687F700AF15AB /* Exceptions for "Brooks-Movella-App" folder in "Brooks-Movella-App" target */,
 				AA4A47342F3054DB00CA4F7C /* Exceptions for "Brooks-Movella-App" folder in "Embed Frameworks" phase from "Brooks-Movella-App" target */,
+				AA9B5FC42F70C8D300035CE5 /* Exceptions for "Brooks-Movella-App" folder in "Brooks-Movella-AppTests" target */,
+				AA9B5FC52F70C8D300035CE5 /* Exceptions for "Brooks-Movella-App" folder in "Embed Frameworks" phase from "Brooks-Movella-AppTests" target */,
 			);
 			path = "Brooks-Movella-App";
+			sourceTree = "<group>";
+		};
+		AA9B5FB32F70C82800035CE5 /* Brooks-Movella-AppTests */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = "Brooks-Movella-AppTests";
 			sourceTree = "<group>";
 		};
 /* End PBXFileSystemSynchronizedRootGroup section */
@@ -71,6 +119,13 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		AA9B5FAF2F70C82800035CE5 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -78,6 +133,7 @@
 			isa = PBXGroup;
 			children = (
 				AA4A46D62F2D48F800CA4F7C /* Brooks-Movella-App */,
+				AA9B5FB32F70C82800035CE5 /* Brooks-Movella-AppTests */,
 				AA4A47302F3054C600CA4F7C /* Frameworks */,
 				AA4A46D52F2D48F800CA4F7C /* Products */,
 			);
@@ -87,6 +143,7 @@
 			isa = PBXGroup;
 			children = (
 				AA4A46D42F2D48F800CA4F7C /* Brooks-Movella-App.app */,
+				AA9B5FB22F70C82800035CE5 /* Brooks-Movella-AppTests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -125,6 +182,30 @@
 			productReference = AA4A46D42F2D48F800CA4F7C /* Brooks-Movella-App.app */;
 			productType = "com.apple.product-type.application";
 		};
+		AA9B5FB12F70C82800035CE5 /* Brooks-Movella-AppTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = AA9B5FB82F70C82800035CE5 /* Build configuration list for PBXNativeTarget "Brooks-Movella-AppTests" */;
+			buildPhases = (
+				AA9B5FAE2F70C82800035CE5 /* Sources */,
+				AA9B5FAF2F70C82800035CE5 /* Frameworks */,
+				AA9B5FB02F70C82800035CE5 /* Resources */,
+				AA9B5FC32F70C8D300035CE5 /* Embed Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				AA9B5FB72F70C82800035CE5 /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				AA9B5FB32F70C82800035CE5 /* Brooks-Movella-AppTests */,
+			);
+			name = "Brooks-Movella-AppTests";
+			packageProductDependencies = (
+			);
+			productName = "Brooks-Movella-AppTests";
+			productReference = AA9B5FB22F70C82800035CE5 /* Brooks-Movella-AppTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -137,6 +218,10 @@
 				TargetAttributes = {
 					AA4A46D32F2D48F800CA4F7C = {
 						CreatedOnToolsVersion = 26.2;
+					};
+					AA9B5FB12F70C82800035CE5 = {
+						CreatedOnToolsVersion = 26.2;
+						TestTargetID = AA4A46D32F2D48F800CA4F7C;
 					};
 				};
 			};
@@ -158,12 +243,20 @@
 			projectRoot = "";
 			targets = (
 				AA4A46D32F2D48F800CA4F7C /* Brooks-Movella-App */,
+				AA9B5FB12F70C82800035CE5 /* Brooks-Movella-AppTests */,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
 		AA4A46D22F2D48F800CA4F7C /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		AA9B5FB02F70C82800035CE5 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -180,7 +273,22 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		AA9B5FAE2F70C82800035CE5 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		AA9B5FB72F70C82800035CE5 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = AA4A46D32F2D48F800CA4F7C /* Brooks-Movella-App */;
+			targetProxy = AA9B5FB62F70C82800035CE5 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
 		AA4A46DF2F2D48F900CA4F7C /* Debug */ = {
@@ -386,6 +494,58 @@
 			};
 			name = Release;
 		};
+		AA9B5FB92F70C82800035CE5 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = ZMY2AZH7FS;
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(PROJECT_DIR)/Brooks-Movella-App",
+				);
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "test-project.Brooks-Movella-AppTests";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				STRING_CATALOG_GENERATE_SYMBOLS = NO;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Brooks-Movella-App.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Brooks-Movella-App";
+			};
+			name = Debug;
+		};
+		AA9B5FBA2F70C82800035CE5 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = ZMY2AZH7FS;
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(PROJECT_DIR)/Brooks-Movella-App",
+				);
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "test-project.Brooks-Movella-AppTests";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				STRING_CATALOG_GENERATE_SYMBOLS = NO;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Brooks-Movella-App.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Brooks-Movella-App";
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -403,6 +563,15 @@
 			buildConfigurations = (
 				AA4A46E22F2D48F900CA4F7C /* Debug */,
 				AA4A46E32F2D48F900CA4F7C /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		AA9B5FB82F70C82800035CE5 /* Build configuration list for PBXNativeTarget "Brooks-Movella-AppTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				AA9B5FB92F70C82800035CE5 /* Debug */,
+				AA9B5FBA2F70C82800035CE5 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

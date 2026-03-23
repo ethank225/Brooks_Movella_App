@@ -133,10 +133,10 @@ extension ExportManager {
                                 let isValid = self.validatePacketCount(csvURL: csvPath)
                                 if !isValid {
                                     try? FileManager.default.removeItem(at: csvPath)
-                                    self.setOnMain { task.hasPacketLoss = true }
+                                    setOnMain { task.hasPacketLoss = true }
                                     self.setTaskStatus(task, .failed, error: "Packet loss detected")
                                 } else {
-                                    self.setOnMain {
+                                    setOnMain {
                                         task.progress = 1.0
                                         task.outputURL = csvPath
                                         task.subphase = .complete
@@ -195,7 +195,7 @@ extension ExportManager {
                         if packetsReceived % 100 == 0 || (now - lastProgressUpdate) >= 0.5 {
                             lastProgressUpdate = now
                             let progress = min((now - exportStartTime) / estimatedDurationSeconds, 0.99)
-                            self.setOnMain { task.progress = progress }
+                            setOnMain { task.progress = progress }
                         }
 
                         let cbDuration = CACurrentMediaTime() - cbStart

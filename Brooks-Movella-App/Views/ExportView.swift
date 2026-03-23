@@ -7,9 +7,6 @@ struct ExportView: View {
     @State private var showCart = false
     @State private var showClearConfirmation = false
     @State private var showInitializingAlert = false
-    #if DEBUG
-    @State private var showMockTest = false
-    #endif
 
     private var connectedDots: [Dot] { manager.connectedDots }
     private var readyDots: [Dot] { connectedDots.filter { $0.connectionPhase == .ready } }
@@ -153,16 +150,7 @@ struct ExportView: View {
             }
         } else if manager.isErasing {
             SectionCard(title: "Recordings", icon: "doc.on.doc") {
-                HStack(spacing: 8) {
-                    ProgressView()
-                        .progressViewStyle(CircularProgressViewStyle(tint: .pink))
-                        .scaleEffect(0.8)
-                    Text("Erasing in progress — please wait")
-                        .font(.subheadline)
-                        .foregroundColor(.pink)
-                }
-                .frame(maxWidth: .infinity, alignment: .center)
-                .padding(.vertical, 8)
+                ErasingBanner()
             }
         } else if exportManager.exportPhase == .idle {
             SectionCard(title: "Recordings", icon: "doc.on.doc") {

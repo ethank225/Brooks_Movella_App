@@ -143,19 +143,8 @@ struct ConnectionView: View {
                     // MARK: - Erasing Banner
 
                     if manager.isErasing {
-                        HStack(spacing: 8) {
-                            ProgressView()
-                                .progressViewStyle(CircularProgressViewStyle(tint: .pink))
-                                .scaleEffect(0.8)
-                            Text("Erasing flash storage…")
-                                .font(.subheadline)
-                                .foregroundColor(.pink)
-                            Spacer()
-                        }
-                        .padding()
-                        .background(Color.pink.opacity(0.1))
-                        .cornerRadius(8)
-                        .padding(.horizontal)
+                        ErasingBanner()
+                            .padding(.horizontal)
                     }
 
                     // MARK: - Sensors

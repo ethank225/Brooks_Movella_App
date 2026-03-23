@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Overview — Brooks Movella App</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<nav class="top-nav">
+  <span class="brand">Brooks Movella</span>
+  <a href="index.html">Home</a>
+  <a href="overview.html" class="active">Overview</a>
+  <a href="queues.html">Queues</a>
+  <a href="connections.html">Connections</a>
+  <a href="sync.html">Sync</a>
+  <a href="registry.html">Registry</a>
+  <a href="operations.html">Operations</a>
+  <a href="export.html">Export</a>
+  <a href="tests.html">Tests</a>
+</nav>
+
+<div class="container">
+  <h1>Overview &amp; Concepts</h1>
+  <p class="subtitle">Reference guide for the core concepts, patterns, and design decisions.</p>
+
+  <h2>Sensor Basics (Movella DOT)</h2>
+  <ul>
+    <li>Each DOT has a 3D accelerometer, gyroscope, and magnetometer</li>
+    <li>Communicates via Bluetooth Low Energy (BLE) 5.0</li>
+    <li>Has 64MB internal storage, records up to 6 hours at 60Hz</li>
+    <li>Supports output rates from 1Hz to 120Hz (120Hz recording only)</li>
+    <li>Internal sampling rate is 800Hz, downsampled via Strapdown Integration (SDI)</li>
+    <li>Sensor fusion algorithm (XKFCore) runs on-device, outputs drift-free 3D orientation</li>
+    <li>Each sensor has its own clock domain &mdash; synchronization is required for multi-sensor setups</li>
+  </ul>
+
+  <h2>Synchronization</h2>
+  <ul>
+    <li>Sync aligns sensor clocks to a common time base via BLE advertisement messages</li>
+    <li>One sensor is the root node, others are scanners</li>
+    <li>Sync takes ~15 seconds and the SDK disconnects/reconnects sensors during the process</li>
+    <li>Sync accuracy: 1 ppm after 30 min, 4 ppm after 1 hour</li>
+    <li>After sync, multiple recordings can be started/stopped without re-syncing</li>
+    <li>Sync is purely clock alignment &mdash; sensors do NOT need to be on a flat surface. Movella recommends syncing on a table for body-mounted scenarios because BLE proximity (&lt;50cm) improves sync success rate during the disconnect/reconnect phase &mdash; not because the algorithm requires a flat surface.</li>
+    <li>Best practice: keep sensors and phone within 50cm during sync, don't stack sensors</li>
+    <li>The SDK cannot handle two concurrent startSync calls. If Runner A is syncing, Runner B must wait.</li>
+    <li>Sync persists on the sensor until powered off, factory reset, or stopSync is called</li>
+  </ul>
+
+  <h2>Threading Model (DotManager)</h2>
+  <ul>
+    <li><strong>stateQueue</strong> (serial) &mdash; protects DotRegistry mutations and internal flags. All state reads/writes happen here.</li>
+    <li><strong>sdkQueue</strong> (serial) &mdash; serializes all Movella SDK API calls. SDK is not thread-safe.</li>
+    <li><strong>Main thread</strong> &mdash; all <code>@Published</code> property writes for SwiftUI</li>
+    <li>Pattern: SDK callback fires on arbitrary thread &rarr; hop to stateQueue for state mutation &rarr; snapshot to main for UI</li>
+    <li>Never synchronously dispatch from stateQueue to sdkQueue or vice versa &mdash; deadlock risk</li>
+  </ul>
+
+  <h2>Connection Lifecycle</h2>
+  <ul>
+    <li>Phases: <code>idle &rarr; connecting &rarr; initializing &rarr; ready</code></li>
+    <li>After BLE connect succeeds, the sensor needs initialization (getFlashInfo for storage info)</li>
+    <li>getFlashInfo will NOT respond if the sensor is currently recording &mdash; this times out and causes "initialization failed"</li>
+    <li>Fix: before calling refreshStorage/getFlashInfo, query recording status with <code>checkRecordingStatus(completion:)</code> which waits for the actual SDK callback. If recording, skip flash query and go straight to <code>.ready</code></li>
+    <li><code>refreshRecordingStatus()</code> is async with two queue hops (sdkQueue &rarr; SDK callback &rarr; main) &mdash; checking isRecording immediately after calling it will see stale data. Always use the callback-based checkRecordingStatus instead.</li>
+    <li>The SDK fires disconnect/reconnect events during sync &mdash; suppress these when <code>syncingUuids</code> contains the device UUID, not based on a global sync flag.</li>
+  </ul>
+
+  <h2>Recording</h2>
+  <ul>
+    <li>Recording stores data on-sensor internal flash, not streamed over BLE</li>
+    <li>Recording starts/stops via SDK commands</li>
+    <li>0xFFFF = record indefinitely until explicitly stopped</li>
+    <li>Sensor continues recording even if BLE disconnects or app is killed</li>
+    <li>On reconnect, <code>device.isRecording()</code> from the SDK is the source of truth for recording state</li>
+    <li>No recovery persistence file needed &mdash; isRecording + RunnerStore runner assignments restore everything</li>
+  </ul>
+
+  <h2>Per-Runner Session Management</h2>
+  <ul>
+    <li>A Runner is a named group of sensor UUIDs (typically 3 dots per runner)</li>
+    <li>Each runner has its own independent SessionPhase: <code>idle &rarr; syncing &rarr; startingRecording &rarr; recording &rarr; stoppingRecording &rarr; idle</code></li>
+    <li>Multiple runners can record concurrently</li>
+    <li>Runners cannot sync concurrently (SDK limitation) &mdash; UI disables start buttons on other runners while one is syncing</li>
+    <li>RunnerStore persists runner assignments to <code>runners.json</code></li>
+    <li><code>DotManager.runnerPhases</code> is in-memory only, rebuilt from isRecording + RunnerStore on reconnect</li>
+    <li>A computed <code>aggregateSessionPhase</code> provides backward compatibility for views that don't need per-runner granularity</li>
+  </ul>
+
+  <h2>Two UI Modes</h2>
+  <ul>
+    <li><strong>Single runner mode</strong> (default): all connected dots record as one unit. A temporary runner with id <code>"__single__"</code> is created on recording start and deleted on stop.</li>
+    <li><strong>Multi-runner mode</strong>: user assigns dots to named runners. Runners persist across start/stop cycles. Mode toggle locked when sensors are connected.</li>
+    <li>The mode is purely a UI concern backed by UserDefaults <code>"multi_runner_mode"</code>. DotManager doesn't know about modes &mdash; it just operates on runner IDs.</li>
+  </ul>
+
+  <h2>Sensor Naming</h2>
+  <ul>
+    <li>SensorNameStore maps sensor UUID to user-defined label via UserDefaults <code>"dot_names"</code></li>
+    <li>Purely visual &mdash; all logic uses UUID, display layer substitutes names</li>
+    <li>Falls back to showing UUID if no name is set</li>
+    <li>Editable inline on the ConnectionView</li>
+  </ul>
+
+  <h2>Export</h2>
+  <ul>
+    <li>Files exported from sensor internal storage via BLE</li>
+    <li>Only query sensors in <code>.ready</code> connection phase &mdash; querying during <code>.initializing</code> causes SDK timeouts</li>
+    <li>Keep sensors within arm's length during export for BLE reliability</li>
+    <li>Each sensor needs both calibration file (small) and run file (large) exported</li>
+    <li>Packet loss or upload failure prompts retry</li>
+  </ul>
+
+  <h2>Persistence Summary</h2>
+  <ul>
+    <li><code>runners.json</code> &mdash; runner assignments (id, label, sensorUuids). Source of truth for which sensors belong to which runner.</li>
+    <li>UserDefaults <code>"multi_runner_mode"</code> &mdash; UI mode toggle</li>
+    <li>UserDefaults <code>"dot_names"</code> &mdash; sensor UUID to display name mapping</li>
+    <li>No session recovery file &mdash; SDK isRecording + runners.json restores state on reconnect</li>
+  </ul>
+
+  <h2>Key Lessons</h2>
+  <ul>
+    <li>The Movella SDK is not thread-safe. All SDK calls must go through a single serial queue.</li>
+    <li>SDK callbacks fire on arbitrary threads. Always hop to your own serial queue before mutating state.</li>
+    <li>During sync, the SDK disconnects and reconnects sensors internally. Your delegate callbacks must detect this and suppress connection state changes for syncing sensors.</li>
+    <li>getFlashInfo does not respond while a sensor is recording. Always check recording status before querying flash.</li>
+    <li><code>refreshRecordingStatus()</code> is async &mdash; never check isRecording synchronously after calling it.</li>
+    <li>SampleTimeFine is a relative microsecond clock that resets on sensor reboot. It has no relationship to UTC.</li>
+    <li>iOS Bluetooth UUIDs are phone-specific and can theoretically change, but are stable enough for single-phone workflows.</li>
+    <li>The sensor's MAC address (D4:22:CD:xx:xx:xx) is the only truly permanent identifier across devices.</li>
+  </ul>
+
+  <div class="page-nav">
+    <a href="index.html">&larr; Home</a>
+    <a href="queues.html">Queue Architecture &rarr;</a>
+  </div>
+</div>
+
+</body>
+</html>

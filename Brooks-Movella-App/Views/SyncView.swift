@@ -18,19 +18,8 @@ struct SyncView: View {
                             // MARK: - Erasing Banner
 
                             if manager.isErasing {
-                                HStack(spacing: 8) {
-                                    ProgressView()
-                                        .progressViewStyle(CircularProgressViewStyle(tint: .pink))
-                                        .scaleEffect(0.8)
-                                    Text("Erasing flash storage…")
-                                        .font(.subheadline)
-                                        .foregroundColor(.pink)
-                                    Spacer()
-                                }
-                                .padding()
-                                .background(Color.pink.opacity(0.1))
-                                .cornerRadius(8)
-                                .padding(.horizontal)
+                                ErasingBanner()
+                                    .padding(.horizontal)
                             }
 
                             // MARK: - Sensor Status
@@ -63,21 +52,7 @@ struct SyncView: View {
 
                                 // Error banner
                                 if case .error(let msg) = phase {
-                                    HStack {
-                                        Image(systemName: "exclamationmark.triangle.fill")
-                                            .foregroundColor(.orange)
-                                        Text(msg)
-                                            .font(.subheadline)
-                                            .foregroundColor(.orange)
-                                        Spacer()
-                                        Button { manager.dismissError() } label: {
-                                            Image(systemName: "xmark.circle.fill")
-                                                .foregroundColor(.secondary)
-                                        }
-                                    }
-                                    .padding()
-                                    .background(Color.orange.opacity(0.1))
-                                    .cornerRadius(8)
+                                    SessionErrorBanner(message: msg, onDismiss: { manager.dismissError() })
                                 }
 
                                 // Status text
