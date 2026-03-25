@@ -23,7 +23,7 @@ struct LiveMiniBar: View {
                     .foregroundColor(.secondary)
                 Spacer()
                 if isConnected {
-                    Text(String(format: "%.0f%%", currentPercent))
+                    Text(String(format: "%.1f%%", currentPercent))
                         .font(.system(size: 12, design: .monospaced))
                         .foregroundColor(.secondary)
                 }

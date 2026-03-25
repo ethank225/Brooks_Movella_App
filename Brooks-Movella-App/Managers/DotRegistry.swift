@@ -130,6 +130,16 @@ final class DotRegistry {
         connectInProgress = nil
     }
 
+    /// Clear `connectInProgress` only if it matches the expected UUID.
+    /// Prevents one device's callback from accidentally clearing another's in-progress status.
+    func advanceConnectQueue(expect uuid: String) {
+        guard connectInProgress == uuid else {
+            print("⚠️ advanceConnectQueue: expected \(uuid) but found \(connectInProgress ?? "nil") — skipping")
+            return
+        }
+        connectInProgress = nil
+    }
+
     func markAllDisconnected() {
         for uuid in byUuid.keys {
             setConnectionPhase(uuid, .idle)

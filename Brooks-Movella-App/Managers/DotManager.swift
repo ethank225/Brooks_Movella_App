@@ -489,6 +489,19 @@ final class DotManager: NSObject, ObservableObject {
                 ExportManager.shared.resetExport()
             }
         }
+        // Safety net: when returning to idle, purge connection-tracking entries
+        // for devices that are already connected. Prevents stale hasPendingConnections
+        // from blocking the UI after edge-case races.
+        if phase == .idle {
+            registry.connectQueue.removeAll { uuid in
+                registry.byUuid[uuid]?.connectionPhase.isConnected == true
+            }
+            if let ip = registry.connectInProgress,
+               registry.byUuid[ip]?.connectionPhase.isConnected == true {
+                registry.connectInProgress = nil
+            }
+        }
+
         let snapshot = runnerPhasesInternal
         DispatchQueue.main.async {
             self.runnerPhases = snapshot
@@ -802,6 +815,30 @@ extension DotManager: DotConnectionDelegate {
                 return
             }
 
+            // Device connected while still queued but not yet being actively
+            // connected (e.g. SDK auto-reconnect fired before we dequeued it).
+            // Remove from queue to prevent double-processing, then use the
+            // lightweight path. Do NOT call advanceConnectQueue() since this
+            // device was not connectInProgress.
+            if self.registry.connectQueue.contains(device.uuid)
+                && self.registry.connectInProgress != device.uuid {
+                self.registry.connectQueue.removeAll { $0 == device.uuid }
+                print("🔄 [\(device.uuid)] Connected while still queued — treating as auto-reconnect")
+
+                self.registry.recordReconnection(device)
+                self.registry.setConnectionPhase(device.uuid, .initializing)
+
+                self.sdkQueue.async {
+                    DotDevicePool.bindDevice(device)
+                }
+
+                if let dot = self.registry.dot(forUuid: device.uuid) {
+                    self.initializeAfterConnect(dot: dot)
+                }
+                self.notify()
+                return
+            }
+
             // SDK auto-reconnect: device was previously connected but the
             // reconnect wasn't user-initiated (not in the connect queue).
             // Use the lightweight path — mark ready immediately and refresh
@@ -846,7 +883,7 @@ extension DotManager: DotConnectionDelegate {
             if let dot = self.registry.dot(forUuid: device.uuid) {
                 self.initializeAfterConnect(dot: dot, settleDelay: settleDelay)
 
-                self.registry.advanceConnectQueue()
+                self.registry.advanceConnectQueue(expect: device.uuid)
                 self.processConnectQueue()
                 self.notify()
             }
@@ -861,7 +898,7 @@ extension DotManager: DotConnectionDelegate {
             if self.registry.syncInProgress && self.registry.syncingUuids.contains(device.uuid) { return }
             self.cancelConnectTimer(device.uuid)
             self.registry.setConnectionPhase(device.uuid, .failed("Connection failed"))
-            self.registry.advanceConnectQueue()
+            self.registry.advanceConnectQueue(expect: device.uuid)
             self.processConnectQueue()
             self.notify()
         }
