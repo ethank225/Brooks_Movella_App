@@ -15,11 +15,16 @@ struct SyncView: View {
                     ScrollView {
                         VStack(spacing: 16) {
 
-                            // MARK: - Erasing Banner
+                            // MARK: - Erasing / Flash Issue Banner
 
                             if manager.isErasing {
                                 ErasingBanner()
                                     .padding(.horizontal)
+                                    .transition(.move(edge: .top).combined(with: .opacity))
+                            } else if manager.hasFlashIssue {
+                                FlashIssueBanner(isErasingFromPreviousSession: manager.isAnyErasingFromPreviousSession)
+                                    .padding(.horizontal)
+                                    .transition(.move(edge: .top).combined(with: .opacity))
                             }
 
                             // MARK: - Sensor Status
@@ -75,7 +80,7 @@ struct SyncView: View {
                                     handlePrimaryAction()
                                 } label: {
                                     HStack {
-                                        if phase.isBusy || manager.isErasing {
+                                        if phase.isBusy || manager.isErasing || manager.isAnyErasingFromPreviousSession {
                                             ProgressView()
                                                 .progressViewStyle(CircularProgressViewStyle(tint: .white))
                                         } else {
@@ -95,6 +100,7 @@ struct SyncView: View {
                             Spacer()
                         }
                         .padding(.top)
+                        .animation(.easeInOut(duration: 0.3), value: manager.hasFlashIssue)
                     }
                 }
             }
@@ -122,12 +128,19 @@ struct SyncView: View {
             && manager.connectedDots.contains { $0.connectionPhase != .ready }
     }
 
+    private var flashIssueTitle: String {
+        if manager.isErasing || manager.isAnyErasingFromPreviousSession {
+            return "Finishing Erase..."
+        }
+        return "Storage Needs Repair"
+    }
+
     private var primaryButtonTitle: String {
         switch phase {
         case .idle:                return noSensors ? "No Sensors Connected"
                                           : sensorsInitializing ? "Sensors Initializing..."
                                           : manager.hasPendingConnections ? "Connecting..."
-                                          : manager.isErasing ? "Erasing Flash..."
+                                          : (manager.isErasing || manager.hasFlashIssue) ? flashIssueTitle
                                           : "Start Recording"
         case .syncing:             return "Syncing Sensors..."
         case .startingRecording:   return "Starting..."
@@ -136,7 +149,7 @@ struct SyncView: View {
         case .error:               return noSensors ? "No Sensors Connected"
                                           : sensorsInitializing ? "Sensors Initializing..."
                                           : manager.hasPendingConnections ? "Connecting..."
-                                          : manager.isErasing ? "Erasing Flash..."
+                                          : (manager.isErasing || manager.hasFlashIssue) ? flashIssueTitle
                                           : "Start Recording"
         }
     }
@@ -148,20 +161,24 @@ struct SyncView: View {
         }
     }
 
+    private var flashIssueColor: Color {
+        (manager.isErasing || manager.isAnyErasingFromPreviousSession) ? .pink : .orange
+    }
+
     private var primaryButtonColor: Color {
         switch phase {
-        case .idle:                return (noSensors || sensorsInitializing || manager.hasPendingConnections) ? .gray : manager.isErasing ? .pink : .green
+        case .idle:                return (noSensors || sensorsInitializing || manager.hasPendingConnections) ? .gray : (manager.isErasing || manager.hasFlashIssue) ? flashIssueColor : .green
         case .recording:           return noSensors ? .gray : .red
-        case .error:               return (noSensors || sensorsInitializing || manager.hasPendingConnections) ? .gray : manager.isErasing ? .pink : .green
+        case .error:               return (noSensors || sensorsInitializing || manager.hasPendingConnections) ? .gray : (manager.isErasing || manager.hasFlashIssue) ? flashIssueColor : .green
         default:                   return .gray
         }
     }
 
     private var primaryButtonDisabled: Bool {
         switch phase {
-        case .idle:    return noSensors || sensorsInitializing || manager.hasPendingConnections || manager.isErasing
+        case .idle:    return noSensors || sensorsInitializing || manager.hasPendingConnections || manager.isErasing || manager.hasFlashIssue
         case .recording: return false
-        case .error:   return noSensors || sensorsInitializing || manager.hasPendingConnections || manager.isErasing
+        case .error:   return noSensors || sensorsInitializing || manager.hasPendingConnections || manager.isErasing || manager.hasFlashIssue
         default:       return true
         }
     }

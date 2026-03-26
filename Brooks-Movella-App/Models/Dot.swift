@@ -50,6 +50,8 @@ final class Dot: ObservableObject, Identifiable {
     /// Flash storage snapshot. Updated after connection, recording, and erase.
     /// We store our own copy because reading `device.usedSpace` / `device.totalSpace`
     /// at render time is unreliable — the SDK can mutate them between frames.
+    @Published var flashCorrupted: Bool = false
+    @Published var isErasingFromPreviousSession: Bool = false
     @Published private(set) var flashUsedBytes: Int = 0
     @Published private(set) var flashTotalBytes: Int = 1  // default 1 to avoid divide-by-zero
     @Published private(set) var batteryLevel: Int = 0
@@ -87,6 +89,10 @@ final class Dot: ObservableObject, Identifiable {
 
     /// Single-flight guard for `getExportFileInfo`. Accessed only on `sdkQueue`.
     private var exportFileInfoInFlight = false
+
+    /// Erase-poll state for detecting mid-erase sensors. Accessed only on `sdkQueue`.
+    private var erasePollCount = 0
+    private var erasePollTimer: DispatchWorkItem?
 
     /// Re-publishes when sensor names change so views pick up `displayName` updates.
     private var nameStoreSubscription: AnyCancellable?
@@ -180,27 +186,61 @@ final class Dot: ObservableObject, Identifiable {
         sdkQueue.async { self.device.getRecordingStatus() }
     }
 
-    /// Queries the SDK for current recording state and calls completion with the result.
-    /// Completion fires on `sdkQueue`. Includes a 3s timeout (assumes not recording on timeout).
-    func checkRecordingStatus(completion: @escaping (Bool) -> Void) {
+    enum SensorActivity { case idle, recording, erasing }
+
+    /// Queries the SDK for current recording/erasing state and calls completion with the result.
+    /// Completion fires on `sdkQueue`. Includes a 3s timeout (assumes idle on timeout).
+    func checkSensorActivity(completion: @escaping (SensorActivity) -> Void) {
         sdkQueue.async {
             var hasCompleted = false
+
+            // Check the property immediately — the SDK may already know the state
+            // from the connection handshake before we even ask.
+            let currentStatus = self.device.recording.recordingStatus
+            print("🔎 [\(self.address)] recordingStatus at connect = \(currentStatus.rawValue)")
+            if currentStatus == .isErasing {
+                completion(.erasing)
+                return
+            }
+
+            // Install one-shot for recording states (fired by installRecordingStatusHandler)
             self.recordingStatusCompletion = { isRec in
                 guard !hasCompleted else { return }
                 hasCompleted = true
-                completion(isRec)
+                completion(isRec ? .recording : .idle)
             }
+
             self.device.getRecordingStatus()
 
-            // Timeout — if SDK doesn't respond, assume not recording
+            // The recording status handler ignores .isErasing, so re-check the property
+            // after giving the SDK time to process the response.
+            self.sdkQueue.asyncAfter(deadline: .now() + 0.5) {
+                guard !hasCompleted else { return }
+                let status = self.device.recording.recordingStatus
+                print("🔎 [\(self.address)] recordingStatus after 0.5s = \(status.rawValue)")
+                if status == .isErasing {
+                    hasCompleted = true
+                    self.recordingStatusCompletion = nil
+                    completion(.erasing)
+                }
+            }
+
+            // Timeout — if SDK doesn't respond, assume idle
             DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
                 self?.sdkQueue.async {
                     guard !hasCompleted else { return }
                     hasCompleted = true
                     self?.recordingStatusCompletion = nil
-                    completion(false)
+                    completion(.idle)
                 }
             }
+        }
+    }
+
+    /// Legacy wrapper for callers that only care about recording state.
+    func checkRecordingStatus(completion: @escaping (Bool) -> Void) {
+        checkSensorActivity { activity in
+            completion(activity == .recording)
         }
     }
 
@@ -223,22 +263,61 @@ final class Dot: ObservableObject, Identifiable {
 
             var hasCapturedResult = false
 
-            self.device.setFlashInfoDoneBlock { [weak self] _ in
+            self.device.setFlashInfoDoneBlock { [weak self] status in
                 guard let self, !hasCapturedResult else { return }
                 hasCapturedResult = true
 
                 let used = Int(self.device.usedSpace)
                 let total = Int(self.device.totalSpace)
-                self.setFlashSnapshot(usedBytes: used, totalBytes: total)
+                let abnormal = (status == .isUninitialized) || (used == 0 && total == 0)
 
-                print("💾 [\(self.address)] Snapshot: \(used)/\(total) (\(String(format: "%.1f", self.storagePercentageUsed))%)")
-                self.sdkQueue.async {
-                    self.device.setFlashInfoDoneBlock(nil)
-                    let waiters = self.flashInfoWaiters
-                    self.flashInfoWaiters = []
-                    self.flashInfoInFlight = false
-                    completion(true)
-                    waiters.forEach { $0(true) }
+                if abnormal {
+                    // Check if sensor is mid-erase from a previous session
+                    self.device.getRecordingStatus()
+
+                    self.sdkQueue.async {
+                        let recStatus = self.device.recording.recordingStatus
+                        self.device.setFlashInfoDoneBlock(nil)
+                        let waiters = self.flashInfoWaiters
+                        self.flashInfoWaiters = []
+                        self.flashInfoInFlight = false
+
+                        if recStatus == .isErasing {
+                            // Sensor still erasing — poll until done
+                            self.setFlashSnapshot(usedBytes: 0, totalBytes: 1)
+                            setOnMain { self.isErasingFromPreviousSession = true }
+                            self.erasePollCount = 0
+                            print("⏳ [\(self.address)] Sensor still erasing from previous session — waiting...")
+
+                            completion(true)
+                            waiters.forEach { $0(true) }
+                            self.startErasePoll()
+                        } else {
+                            // Not erasing — truly corrupted
+                            self.setFlashSnapshot(usedBytes: 0, totalBytes: 1)
+                            setOnMain { self.flashCorrupted = true }
+                            print("⚠️ [\(self.address)] Flash corrupted (status=\(status), recStatus=\(recStatus), \(used)/\(total)) — needs erase")
+
+                            completion(true)
+                            waiters.forEach { $0(true) }
+                        }
+                    }
+                } else {
+                    self.setFlashSnapshot(usedBytes: used, totalBytes: total)
+                    setOnMain {
+                        self.flashCorrupted = false
+                        self.isErasingFromPreviousSession = false
+                    }
+                    print("💾 [\(self.address)] Snapshot: \(used)/\(total) (\(String(format: "%.1f", self.storagePercentageUsed))%)")
+
+                    self.sdkQueue.async {
+                        self.device.setFlashInfoDoneBlock(nil)
+                        let waiters = self.flashInfoWaiters
+                        self.flashInfoWaiters = []
+                        self.flashInfoInFlight = false
+                        completion(true)
+                        waiters.forEach { $0(true) }
+                    }
                 }
             }
 
@@ -268,6 +347,68 @@ final class Dot: ObservableObject, Identifiable {
             self.flashTotalBytes = max(totalBytes, 1)
             self.batteryLevel = battery
         }
+    }
+
+    /// Public entry point for `DotManager` to kick off erase polling after reconnect.
+    /// Dispatches to `sdkQueue` so callers don't need to be on it.
+    func startErasePollFromManager() {
+        sdkQueue.async {
+            self.erasePollCount = 0
+            self.startErasePoll()
+        }
+    }
+
+    /// Polls `recordingStatus` every 3s while sensor finishes a previous erase.
+    /// Once the erase completes, reads flash info and clears the erasing flag.
+    /// After 60 polls (~3 minutes), gives up and marks `flashCorrupted`.
+    /// Must be called on `sdkQueue`.
+    private func startErasePoll() {
+        erasePollTimer?.cancel()
+
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.erasePollCount += 1
+            let attempt = self.erasePollCount
+            print("🔄 [\(self.address)] Erase poll #\(attempt)")
+
+            // Ask the SDK to refresh the recording status property
+            self.device.getRecordingStatus()
+
+            // Check the property after a short delay
+            self.sdkQueue.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                guard let self else { return }
+                let status = self.device.recording.recordingStatus
+                print("🔄 [\(self.address)] recordingStatus=\(status.rawValue)")
+
+                if status == .isErasing {
+                    // Still erasing — check max attempts
+                    if attempt >= 60 {
+                        print("⚠️ [\(self.address)] Erase poll limit reached (3 min) — marking corrupted")
+                        setOnMain {
+                            self.isErasingFromPreviousSession = false
+                            self.flashCorrupted = true
+                        }
+                    } else {
+                        // Schedule next poll in 3 seconds
+                        self.startErasePoll()
+                    }
+                } else {
+                    // Erase finished — now flash queries will respond
+                    print("✅ [\(self.address)] Erase completed — reading flash info")
+                    self.getFlashInfo { [weak self] _ in
+                        guard let self else { return }
+                        setOnMain {
+                            self.isErasingFromPreviousSession = false
+                            self.flashCorrupted = false
+                        }
+                        print("✅ [\(self.address)] Flash recovered after erase")
+                    }
+                }
+            }
+        }
+
+        erasePollTimer = work
+        sdkQueue.asyncAfter(deadline: .now() + 3.0, execute: work)
     }
 
     /// Reads the current battery level from the SDK and publishes it.
@@ -301,7 +442,7 @@ final class Dot: ObservableObject, Identifiable {
                 self.device.getRecordingStatus()
             }
 
-            self.waitForRecordingState(true, timeout: 5.0) { success in
+            self.waitForRecordingState(true, timeout: 10.0) { success in
                 print(success
                       ? "🔴 [\(self.address)] Recording confirmed started"
                       : "❌ [\(self.address)] Recording did not start in time")
@@ -424,6 +565,13 @@ final class Dot: ObservableObject, Identifiable {
                 let ok = success != 0
                 print("🗑️ [\(self?.address ?? "?")] Erase: \(ok ? "success" : "failed")")
                 setOnMain { self?.isErasing = false }
+                if ok {
+                    setOnMain {
+                        self?.flashCorrupted = false
+                        self?.isErasingFromPreviousSession = false
+                    }
+                    self?.sdkQueue.async { self?.erasePollTimer?.cancel() }
+                }
                 self?.getFlashInfo { _ in }
                 completion(ok)
             }

@@ -84,10 +84,16 @@ struct ResearcherModeRecordView: View {
             if manager.isErasing {
                 ErasingBanner()
                     .padding(.horizontal)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+            } else if manager.hasFlashIssue {
+                FlashIssueBanner(isErasingFromPreviousSession: manager.isAnyErasingFromPreviousSession)
+                    .padding(.horizontal)
+                    .transition(.move(edge: .top).combined(with: .opacity))
             }
 
             runnerList
         }
+        .animation(.easeInOut(duration: 0.3), value: manager.hasFlashIssue)
         .alert("Sensors Initializing", isPresented: $showInitializingAlert) {
             Button("OK", role: .cancel) {}
         } message: {
@@ -132,7 +138,7 @@ struct ResearcherModeRecordView: View {
             phase: phase(for: runner),
             assignedDots: assignedDots(for: runner),
             hasAvailableDots: !availableDots.isEmpty,
-            isStartDisabled: (manager.isAnySyncing && phase(for: runner) != .syncing) || manager.isErasing,
+            isStartDisabled: (manager.isAnySyncing && phase(for: runner) != .syncing) || manager.isErasing || manager.hasFlashIssue,
             selectedDotId: selectedDotId,
             isSlotSelected: selectedSlotRunnerId == runner.id,
             onPlaceDot: {

@@ -56,71 +56,154 @@ struct ConnectionView: View {
         }
     }
 
+    // MARK: - Extracted Subviews
+
+    private var controlBar: some View {
+        HStack {
+            // Research Mode toggle
+            Button {
+                if !runnerStore.isMultiRunnerMode {
+                    if runnerStore.runners.contains(where: { $0.id == DotManager.singleRunnerID }) {
+                        let newId = UUID().uuidString
+                        manager.promoteSingleRunner(to: newId, label: "Runner A")
+                    }
+                    runnerStore.isMultiRunnerMode = true
+                } else {
+                    let hasRealRunners = runnerStore.runners.contains { $0.id != DotManager.singleRunnerID }
+                    let hasActivePhase = manager.runnerPhases.contains { $0.key != DotManager.singleRunnerID && $0.value != .idle }
+                    if hasRealRunners || hasActivePhase {
+                        modeToggleAlertMessage = "Remove all runners before switching to single runner mode."
+                        showModeToggleAlert = true
+                    } else {
+                        runnerStore.isMultiRunnerMode = false
+                    }
+                }
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: runnerStore.isMultiRunnerMode
+                          ? "person.2.fill" : "person.2")
+                        .font(.subheadline)
+                    Text("Research")
+                        .font(.subheadline)
+                }
+                .foregroundColor(runnerStore.isMultiRunnerMode ? .blue : .secondary)
+            }
+            .frame(minWidth: 0, maxWidth: .infinity)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 10)
+            .background(.ultraThinMaterial)
+            .cornerRadius(10)
+            .disabled(manager.sessionPhase != .idle)
+
+            Spacer()
+
+            // Erase All
+            Button {
+                showEraseAllConfirmation = true
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: "trash")
+                        .font(.subheadline)
+                    Text("Erase All")
+                        .font(.subheadline)
+                }
+                .foregroundColor(.red)
+            }
+            .disabled(!canEraseAll)
+            .opacity(canEraseAll ? 1 : 0.4)
+            .frame(minWidth: 0, maxWidth: .infinity)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 10)
+            .background(.ultraThinMaterial)
+            .cornerRadius(10)
+        }
+        .padding(.horizontal)
+    }
+
+    private var sensorSection: some View {
+        SectionCard(
+            title: connectedCount > 0
+                ? "Sensors — \(connectedCount) connected"
+                : "Sensors",
+            icon: "sensor.tag.radiowaves.forward"
+        ) {
+            if discoveredList.isEmpty && manager.isScanning {
+                VStack(spacing: 8) {
+                    ProgressView()
+                    Text("Scanning for sensors...")
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 20)
+            } else if discoveredList.isEmpty {
+                VStack(spacing: 8) {
+                    Image(systemName: "sensor.tag.radiowaves.forward")
+                        .font(.largeTitle)
+                        .foregroundColor(.secondary)
+                    Text("No sensors found")
+                        .font(.headline)
+                        .foregroundColor(.secondary)
+                    Text("Pull down or tap refresh to scan")
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 20)
+            } else {
+                ForEach(discoveredList, id: \.uuid) { device in
+                    let uuid = device.uuid
+                    let phase = manager.connectionPhase(forUuid: uuid)
+                    let dot = manager.dot(forUuid: uuid)
+                    let displayTitle = dot?.displayName
+                        ?? nameStore.names[uuid]
+                        ?? Self.shortMac(from: manager.displayAddress(for: device))
+                    let isErasing = erasingUuids.contains(uuid) || (dot?.isErasingFromPreviousSession ?? false)
+                    let canErase = phase == .ready
+                        && !(dot?.isRecording ?? false)
+                        && !isErasing
+                        && !manager.sessionPhase.isBusy
+
+                    DeviceRow(
+                        title: displayTitle,
+                        phase: phase,
+                        isIdentifying: identifyingUuid == uuid,
+                        dot: dot,
+                        sessionBusy: manager.sessionPhase.isBusy,
+                        isErasing: isErasing,
+                        isCorrupted: dot?.flashCorrupted ?? false,
+                        canErase: canErase,
+                        isEditing: editingUuid == uuid,
+                        editText: editingUuid == uuid ? $editText : nil,
+                        onToggle: { toggleConnection(device) },
+                        onErase: {
+                            eraseTargetUuid = uuid
+                            showEraseConfirmation = true
+                        },
+                        onRepairErase: { repairErase(uuid: uuid) },
+                        onNameTap: phase.isConnected ? {
+                            editingUuid = uuid
+                            editText = nameStore.names[uuid] ?? ""
+                        } : nil,
+                        onNameCommit: {
+                            nameStore.setName(editText, for: uuid)
+                            editingUuid = nil
+                        },
+                        onIdentify: phase == .ready ? {
+                            triggerIdentify(uuid: uuid)
+                        } : nil
+                    )
+                }
+            }
+        }
+    }
+
     var body: some View {
         NavigationView {
             ScrollView {
                 VStack(spacing: 16) {
 
-                    // MARK: - Control Bar
-
-                    HStack {
-                        // Research Mode toggle
-                        Button {
-                            if !runnerStore.isMultiRunnerMode {
-                                if runnerStore.runners.contains(where: { $0.id == DotManager.singleRunnerID }) {
-                                    let newId = UUID().uuidString
-                                    manager.promoteSingleRunner(to: newId, label: "Runner A")
-                                }
-                                runnerStore.isMultiRunnerMode = true
-                            } else {
-                                let hasRealRunners = runnerStore.runners.contains { $0.id != DotManager.singleRunnerID }
-                                let hasActivePhase = manager.runnerPhases.contains { $0.key != DotManager.singleRunnerID && $0.value != .idle }
-                                if hasRealRunners || hasActivePhase {
-                                    modeToggleAlertMessage = "Remove all runners before switching to single runner mode."
-                                    showModeToggleAlert = true
-                                } else {
-                                    runnerStore.isMultiRunnerMode = false
-                                }
-                            }
-                        } label: {
-                            HStack(spacing: 4) {
-                                Image(systemName: runnerStore.isMultiRunnerMode
-                                      ? "person.2.fill" : "person.2")
-                                    .font(.subheadline)
-                                Text("Research")
-                                    .font(.subheadline)
-                            }
-                            .foregroundColor(runnerStore.isMultiRunnerMode ? .blue : .secondary)
-                        }
-                        .frame(minWidth: 0, maxWidth: .infinity)
-                        .padding(.horizontal, 16)
-                        .padding(.vertical, 10)
-                        .background(.ultraThinMaterial)
-                        .cornerRadius(10)
-
-                        Spacer()
-
-                        // Erase All
-                        Button {
-                            showEraseAllConfirmation = true
-                        } label: {
-                            HStack(spacing: 4) {
-                                Image(systemName: "trash")
-                                    .font(.subheadline)
-                                Text("Erase All")
-                                    .font(.subheadline)
-                            }
-                            .foregroundColor(.red)
-                        }
-                        .disabled(!canEraseAll)
-                        .opacity(canEraseAll ? 1 : 0.4)
-                        .frame(minWidth: 0, maxWidth: .infinity)
-                        .padding(.horizontal, 16)
-                        .padding(.vertical, 10)
-                        .background(.ultraThinMaterial)
-                        .cornerRadius(10)
-                    }
-                    .padding(.horizontal)
+                    controlBar
 
                     // MARK: - Session Busy Banner
 
@@ -147,81 +230,7 @@ struct ConnectionView: View {
                             .padding(.horizontal)
                     }
 
-                    // MARK: - Sensors
-
-                    SectionCard(
-                        title: connectedCount > 0
-                            ? "Sensors — \(connectedCount) connected"
-                            : "Sensors",
-                        icon: "sensor.tag.radiowaves.forward"
-                    ) {
-                        if discoveredList.isEmpty && manager.isScanning {
-                            VStack(spacing: 8) {
-                                ProgressView()
-                                Text("Scanning for sensors...")
-                                    .font(.subheadline)
-                                    .foregroundColor(.secondary)
-                            }
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 20)
-                        } else if discoveredList.isEmpty {
-                            VStack(spacing: 8) {
-                                Image(systemName: "sensor.tag.radiowaves.forward")
-                                    .font(.largeTitle)
-                                    .foregroundColor(.secondary)
-                                Text("No sensors found")
-                                    .font(.headline)
-                                    .foregroundColor(.secondary)
-                                Text("Pull down or tap refresh to scan")
-                                    .font(.subheadline)
-                                    .foregroundColor(.secondary)
-                            }
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 20)
-                        } else {
-                            ForEach(discoveredList, id: \.uuid) { device in
-                                let uuid = device.uuid
-                                let phase = manager.connectionPhase(forUuid: uuid)
-                                let dot = manager.dot(forUuid: uuid)
-                                let displayTitle = dot?.displayName
-                                    ?? nameStore.names[uuid]
-                                    ?? Self.shortMac(from: manager.displayAddress(for: device))
-                                let isErasing = erasingUuids.contains(uuid)
-                                let canErase = phase == .ready
-                                    && !(dot?.isRecording ?? false)
-                                    && !isErasing
-                                    && !manager.sessionPhase.isBusy
-
-                                DeviceRow(
-                                    title: displayTitle,
-                                    phase: phase,
-                                    isIdentifying: identifyingUuid == uuid,
-                                    dot: dot,
-                                    sessionBusy: manager.sessionPhase.isBusy,
-                                    isErasing: isErasing,
-                                    canErase: canErase,
-                                    isEditing: editingUuid == uuid,
-                                    editText: editingUuid == uuid ? $editText : nil,
-                                    onToggle: { toggleConnection(device) },
-                                    onErase: {
-                                        eraseTargetUuid = uuid
-                                        showEraseConfirmation = true
-                                    },
-                                    onNameTap: phase.isConnected ? {
-                                        editingUuid = uuid
-                                        editText = nameStore.names[uuid] ?? ""
-                                    } : nil,
-                                    onNameCommit: {
-                                        nameStore.setName(editText, for: uuid)
-                                        editingUuid = nil
-                                    },
-                                    onIdentify: phase == .ready ? {
-                                        triggerIdentify(uuid: uuid)
-                                    } : nil
-                                )
-                            }
-                        }
-                    }
+                    sensorSection
 
                     Spacer()
                 }
@@ -314,6 +323,18 @@ struct ConnectionView: View {
         }
     }
 
+    private func repairErase(uuid: String) {
+        guard let dot = manager.dot(forUuid: uuid) else { return }
+        erasingUuids.insert(uuid)
+        manager.isErasing = true
+        dot.eraseFlash { _ in
+            DispatchQueue.main.async {
+                self.erasingUuids.remove(uuid)
+                self.manager.isErasing = false
+            }
+        }
+    }
+
     private func eraseSingle() {
         guard let uuid = eraseTargetUuid,
               let dot = manager.dot(forUuid: uuid) else { return }
@@ -339,6 +360,59 @@ struct ConnectionView: View {
     }
 }
 
+// MARK: - Corrupted Sensor Row
+
+struct CorruptedSensorRow: View {
+    let displayName: String
+    var isRepairing: Bool = false
+    let onErase: () -> Void
+
+    var body: some View {
+        // Matches normalRow: VStack(spacing: 10) with top line + bottom line
+        VStack(alignment: .leading, spacing: 10) {
+            // Top line — icon + name + erase button
+            HStack(spacing: 10) {
+                if isRepairing {
+                    ProgressView()
+                        .scaleEffect(0.75)
+                        .fixedSize()
+                        .frame(width: 10, height: 10)
+                } else {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundColor(.orange)
+                        .font(.system(size: 10))
+                }
+
+                Text(displayName)
+                    .font(.headline)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+
+                Spacer()
+
+                if !isRepairing {
+                    Button(action: onErase) {
+                        Text("Erase")
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 6)
+                            .background(Color.orange)
+                            .cornerRadius(8)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+
+            // Bottom line — status message, left-aligned under the name
+            Text(isRepairing ? "Repairing storage..." : "Storage corrupted — tap Erase to repair")
+                .font(.caption)
+                .foregroundColor(isRepairing ? .pink : .orange)
+                .padding(.leading, 20)
+        }
+    }
+}
+
 // MARK: - Device Row
 
 struct DeviceRow: View {
@@ -348,11 +422,13 @@ struct DeviceRow: View {
     var dot: Dot? = nil
     var sessionBusy: Bool = false
     var isErasing: Bool = false
+    var isCorrupted: Bool = false
     var canErase: Bool = false
     var isEditing: Bool = false
     var editText: Binding<String>? = nil
     let onToggle: () -> Void
     var onErase: (() -> Void)? = nil
+    var onRepairErase: (() -> Void)? = nil
     var onNameTap: (() -> Void)? = nil
     var onNameCommit: (() -> Void)? = nil
     var onIdentify: (() -> Void)? = nil
@@ -364,7 +440,17 @@ struct DeviceRow: View {
 
     @ViewBuilder
     private var rowBackgroundView: some View {
-        if isErasing {
+        if isErasing && isCorrupted {
+            Color.pink
+                .opacity(eraseBreathe ? 0.25 : 0.06)
+                .onAppear {
+                    withAnimation(.easeInOut(duration: 1.2).repeatForever(autoreverses: true)) {
+                        eraseBreathe = true
+                    }
+                }
+        } else if isCorrupted {
+            Color.orange.opacity(0.12)
+        } else if isErasing {
             Color.pink
                 .opacity(eraseBreathe ? 0.25 : 0.06)
                 .onAppear {
@@ -383,7 +469,9 @@ struct DeviceRow: View {
         }
     }
 
-    var body: some View {
+    // MARK: - Normal Row
+
+    private var normalRow: some View {
         VStack(alignment: .leading, spacing: 10) {
             // MARK: Top line — status dot + name + trash + toggle
             HStack(spacing: 10) {
@@ -501,12 +589,35 @@ struct DeviceRow: View {
                 }
             }
         }
+    }
+
+    var body: some View {
+        VStack {
+            if isCorrupted {
+                CorruptedSensorRow(
+                    displayName: title,
+                    isRepairing: isErasing,
+                    onErase: { onRepairErase?() }
+                )
+                .transition(.asymmetric(
+                    insertion: .push(from: .bottom),
+                    removal: .push(from: .top)
+                ))
+            } else {
+                normalRow
+                    .transition(.asymmetric(
+                        insertion: .push(from: .top),
+                        removal: .push(from: .bottom)
+                    ))
+            }
+        }
         .padding()
         .background(rowBackgroundView)
         .cornerRadius(10)
         .contentShape(Rectangle())
         .onTapGesture(count: 2) { onIdentify?() }
         .animation(.easeInOut(duration: 0.3), value: isIdentifying)
+        .animation(.easeInOut(duration: 0.4), value: isCorrupted)
         .onChange(of: isErasing) { erasing in
             if !erasing { eraseBreathe = false }
         }

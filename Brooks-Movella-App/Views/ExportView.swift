@@ -93,6 +93,7 @@ struct ExportView: View {
                     && exportManager.exportPhase != .exporting
                     && exportManager.exportPhase != .done
                     && !manager.isErasing
+                    && !manager.hasFlashIssue
                 if safeToRefresh {
                     exportManager.fetchRecordings(for: readyDots)
                 }
@@ -148,9 +149,13 @@ struct ExportView: View {
                     subheadline: "Connect sensors in the Connect tab to view recordings"
                 )
             }
-        } else if manager.isErasing {
+        } else if manager.isErasing || manager.hasFlashIssue {
             SectionCard(title: "Recordings", icon: "doc.on.doc") {
-                ErasingBanner()
+                if manager.isErasing {
+                    ErasingBanner()
+                } else {
+                    FlashIssueBanner(isErasingFromPreviousSession: manager.isAnyErasingFromPreviousSession)
+                }
             }
         } else if exportManager.exportPhase == .idle {
             SectionCard(title: "Recordings", icon: "doc.on.doc") {
@@ -273,7 +278,7 @@ struct CartView: View {
     }
 
     private var canExport: Bool {
-        !exportManager.cartItems.isEmpty && selectedProfile != nil && emptyMetadataFields.isEmpty && !isAnyRecording && !dotManager.isErasing
+        !exportManager.cartItems.isEmpty && selectedProfile != nil && emptyMetadataFields.isEmpty && !isAnyRecording && !dotManager.isErasing && !dotManager.hasFlashIssue
     }
 
     var body: some View {

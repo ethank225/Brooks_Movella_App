@@ -173,6 +173,14 @@ final class DotManager: NSObject, ObservableObject {
 
     @Published var isErasing: Bool = false
 
+    var hasFlashIssue: Bool {
+        connectedDots.contains { $0.flashCorrupted || $0.isErasingFromPreviousSession }
+    }
+
+    var isAnyErasingFromPreviousSession: Bool {
+        connectedDots.contains { $0.isErasingFromPreviousSession }
+    }
+
     @Published var selectedOutputRate: Int = 120
     @Published var selectedFilterIndex: Int = 0
     
@@ -378,6 +386,9 @@ final class DotManager: NSObject, ObservableObject {
                 self.stateQueue.async {
                     if success {
                         self.setPhase(.idle, forRunner: runnerId)
+                        for dot in dots {
+                            dot.getFlashInfo { _ in }
+                        }
                     } else {
                         self.setPhase(.error("Failed to stop recording. Please try again."), forRunner: runnerId)
                     }
@@ -633,6 +644,22 @@ final class DotManager: NSObject, ObservableObject {
                 self.registry.initializationInProgress.remove(uuid)
 
                 guard success else {
+                    // Flash info timed out — check if the sensor is mid-erase.
+                    // The SDK won't respond to flash queries while erasing, so the
+                    // timeout is expected. Check the recording status property directly.
+                    let recStatus = dot.device.recording.recordingStatus
+                    print("⚠️ [\(uuid)] Flash info failed — recordingStatus=\(recStatus.rawValue)")
+
+                    if recStatus == .isErasing {
+                        print("⏳ [\(uuid)] Sensor is mid-erase — marking .ready and polling")
+                        self.registry.setConnectionPhase(uuid, .ready)
+                        dot.refreshBattery()
+                        setOnMain { dot.isErasingFromPreviousSession = true }
+                        dot.startErasePollFromManager()
+                        self.notify()
+                        return
+                    }
+
                     print("⚠️ [\(uuid)] Init failed — not marking .ready")
                     self.registry.setConnectionPhase(uuid, .failed("Initialization timed out"))
                     self.notify()
@@ -649,16 +676,23 @@ final class DotManager: NSObject, ObservableObject {
 
                 // If the sensor is still recording (e.g. after BT reset or app relaunch),
                 // restore the runner's phase so the UI reflects the active session.
-                if dot.isRecording,
-                   let runner = RunnerStore.shared.runner(forSensorUuid: uuid) {
-                    let phase = self.runnerPhasesInternal[runner.id] ?? .idle
-                    if phase == .idle || phase.isError {
-                        print("🔄 [\(uuid)] Restoring .recording for runner \(runner.id)")
-                        self.setPhase(.recording, forRunner: runner.id)
-                    }
-                }
+//                if dot.isRecording,
+//                   let runner = RunnerStore.shared.runner(forSensorUuid: uuid) {
+//                    let phase = self.runnerPhasesInternal[runner.id] ?? .idle
+//                    if phase == .idle || phase.isError {
+//                        print("🔄 [\(uuid)] Restoring .recording for runner \(runner.id)")
+//                        self.setPhase(.recording, forRunner: runner.id)
+//                    }
+//                }
 
                 self.notify()
+
+                // DEBUG ONLY — remove after testing
+//                setOnMain { dot.flashCorrupted = true }
+                
+                DispatchQueue.main.async {
+                    self.objectWillChange.send()
+                }
             }
         } completion: {}
     }
@@ -673,11 +707,12 @@ final class DotManager: NSObject, ObservableObject {
     private func initializeAfterConnect(dot: Dot, settleDelay: TimeInterval = 0) {
         let uuid = dot.address
 
-        dot.checkRecordingStatus { [weak self] isRecording in
+        dot.checkSensorActivity { [weak self] activity in
             guard let self else { return }
             self.stateQueue.async {
 
-                if isRecording {
+                switch activity {
+                case .recording:
                     print("⏳ [\(uuid)] Still recording — skipping flash query")
                     self.registry.initializationInProgress.remove(uuid)
                     self.registry.setConnectionPhase(uuid, .ready)
@@ -692,8 +727,18 @@ final class DotManager: NSObject, ObservableObject {
                         }
                     }
                     self.notify()
-                } else {
 
+                case .erasing:
+                    print("⏳ [\(uuid)] Still erasing from previous session — skipping flash query")
+                    self.registry.initializationInProgress.remove(uuid)
+                    self.registry.setConnectionPhase(uuid, .ready)
+                    print("✅ [\(uuid)] phase now .ready (erasing device, flash skipped)")
+                    dot.refreshBattery()
+                    setOnMain { dot.isErasingFromPreviousSession = true }
+                    dot.startErasePollFromManager()
+                    self.notify()
+
+                case .idle:
                     self.refreshStorage(dots: [dot], settleDelay: settleDelay)
                 }
             }
@@ -833,6 +878,11 @@ extension DotManager: DotConnectionDelegate {
                 }
 
                 if let dot = self.registry.dot(forUuid: device.uuid) {
+                    setOnMain {
+                        dot.isErasing = false
+                        dot.isErasingFromPreviousSession = false
+                        dot.flashCorrupted = false
+                    }
                     self.initializeAfterConnect(dot: dot)
                 }
                 self.notify()
@@ -857,6 +907,11 @@ extension DotManager: DotConnectionDelegate {
                 }
 
                 if let dot = self.registry.dot(forUuid: device.uuid) {
+                    setOnMain {
+                        dot.isErasing = false
+                        dot.isErasingFromPreviousSession = false
+                        dot.flashCorrupted = false
+                    }
                     self.initializeAfterConnect(dot: dot)
                 }
                 self.notify()
@@ -881,6 +936,11 @@ extension DotManager: DotConnectionDelegate {
             }
 
             if let dot = self.registry.dot(forUuid: device.uuid) {
+                setOnMain {
+                    dot.isErasing = false
+                    dot.isErasingFromPreviousSession = false
+                    dot.flashCorrupted = false
+                }
                 self.initializeAfterConnect(dot: dot, settleDelay: settleDelay)
 
                 self.registry.advanceConnectQueue(expect: device.uuid)
