@@ -94,6 +94,9 @@ final class Dot: ObservableObject, Identifiable {
     private var erasePollCount = 0
     private var erasePollTimer: DispatchWorkItem?
 
+    /// Called on main thread when erase state changes. Set by DotManager to trigger `notify()`.
+    var onEraseStateChanged: (() -> Void)?
+
     /// Re-publishes when sensor names change so views pick up `displayName` updates.
     private var nameStoreSubscription: AnyCancellable?
 
@@ -285,7 +288,10 @@ final class Dot: ObservableObject, Identifiable {
                         if recStatus == .isErasing {
                             // Sensor still erasing — poll until done
                             self.setFlashSnapshot(usedBytes: 0, totalBytes: 1)
-                            setOnMain { self.isErasingFromPreviousSession = true }
+                            setOnMain {
+                                self.isErasingFromPreviousSession = true
+                                self.onEraseStateChanged?()
+                            }
                             self.erasePollCount = 0
                             print("⏳ [\(self.address)] Sensor still erasing from previous session — waiting...")
 
@@ -387,6 +393,7 @@ final class Dot: ObservableObject, Identifiable {
                         setOnMain {
                             self.isErasingFromPreviousSession = false
                             self.flashCorrupted = true
+                            self.onEraseStateChanged?()
                         }
                     } else {
                         // Schedule next poll in 3 seconds
@@ -400,6 +407,7 @@ final class Dot: ObservableObject, Identifiable {
                         setOnMain {
                             self.isErasingFromPreviousSession = false
                             self.flashCorrupted = false
+                            self.onEraseStateChanged?()
                         }
                         print("✅ [\(self.address)] Flash recovered after erase")
                     }
@@ -427,7 +435,7 @@ final class Dot: ObservableObject, Identifiable {
             guard let self else { completion(false); return }
 
             guard success, self.isInitialized else {
-                print("❌ [\(self.address)] Cannot start recording (not initialized)")
+                print("❌ [\(self.address)] Cannot start recording (flashInfo=\(success) initialized=\(self.isInitialized))")
                 completion(false)
                 return
             }

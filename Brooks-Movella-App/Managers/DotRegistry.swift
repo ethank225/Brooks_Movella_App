@@ -30,6 +30,10 @@ final class DotRegistry {
     var syncingUuids: Set<String> = []
     var isScanningInternal: Bool = false
 
+    var hasErasingFromPreviousSession: Bool {
+        byUuid.values.contains { $0.dot?.isErasingFromPreviousSession == true }
+    }
+
     // MARK: - Snapshots
 
     var discovered: [DotDevice] {

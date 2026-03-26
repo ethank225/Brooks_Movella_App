@@ -5,11 +5,15 @@ struct ExportResultsSection: View {
     let onRetryUpload: (ExportTask) -> Void
 
     @State private var showShareSheet = false
+    @State private var sharePackageURL: URL?
 
     private var isExporting: Bool { exportManager.exportPhase == .exporting }
     private var isDone: Bool { exportManager.exportPhase == .done }
     private var hasFailed: Bool {
         exportManager.tasks.contains { $0.status == .failed || $0.status == .canceled }
+    }
+    private var hasExportedFiles: Bool {
+        !exportManager.exportedSessionFolderURLs.isEmpty || !exportManager.exportedFileURLs.isEmpty
     }
 
     var body: some View {
@@ -42,10 +46,22 @@ struct ExportResultsSection: View {
                         }
                     }
 
-                    if !exportManager.exportedFileURLs.isEmpty {
+                    if hasExportedFiles {
                         FullWidthButton(icon: "square.and.arrow.up", label: "Share Exported Files", color: .blue) {
-                            showShareSheet = true
+                            if let url = exportManager.packageForSharing() {
+                                print("📄 Sharing package: \(url.lastPathComponent)")
+                                sharePackageURL = url
+                                showShareSheet = true
+                            } else {
+                                // Fallback: share individual files.
+                                sharePackageURL = nil
+                                showShareSheet = true
+                            }
                         }
+
+                        Text("Files also saved to Files \u{2192} Exports")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
                     }
 
                     Button {
@@ -67,7 +83,9 @@ struct ExportResultsSection: View {
             }
         }
         .sheet(isPresented: $showShareSheet) {
-            if !exportManager.exportedFileURLs.isEmpty {
+            if let packageURL = sharePackageURL {
+                ShareSheet(urls: [packageURL])
+            } else if !exportManager.exportedFileURLs.isEmpty {
                 ShareSheet(urls: exportManager.exportedFileURLs)
             }
         }

@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Flash Recovery — Brooks Movella App</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<nav class="top-nav">
+  <span class="brand">Brooks Movella</span>
+  <a href="index.html">Home</a>
+  <a href="overview.html">Overview</a>
+  <a href="queues.html">Queues</a>
+  <a href="connections.html">Connections</a>
+  <a href="sync.html">Sync</a>
+  <a href="registry.html">Registry</a>
+  <a href="operations.html">Operations</a>
+  <a href="export.html">Export</a>
+  <a href="flash-recovery.html" class="active">Flash Recovery</a>
+  <a href="tests.html">Tests</a>
+</nav>
+
+<div class="container">
+  <h1>Flash Recovery System</h1>
+  <p class="subtitle">Detecting and recovering from corrupted flash storage on Movella DOT sensors.</p>
+
+  <h2>Background</h2>
+
+  <p>A single change &mdash; sorting connected dots alphabetically in DotRegistry &mdash; introduced a race condition in the connection queue. When the SDK auto-reconnected sensors in a different order than the queue expected, it attempted to connect already-connected sensors. This corrupted the BLE state, and if the sensor was performing a flash operation at the time, the flash storage index was left in an inconsistent state (the SDK reports <code>XSFlashInfoIsUninitialized</code> and <code>getFlashInfo</code> returns 0/0).</p>
+
+  <p>A second corruption path was discovered through testing: killing the app mid-erase. The sensor firmware continues erasing after BLE disconnect, but the app has no record of the ongoing operation on next launch.</p>
+
+  <h2>Root Causes and Fixes</h2>
+
+  <h3>Race condition in connection queue</h3>
+
+  <p>Sorting dots alphabetically changed the queue order, but the SDK reconnects in whatever order Bluetooth responds. Device B could connect while Device A was <code>connectInProgress</code>, causing <code>advanceConnectQueue</code> to clear A's slot. This left <code>connectInProgress</code> stuck and could corrupt BLE state during flash operations.</p>
+
+  <p><strong>Fix:</strong> <code>advanceConnectQueue(expect:)</code> only clears <code>connectInProgress</code> if it matches the expected device UUID. Eliminates double-connects entirely.</p>
+
+  <h3>App killed mid-erase</h3>
+
+  <p>Cannot be prevented &mdash; iOS allows force-kill at any time. The sensor firmware continues erasing independently. On next connect, the app sees 0/0 flash and no record of an ongoing erase.</p>
+
+  <p><strong>Fix:</strong> Detect mid-erase via <code>recordingStatus == .isErasing</code>, poll until complete.</p>
+
+  <h2>Detection Layers</h2>
+
+  <p>Flash issues are detected at four points. Each covers a different timing scenario:</p>
+
+  <ol>
+    <li><strong><code>checkSensorActivity</code></strong> (Dot.swift) &mdash; On connect, checks <code>recordingStatus</code> before any flash query. If <code>.isErasing</code>, skips flash query and starts polling. Fastest path.</li>
+    <li><strong><code>getFlashInfo</code> callback</strong> (Dot.swift) &mdash; If the SDK responds with 0/0 or <code>.isUninitialized</code>, checks <code>recordingStatus</code>. If <code>.isErasing</code>, starts polling. If not, marks <code>flashCorrupted</code>.</li>
+    <li><strong><code>refreshStorage</code> timeout</strong> (DotManager.swift) &mdash; If <code>getFlashInfo</code> times out after 5s (SDK won't respond during erase), checks <code>recordingStatus</code> as fallback. If <code>.isErasing</code>, starts polling instead of marking failed.</li>
+    <li><strong>Erase poll limit</strong> (Dot.swift) &mdash; After 60 polls (3 minutes), gives up and marks <code>flashCorrupted</code>. Safety net for stuck erases.</li>
+  </ol>
+
+  <h2>Two States</h2>
+
+  <p><strong><code>isErasingFromPreviousSession</code></strong>: Sensor is mid-erase from a previous session. Firmware is still working. App polls <code>recordingStatus</code> every 3 seconds until erase completes, then reads flash info. No user action needed.</p>
+
+  <p><strong><code>flashCorrupted</code></strong>: Flash is truly corrupted and sensor is not erasing. User must erase to recover. Recording and export blocked globally while any sensor has a flash issue.</p>
+
+  <h2>UI Components</h2>
+
+  <p>Each flash state has a dedicated row component in <code>Views/Components/DeviceRows/</code> that replaces the normal sensor row:</p>
+
+  <table>
+    <thead>
+      <tr><th>State</th><th>Component</th><th>Visual</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>isErasingFromPreviousSession</code></td>
+        <td><code>ErasingSensorRow</code></td>
+        <td>Clock icon + &ldquo;Finishing erase from previous session&rdquo; + pink shimmer bar. Pink breathing background.</td>
+      </tr>
+      <tr>
+        <td>User-initiated erase</td>
+        <td><code>ClearingSensorRow</code></td>
+        <td>Pulsing red trash icon + &ldquo;Clearing flash storage&rdquo; + red shimmer bar. Pink breathing background.</td>
+      </tr>
+      <tr>
+        <td><code>flashCorrupted</code></td>
+        <td><code>CorruptedSensorRow</code></td>
+        <td>Orange warning icon + &ldquo;Storage corrupted&rdquo; + Erase button. Orange background.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p><code>ObservedDotContent</code> (ConnectionView.swift) wraps the Dot with <code>@ObservedObject</code> so the row reacts automatically when <code>isErasingFromPreviousSession</code>, <code>flashCorrupted</code>, or <code>isErasing</code> change. Background color, <code>canErase</code>, and the row variant switch all live inside this sub-view and update without needing <code>DotManager.notify()</code>.</p>
+
+  <p>Status banners on the Record and Export tabs (<code>ErasingBanner</code>, <code>FlashIssueBanner</code> in <code>Views/Components/Shared/StatusBanners.swift</code>) read from <code>DotManager.hasFlashIssue</code> / <code>isAnyErasingFromPreviousSession</code>, which depend on the <code>connectedDots</code> snapshot. These update via the <code>onEraseStateChanged</code> callback (see below).</p>
+
+  <h2>Polling Mechanism</h2>
+
+  <p>When mid-erase is detected, <code>startErasePoll()</code> runs on <code>sdkQueue</code>:</p>
+
+  <ul>
+    <li>Every 3 seconds: calls <code>getRecordingStatus()</code>, waits 0.5s, reads <code>recordingStatus</code></li>
+    <li>Still <code>.isErasing</code> &rarr; schedule next poll</li>
+    <li>No longer <code>.isErasing</code> &rarr; erase done, call <code>getFlashInfo</code> for real values, clear flag</li>
+    <li>After 60 polls (3 min) &rarr; give up, mark <code>flashCorrupted</code></li>
+  </ul>
+
+  <p>Typical erase takes ~42 seconds (~14 polls).</p>
+
+  <h2>Scanning Suppression</h2>
+
+  <p>Bluetooth scanning is suppressed while any sensor has <code>isErasingFromPreviousSession == true</code>. Without this guard, the 1-second auto-retry scan timer in ConnectionView can trigger SDK-internal reconnects during polling. A reconnect clears the erase flags in <code>onDeviceConnectSucceeded</code>, then <code>initializeAfterConnect</code> detects the erase again and restarts polling &mdash; creating an infinite loop.</p>
+
+  <p>The guard lives in <code>DotManager.startScan()</code> via <code>DotRegistry.hasErasingFromPreviousSession</code>. All scan triggers (timer, pull-to-refresh, manual button) flow through <code>startScan()</code>, so a single check blocks them all. Scanning resumes automatically on the next timer tick after the flag clears.</p>
+
+  <h2>Post-Stop Settle Delay</h2>
+
+  <p>When a recording that was resumed from a previous app session is stopped, the SDK does not respond to <code>getFlashInfo</code> immediately. The sensor firmware needs time to finalize the flash storage index after the stop. Without a delay, <code>getFlashInfo</code> times out repeatedly &mdash; blocking the export page from fetching recordings and preventing new recordings from starting.</p>
+
+  <p><code>DotManager.endSession()</code> waits 2 seconds after all sensors confirm stopped before calling <code>getFlashInfo</code>. This matches the existing settle delay pattern used after Bluetooth-reset reconnects in <code>initializeAfterConnect</code>.</p>
+
+  <h2>State Change Callback</h2>
+
+  <p><code>Dot.onEraseStateChanged</code> is a closure set by <code>DotManager</code> in all three connection paths (<code>onDeviceConnectSucceeded</code>). It fires on the main thread when <code>isErasingFromPreviousSession</code> is set to <code>true</code> or cleared (poll success and poll timeout). The callback calls <code>DotManager.notify()</code> on <code>stateQueue</code>, which re-pushes the <code>connectedDots</code> snapshot. This causes the Record and Export tabs to re-evaluate <code>hasFlashIssue</code> and update their banners.</p>
+
+  <p>The Connect tab does not need this callback &mdash; it uses <code>ObservedDotContent</code> with <code>@ObservedObject</code> to react directly to the Dot&rsquo;s <code>@Published</code> properties.</p>
+
+  <h2>Connection Reset</h2>
+
+  <p>On every new connection, all flags reset before <code>initializeAfterConnect</code>:</p>
+
+  <ul>
+    <li><code>isErasing = false</code></li>
+    <li><code>isErasingFromPreviousSession = false</code></li>
+    <li><code>flashCorrupted = false</code></li>
+  </ul>
+
+  <p>Detection logic determines real state from hardware. No stale values carry over.</p>
+
+  <h2>SDK Reference</h2>
+
+  <table>
+    <thead>
+      <tr><th>Symbol</th><th>Meaning</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>XSFlashInfoStatus.isUninitialized</code></td>
+        <td>Flash needs erase</td>
+      </tr>
+      <tr>
+        <td><code>XSRecordingStatus.isErasing</code> (value 100)</td>
+        <td>Sensor is mid-erase</td>
+      </tr>
+      <tr>
+        <td><code>XSRecordingStatus.isIdle</code> (value 0)</td>
+        <td>Sensor is idle</td>
+      </tr>
+      <tr>
+        <td><code>getFlashInfo</code></td>
+        <td>Will not respond while sensor is erasing</td>
+      </tr>
+      <tr>
+        <td><code>eraseData</code></td>
+        <td>Continues at firmware level after BLE disconnect</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="page-nav">
+    <a href="export.html">&larr; Export Pipeline</a>
+    <a href="tests.html">Unit Tests &rarr;</a>
+  </div>
+</div>
+
+</body>
+</html>

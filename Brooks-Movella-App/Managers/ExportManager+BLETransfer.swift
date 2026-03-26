@@ -136,6 +136,11 @@ extension ExportManager {
                                     setOnMain { task.hasPacketLoss = true }
                                     self.setTaskStatus(task, .failed, error: "Packet loss detected")
                                 } else {
+                                    // Log file size at finalization for truncation debugging
+                                    if let attrs = try? FileManager.default.attributesOfItem(atPath: csvPath.path),
+                                       let size = attrs[.size] as? Int {
+                                        print("📏 [\(dot.address)] Final CSV size: \(csvPath.lastPathComponent) = \(size) bytes (\(size / 1024) KB)")
+                                    }
                                     setOnMain {
                                         task.progress = 1.0
                                         task.outputURL = csvPath

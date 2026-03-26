@@ -228,6 +228,7 @@ struct CartView: View {
         let study: String
         let test: String
         let product: String
+        let sessionMetadata: SessionMetadata?
     }
 
     @ObservedObject private var exportManager   = ExportManager.shared
@@ -433,7 +434,8 @@ struct CartView: View {
             profileId: profile.id,
             dbSessionMap: Dictionary(uniqueKeysWithValues: dbSessionMap.map { ($0.key.uuidString, $0.value) }),
             shoeBrand: shoeBrand, shoeModel: shoeModel, shoeGeneration: shoeGeneration,
-            conditionTags: conditionTags, study: study, test: test, product: product
+            conditionTags: conditionTags, study: study, test: test, product: product,
+            sessionMetadata: exportManager.sessionMetadata
         )
         if let data = try? JSONEncoder().encode(ctx) {
             UserDefaults.standard.set(data, forKey: "activeExportContext")
@@ -459,6 +461,7 @@ struct CartView: View {
         shoeBrand = ctx.shoeBrand; shoeModel = ctx.shoeModel; shoeGeneration = ctx.shoeGeneration
         conditionTags = ctx.conditionTags; study = ctx.study; test = ctx.test; product = ctx.product
         selectedProfile = supabaseManager.profiles.first(where: { $0.id == ctx.profileId })
+        exportManager.sessionMetadata = ctx.sessionMetadata
 
         // Re-wire callback only if tasks are still in flight.
         if exportManager.exportPhase == .exporting {
@@ -504,6 +507,19 @@ struct CartView: View {
             return
         }
         dbSessionMap = map
+
+        exportManager.sessionMetadata = SessionMetadata(
+            runnerName: profile.displayName,
+            shoeBrand: shoeBrand,
+            shoeModel: shoeModel,
+            shoeGeneration: shoeGeneration,
+            conditionType: conditionType,
+            study: study,
+            test: test,
+            product: product,
+            outputRate: DotManager.shared.selectedOutputRate,
+            filterIndex: DotManager.shared.selectedFilterIndex
+        )
         saveExportContext()
 
         exportManager.onTaskCompleted = { [self] task in

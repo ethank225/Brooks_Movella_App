@@ -4,6 +4,23 @@ import UserNotifications
 import MovellaDotSdk
 import Combine
 
+// MARK: - Session Metadata
+
+/// Metadata captured from the CartView before export starts.
+/// Written into `metadata.csv` inside each session folder.
+struct SessionMetadata: Codable {
+    let runnerName: String
+    let shoeBrand: String
+    let shoeModel: String
+    let shoeGeneration: String
+    let conditionType: String
+    let study: String
+    let test: String
+    let product: String
+    let outputRate: Int
+    let filterIndex: Int
+}
+
 // MARK: - ExportManager
 
 /// Singleton managing the recording-export lifecycle:
@@ -21,6 +38,7 @@ final class ExportManager: ObservableObject {
 
     private init() {
         restorePersistedTasks()
+        cleanupSharePackages()
 
         // Prune recordings and cart items when sensors disconnect.
         DotManager.shared.$connectedDots
@@ -83,6 +101,16 @@ final class ExportManager: ObservableObject {
 
     /// Called on the main thread immediately after each file's BLE transfer succeeds.
     var onTaskCompleted: ((ExportTask) -> Void)?
+
+    // MARK: - Session Folder State
+
+    /// Metadata for the current export session, set by CartView before calling startExport().
+    var sessionMetadata: SessionMetadata?
+
+    /// Session folder URLs from the most recent export. Populated after organizeIntoSessionFolders().
+    /// Used by the share sheet's packageForSharing(). Not persisted — session folders in
+    /// Documents/Exports/ are permanent user data managed via the Files app.
+    var exportedSessionFolderURLs: [URL] = []
 
     // MARK: - Disconnection Pruning
 
@@ -284,12 +312,9 @@ final class ExportManager: ObservableObject {
             guard let self else { return }
             for _ in 0..<deviceCount { semaphore.wait() }
             DispatchQueue.main.async {
-                guard self.exportSequenceGeneration == myGen else { return }
                 self.exportPendingSignals = 0
-                self.exportPhase = .done
-                self.sendCompletionNotification()
-                self.endExportBackgroundTask()
             }
+            self.finalizeExport(generation: myGen)
         }
     }
 
@@ -343,10 +368,20 @@ final class ExportManager: ObservableObject {
         for _ in 0..<pending { currentExportSemaphore?.signal() }
         currentExportSemaphore = nil
 
-        setOnMain {
-            self.exportPhase = .done
-            self.sendCompletionNotification()
-            self.endExportBackgroundTask()
+        // Snapshot on main, then organize on fileQueue after pending close/delete ops.
+        let snapshot = snapshotSuccessTasks()
+        let metadata = sessionMetadata
+        fileQueue.async { [weak self] in
+            guard let self else { return }
+            if let metadata, !snapshot.isEmpty {
+                self.organizeIntoSessionFolders(snapshot: snapshot, metadata: metadata)
+            }
+            DispatchQueue.main.async {
+                self.exportPhase = .done
+                self.persistTasks()
+                self.sendCompletionNotification()
+                self.endExportBackgroundTask()
+            }
         }
     }
 
@@ -434,9 +469,19 @@ final class ExportManager: ObservableObject {
             let grouped = Dictionary(grouping: fullPipeline, by: { $0.cartItem.recording.dotAddress })
 
             guard !grouped.isEmpty else {
-                self.exportPhase = .done
-                self.sendCompletionNotification()
-                self.endExportBackgroundTask()
+                let snapshot = self.snapshotSuccessTasks()
+                let metadata = self.sessionMetadata
+                self.fileQueue.async {
+                    if let metadata, !snapshot.isEmpty {
+                        self.organizeIntoSessionFolders(snapshot: snapshot, metadata: metadata)
+                    }
+                    DispatchQueue.main.async {
+                        self.exportPhase = .done
+                        self.persistTasks()
+                        self.sendCompletionNotification()
+                        self.endExportBackgroundTask()
+                    }
+                }
                 return
             }
 
@@ -461,12 +506,7 @@ final class ExportManager: ObservableObject {
                     semaphore.wait()
                 }
 
-                DispatchQueue.main.async {
-                    guard self.exportSequenceGeneration == myGen else { return }
-                    self.exportPhase = .done
-                    self.sendCompletionNotification()
-                    self.endExportBackgroundTask()
-                }
+                self.finalizeExport(generation: myGen)
             }
         }
     }
@@ -504,9 +544,19 @@ final class ExportManager: ObservableObject {
                         task.progress = 1.0
                         task.outputURL = csv
                         task.error = nil
-                        self.exportPhase = .done
-                        self.sendCompletionNotification()
-                        self.endExportBackgroundTask()
+                        let snapshot = self.snapshotSuccessTasks()
+                        let metadata = self.sessionMetadata
+                        self.fileQueue.async {
+                            if let metadata, !snapshot.isEmpty {
+                                self.organizeIntoSessionFolders(snapshot: snapshot, metadata: metadata)
+                            }
+                            DispatchQueue.main.async {
+                                self.exportPhase = .done
+                                self.persistTasks()
+                                self.sendCompletionNotification()
+                                self.endExportBackgroundTask()
+                            }
+                        }
                     } else {
                         // File is gone — run the full BLE pipeline.
                         // Sequence state mutations happen here on main, matching the contract.
@@ -526,24 +576,14 @@ final class ExportManager: ObservableObject {
                             guard !self.currentExportCanceled,
                                   let dot = DotManager.shared.dot(forUuid: address), dot.isConnected else {
                                 self.setTaskStatus(task, .failed, error: "Sensor disconnected")
-                                DispatchQueue.main.async {
-                                    guard self.exportSequenceGeneration == myGen else { return }
-                                    self.exportPhase = .done
-                                    self.sendCompletionNotification()
-                                    self.endExportBackgroundTask()
-                                }
+                                self.finalizeExport(generation: myGen)
                                 return
                             }
 
                             self.exportFilesForDot(dot: dot, tasks: [task]) { semaphore.signal() }
                             semaphore.wait()
 
-                            DispatchQueue.main.async {
-                                guard self.exportSequenceGeneration == myGen else { return }
-                                self.exportPhase = .done
-                                self.sendCompletionNotification()
-                                self.endExportBackgroundTask()
-                            }
+                            self.finalizeExport(generation: myGen)
                         }
                     }
                 }
@@ -552,17 +592,24 @@ final class ExportManager: ObservableObject {
             // No deletion needed — file state is stable. Synchronous check is safe on
             // main because the file was never touched by a partial transfer.
             if FileManager.default.fileExists(atPath: csv.path) {
-                setOnMain {
-                    task.status = .success
-                    task.subphase = .complete
-                    task.progress = 1.0
-                    task.outputURL = csv
-                    task.error = nil
-                }
-                DispatchQueue.main.async {
-                    self.exportPhase = .done
-                    self.sendCompletionNotification()
-                    self.endExportBackgroundTask()
+                task.status = .success
+                task.subphase = .complete
+                task.progress = 1.0
+                task.outputURL = csv
+                task.error = nil
+                let snapshot = snapshotSuccessTasks()
+                let metadata = sessionMetadata
+                fileQueue.async { [weak self] in
+                    guard let self else { return }
+                    if let metadata, !snapshot.isEmpty {
+                        self.organizeIntoSessionFolders(snapshot: snapshot, metadata: metadata)
+                    }
+                    DispatchQueue.main.async {
+                        self.exportPhase = .done
+                        self.persistTasks()
+                        self.sendCompletionNotification()
+                        self.endExportBackgroundTask()
+                    }
                 }
                 return
             }
@@ -583,24 +630,14 @@ final class ExportManager: ObservableObject {
                 guard !self.currentExportCanceled,
                       let dot = DotManager.shared.dot(forUuid: address), dot.isConnected else {
                     self.setTaskStatus(task, .failed, error: "Sensor disconnected")
-                    DispatchQueue.main.async {
-                        guard self.exportSequenceGeneration == myGen else { return }
-                        self.exportPhase = .done
-                        self.sendCompletionNotification()
-                        self.endExportBackgroundTask()
-                    }
+                    self.finalizeExport(generation: myGen)
                     return
                 }
 
                 self.exportFilesForDot(dot: dot, tasks: [task]) { semaphore.signal() }
                 semaphore.wait()
 
-                DispatchQueue.main.async {
-                    guard self.exportSequenceGeneration == myGen else { return }
-                    self.exportPhase = .done
-                    self.sendCompletionNotification()
-                    self.endExportBackgroundTask()
-                }
+                self.finalizeExport(generation: myGen)
             }
         }
     }
@@ -619,8 +656,13 @@ final class ExportManager: ObservableObject {
     func resetExport() {
         clearPersistedTasks()
         tasks.removeAll()
+        exportedSessionFolderURLs.removeAll()
+        sessionMetadata = nil
         hasRestoredTasks = false
         exportPhase = recordings.isEmpty ? .idle : .ready
+        cleanupSharePackages()
+        // Clean up flat CSVs that were copied into session folders.
+        fileQueue.async { self.cleanupFlatExportFiles() }
     }
 
     func dismissRestoredTasksBanner() {
@@ -653,7 +695,22 @@ final class ExportManager: ObservableObject {
         return "\(label)_\(last4)_f\(fileIndex)_\(idHash)"
     }
 
+    /// Flat CSV cache directory (hidden from Files app). BLE transfers write here.
     func exportDir() -> URL? {
+        let fm = FileManager.default
+        guard let appSupport = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else { return nil }
+        let dir = appSupport.appendingPathComponent("ExportCache", isDirectory: true)
+        do {
+            try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+            return dir
+        } catch {
+            print("❌ Failed to create ExportCache directory: \(error)")
+            return nil
+        }
+    }
+
+    /// Session folder directory (visible in Files app). Only clean session folders live here.
+    func sessionExportDir() -> URL? {
         let fm = FileManager.default
         guard let docs = fm.urls(for: .documentDirectory, in: .userDomainMask).first else { return nil }
         let dir = docs.appendingPathComponent("Exports", isDirectory: true)
@@ -671,6 +728,237 @@ final class ExportManager: ObservableObject {
             .replacingOccurrences(of: "/", with: "_")
             .replacingOccurrences(of: ":", with: "_")
             .replacingOccurrences(of: " ", with: "_")
+    }
+
+    // MARK: - Session Folder Organization
+
+    private static let sessionFolderFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd_HH-mm-ss"
+        f.timeZone = .current
+        return f
+    }()
+
+    /// Snapshot of task data captured on the main thread for thread-safe file operations.
+    struct TaskMoveInfo {
+        let sourceURL: URL
+        let sessionId: UUID
+        let label: String
+        let dotAddress: String
+        let fileIndex: Int
+        let timestamp: UInt32
+        let taskId: String
+    }
+
+    /// Snapshots successful task data on the main thread. Must be called on main.
+    func snapshotSuccessTasks() -> [TaskMoveInfo] {
+        tasks.compactMap { task in
+            guard task.status == .success, let url = task.outputURL else { return nil }
+            return TaskMoveInfo(
+                sourceURL: url,
+                sessionId: task.cartItem.sessionId,
+                label: task.cartItem.label,
+                dotAddress: task.cartItem.recording.dotAddress,
+                fileIndex: task.cartItem.recording.fileIndex,
+                timestamp: task.cartItem.recording.timestamp,
+                taskId: task.id
+            )
+        }
+    }
+
+    /// Groups successful tasks into timestamped session folders with metadata.csv.
+    /// Must be called on `fileQueue` with pre-snapshotted task data.
+    func organizeIntoSessionFolders(snapshot: [TaskMoveInfo], metadata: SessionMetadata) {
+        guard let baseDir = sessionExportDir() else { return }
+        guard !snapshot.isEmpty else { return }
+
+        let grouped = Dictionary(grouping: snapshot) { $0.sessionId }
+        var folderURLs: [URL] = []
+
+        for (_, sessionItems) in grouped {
+            let earliest = sessionItems
+                .map { $0.timestamp }
+                .min() ?? UInt32(Date().timeIntervalSince1970)
+            let date = Date(timeIntervalSince1970: TimeInterval(earliest))
+            let folderName = Self.sessionFolderFormatter.string(from: date)
+
+            // Disambiguate if folder already exists.
+            var sessionDir = baseDir.appendingPathComponent(folderName, isDirectory: true)
+            var suffix = 1
+            while FileManager.default.fileExists(atPath: sessionDir.path) {
+                sessionDir = baseDir.appendingPathComponent("\(folderName)_\(suffix)", isDirectory: true)
+                suffix += 1
+            }
+
+            do {
+                try FileManager.default.createDirectory(at: sessionDir, withIntermediateDirectories: true)
+            } catch {
+                print("Failed to create session folder: \(error)")
+                continue
+            }
+
+            writeMetadataCSV(to: sessionDir, metadata: metadata, items: sessionItems)
+
+            for item in sessionItems {
+                let preferredName = sanitize(item.label) + ".csv"
+                safeCopy(from: item.sourceURL, toDirectory: sessionDir, preferredName: preferredName, taskId: item.taskId)
+            }
+
+            folderURLs.append(sessionDir)
+        }
+
+        setOnMain { self.exportedSessionFolderURLs = folderURLs }
+    }
+
+    /// Copies a file into a directory with collision checking.
+    /// The original stays in place for uploads; cleaned up later via `cleanupFlatExportFiles()`.
+    @discardableResult
+    private func safeCopy(from source: URL, toDirectory dir: URL, preferredName: String, taskId: String) -> URL? {
+        let fm = FileManager.default
+        var targetURL = dir.appendingPathComponent(preferredName)
+
+        if fm.fileExists(atPath: targetURL.path) {
+            let stem = preferredName.replacingOccurrences(of: ".csv", with: "")
+            let suffix = String(taskId.prefix(6))
+            targetURL = dir.appendingPathComponent("\(stem)_\(suffix).csv")
+        }
+
+        do {
+            try fm.copyItem(at: source, to: targetURL)
+            return targetURL
+        } catch {
+            print("Failed to copy \(source.lastPathComponent) -> \(targetURL.lastPathComponent): \(error)")
+            return nil
+        }
+    }
+
+    // MARK: - Share Packaging
+
+    /// Assembles all session folders into a single shareable bundle in tmp/.
+    /// Returns the top-level folder URL (e.g. `tmp/BrooksExport_2026-03-22/`).
+    func packageForSharing() -> URL? {
+        let fm = FileManager.default
+        guard !exportedSessionFolderURLs.isEmpty else { return nil }
+
+        let dateStr = Self.shareDateFormatter.string(from: Date())
+        let packageDir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("BrooksExport_\(dateStr)", isDirectory: true)
+
+        // Remove any stale package at this path.
+        try? fm.removeItem(at: packageDir)
+
+        do {
+            try fm.createDirectory(at: packageDir, withIntermediateDirectories: true)
+        } catch {
+            print("Failed to create share package: \(error)")
+            return nil
+        }
+
+        for folderURL in exportedSessionFolderURLs {
+            let dest = packageDir.appendingPathComponent(folderURL.lastPathComponent, isDirectory: true)
+            do {
+                try fm.copyItem(at: folderURL, to: dest)
+            } catch {
+                print("Failed to copy session folder \(folderURL.lastPathComponent): \(error)")
+            }
+        }
+
+        return packageDir
+    }
+
+    private static let shareDateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd"
+        f.timeZone = .current
+        return f
+    }()
+
+    /// Removes any BrooksExport_* directories from the tmp directory.
+    func cleanupSharePackages() {
+        let fm = FileManager.default
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
+        let items = (try? fm.contentsOfDirectory(at: tmp, includingPropertiesForKeys: nil)) ?? []
+        for item in items where item.lastPathComponent.hasPrefix("BrooksExport_") {
+            try? fm.removeItem(at: item)
+        }
+    }
+
+    /// Deletes flat CSV files in the Exports/ root that have been copied into session folders.
+    /// Safe to call after all uploads complete. Must be called on `fileQueue`.
+    func cleanupFlatExportFiles() {
+        guard let dir = exportDir() else { return }
+        let fm = FileManager.default
+        let items = (try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? []
+        for item in items where item.pathExtension == "csv" {
+            try? fm.removeItem(at: item)
+        }
+    }
+
+    /// Writes a metadata.csv file summarizing the export session.
+    private func writeMetadataCSV(to dir: URL, metadata: SessionMetadata, items: [TaskMoveInfo]) {
+        var rows: [[String]] = []
+        rows.append(["Key", "Value"])
+        rows.append(["Runner Name", metadata.runnerName])
+        rows.append(["Shoe Brand", metadata.shoeBrand])
+        rows.append(["Shoe Model", metadata.shoeModel])
+        rows.append(["Shoe Generation", metadata.shoeGeneration])
+        rows.append(["Condition Type", metadata.conditionType])
+        rows.append(["Study", metadata.study])
+        rows.append(["Test", metadata.test])
+        rows.append(["Product", metadata.product])
+        rows.append(["Output Rate (Hz)", "\(metadata.outputRate)"])
+        rows.append(["Filter Profile", "\(metadata.filterIndex)"])
+
+        let sensorAddresses = Set(items.map { $0.dotAddress })
+        for address in sensorAddresses.sorted() {
+            let name = SensorNameStore.shared.names[address] ?? address
+            rows.append(["Sensor", "\(name) (\(address))"])
+        }
+
+        let isoFormatter = ISO8601DateFormatter()
+        for item in items.sorted(by: { $0.fileIndex < $1.fileIndex }) {
+            let date = Date(timeIntervalSince1970: TimeInterval(item.timestamp))
+            rows.append(["Recording (\(item.label))", isoFormatter.string(from: date)])
+        }
+
+        let csv = rows.map { row in
+            row.map { field in
+                // Escape fields containing commas or quotes.
+                if field.contains(",") || field.contains("\"") {
+                    return "\"" + field.replacingOccurrences(of: "\"", with: "\"\"") + "\""
+                }
+                return field
+            }.joined(separator: ",")
+        }.joined(separator: "\n") + "\n"
+
+        let url = dir.appendingPathComponent("metadata.csv")
+        try? csv.data(using: .utf8)?.write(to: url, options: .atomic)
+    }
+
+    /// Snapshots task data on main, organizes into session folders on `fileQueue`,
+    /// then transitions to `.done` on main.
+    private func finalizeExport(generation: Int) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            guard self.exportSequenceGeneration == generation else { return }
+
+            // Snapshot @Published task data on main thread.
+            let snapshot = self.snapshotSuccessTasks()
+            let metadata = self.sessionMetadata
+
+            self.fileQueue.async {
+                if let metadata, !snapshot.isEmpty {
+                    self.organizeIntoSessionFolders(snapshot: snapshot, metadata: metadata)
+                }
+                DispatchQueue.main.async {
+                    guard self.exportSequenceGeneration == generation else { return }
+                    self.exportPhase = .done
+                    self.persistTasks()
+                    self.sendCompletionNotification()
+                    self.endExportBackgroundTask()
+                }
+            }
+        }
     }
 
     // MARK: - Background Task

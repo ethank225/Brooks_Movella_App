@@ -28,8 +28,10 @@ extension ExportManager {
     // MARK: - Storage URL
 
     private var exportRecordsURL: URL? {
-        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first?
-            .appendingPathComponent("export_records.json")
+        let fm = FileManager.default
+        guard let appSupport = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else { return nil }
+        try? fm.createDirectory(at: appSupport, withIntermediateDirectories: true)
+        return appSupport.appendingPathComponent("export_records.json")
     }
 
     // MARK: - Persist
@@ -70,8 +72,18 @@ extension ExportManager {
     /// Called once from init(). Rehydrates tasks from the JSON file if it exists.
     /// Verifies CSVs still exist for success tasks; deletes orphaned CSVs from mid-export kills.
     func restorePersistedTasks() {
-        guard let url = exportRecordsURL,
-              let data = try? Data(contentsOf: url),
+        guard let url = exportRecordsURL else { return }
+
+        var data = try? Data(contentsOf: url)
+
+        // Fallback: check old Documents path if file doesn't exist at new Application Support path.
+        if data == nil,
+           let docsURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first?
+               .appendingPathComponent("export_records.json") {
+            data = try? Data(contentsOf: docsURL)
+        }
+
+        guard let data,
               let records = try? JSONDecoder().decode([CodableExportRecord].self, from: data),
               !records.isEmpty
         else { return }
@@ -115,14 +127,12 @@ extension ExportManager {
 
         guard !restored.isEmpty else { return }
 
-        // Delete orphaned CSVs: any file in Exports/ not referenced by a success record
-        // is either a partial write from a mid-export kill or an already-failed task.
-        if let dir = exportDir() {
-            let all = (try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? []
-            for csv in all where csv.pathExtension == "csv" {
-                if !knownPaths.contains(csv.path) {
-                    try? fm.removeItem(at: csv)
-                }
+        // Delete orphaned flat CSVs in ExportCache/ (Application Support).
+        // Session folders in Documents/Exports/ are permanent user data — never deleted by the app.
+        if let cacheDir = exportDir() {
+            let cacheItems = (try? fm.contentsOfDirectory(at: cacheDir, includingPropertiesForKeys: nil)) ?? []
+            for item in cacheItems where item.pathExtension == "csv" && !knownPaths.contains(item.path) {
+                try? fm.removeItem(at: item)
             }
         }
 
@@ -133,7 +143,8 @@ extension ExportManager {
 
     /// Removes the persisted JSON file. Called from resetExport().
     func clearPersistedTasks() {
-        guard let url = exportRecordsURL else { return }
-        try? FileManager.default.removeItem(at: url)
+        if let url = exportRecordsURL {
+            try? FileManager.default.removeItem(at: url)
+        }
     }
 }

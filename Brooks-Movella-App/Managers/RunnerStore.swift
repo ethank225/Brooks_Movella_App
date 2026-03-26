@@ -15,7 +15,17 @@ final class RunnerStore: ObservableObject {
     let fileURL: URL?
 
     init(fileURL: URL? = nil) {
-        self.fileURL = fileURL ?? FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first?.appendingPathComponent("runners.json")
+        if let explicit = fileURL {
+            self.fileURL = explicit
+        } else {
+            let fm = FileManager.default
+            if let appSupport = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first {
+                try? fm.createDirectory(at: appSupport, withIntermediateDirectories: true)
+                self.fileURL = appSupport.appendingPathComponent("runners.json")
+            } else {
+                self.fileURL = nil
+            }
+        }
         isMultiRunnerMode = UserDefaults.standard.bool(forKey: "multi_runner_mode")
         load()
     }
@@ -107,9 +117,18 @@ final class RunnerStore: ObservableObject {
     // MARK: - Persistence
 
     private func load() {
-        guard let url = fileURL,
-              let data = try? Data(contentsOf: url),
-              let decoded = try? JSONDecoder().decode([Runner].self, from: data) else { return }
+        guard let url = fileURL else { return }
+
+        var data = try? Data(contentsOf: url)
+
+        // Fallback: check old Documents path if file doesn't exist at new Application Support path.
+        if data == nil,
+           let docsURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first?
+               .appendingPathComponent("runners.json") {
+            data = try? Data(contentsOf: docsURL)
+        }
+
+        guard let data, let decoded = try? JSONDecoder().decode([Runner].self, from: data) else { return }
         runners = decoded
         syncSnapshot()
     }

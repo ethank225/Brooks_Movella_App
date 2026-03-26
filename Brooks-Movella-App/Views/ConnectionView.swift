@@ -158,21 +158,13 @@ struct ConnectionView: View {
                     let displayTitle = dot?.displayName
                         ?? nameStore.names[uuid]
                         ?? Self.shortMac(from: manager.displayAddress(for: device))
-                    let isErasing = erasingUuids.contains(uuid) || (dot?.isErasingFromPreviousSession ?? false)
-                    let canErase = phase == .ready
-                        && !(dot?.isRecording ?? false)
-                        && !isErasing
-                        && !manager.sessionPhase.isBusy
-
                     DeviceRow(
                         title: displayTitle,
                         phase: phase,
                         isIdentifying: identifyingUuid == uuid,
                         dot: dot,
                         sessionBusy: manager.sessionPhase.isBusy,
-                        isErasing: isErasing,
-                        isCorrupted: dot?.flashCorrupted ?? false,
-                        canErase: canErase,
+                        isErasing: erasingUuids.contains(uuid),
                         isEditing: editingUuid == uuid,
                         editText: editingUuid == uuid ? $editText : nil,
                         onToggle: { toggleConnection(device) },
@@ -221,13 +213,6 @@ struct ConnectionView: View {
                         .background(sessionBusyColor.opacity(0.1))
                         .cornerRadius(8)
                         .padding(.horizontal)
-                    }
-
-                    // MARK: - Erasing Banner
-
-                    if manager.isErasing {
-                        ErasingBanner()
-                            .padding(.horizontal)
                     }
 
                     sensorSection
@@ -362,85 +347,43 @@ struct ConnectionView: View {
 
 // MARK: - Corrupted Sensor Row
 
-struct CorruptedSensorRow: View {
-    let displayName: String
-    var isRepairing: Bool = false
-    let onErase: () -> Void
+// MARK: - Observed Dot Content
 
-    var body: some View {
-        // Matches normalRow: VStack(spacing: 10) with top line + bottom line
-        VStack(alignment: .leading, spacing: 10) {
-            // Top line — icon + name + erase button
-            HStack(spacing: 10) {
-                if isRepairing {
-                    ProgressView()
-                        .scaleEffect(0.75)
-                        .fixedSize()
-                        .frame(width: 10, height: 10)
-                } else {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .foregroundColor(.orange)
-                        .font(.system(size: 10))
-                }
-
-                Text(displayName)
-                    .font(.headline)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-
-                Spacer()
-
-                if !isRepairing {
-                    Button(action: onErase) {
-                        Text("Erase")
-                            .font(.subheadline.weight(.semibold))
-                            .foregroundColor(.white)
-                            .padding(.horizontal, 14)
-                            .padding(.vertical, 6)
-                            .background(Color.orange)
-                            .cornerRadius(8)
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
-
-            // Bottom line — status message, left-aligned under the name
-            Text(isRepairing ? "Repairing storage..." : "Storage corrupted — tap Erase to repair")
-                .font(.caption)
-                .foregroundColor(isRepairing ? .pink : .orange)
-                .padding(.leading, 20)
-        }
-    }
-}
-
-// MARK: - Device Row
-
-struct DeviceRow: View {
+/// Sub-view that observes a Dot's @Published flags and reactively switches
+/// between the alternate row layouts (corrupted, erasing, clearing, normal).
+private struct ObservedDotContent: View {
+    @ObservedObject var dot: Dot
     let title: String
     let phase: ConnectionPhase
-    var isIdentifying: Bool = false
-    var dot: Dot? = nil
-    var sessionBusy: Bool = false
-    var isErasing: Bool = false
-    var isCorrupted: Bool = false
-    var canErase: Bool = false
-    var isEditing: Bool = false
-    var editText: Binding<String>? = nil
+    var isIdentifying: Bool
+    var isUserErasing: Bool
+    var sessionBusy: Bool
+    var isEditing: Bool
+    var editText: Binding<String>?
     let onToggle: () -> Void
-    var onErase: (() -> Void)? = nil
-    var onRepairErase: (() -> Void)? = nil
-    var onNameTap: (() -> Void)? = nil
-    var onNameCommit: (() -> Void)? = nil
-    var onIdentify: (() -> Void)? = nil
+    var onErase: (() -> Void)?
+    var onRepairErase: (() -> Void)?
+    var onNameTap: (() -> Void)?
+    var onNameCommit: (() -> Void)?
 
     @FocusState private var isFieldFocused: Bool
     @State private var eraseBreathe = false
 
     private var isBusy: Bool { phase.isBusy }
+    private var isErasing: Bool { isUserErasing || dot.isErasingFromPreviousSession }
+    private var canErase: Bool {
+        phase == .ready
+            && !dot.isRecording
+            && !isUserErasing
+            && !dot.isErasingFromPreviousSession
+            && !sessionBusy
+    }
+
+    // MARK: - Background
 
     @ViewBuilder
     private var rowBackgroundView: some View {
-        if isErasing && isCorrupted {
+        if isErasing && dot.flashCorrupted {
             Color.pink
                 .opacity(eraseBreathe ? 0.25 : 0.06)
                 .onAppear {
@@ -448,7 +391,7 @@ struct DeviceRow: View {
                         eraseBreathe = true
                     }
                 }
-        } else if isCorrupted {
+        } else if dot.flashCorrupted {
             Color.orange.opacity(0.12)
         } else if isErasing {
             Color.pink
@@ -473,7 +416,6 @@ struct DeviceRow: View {
 
     private var normalRow: some View {
         VStack(alignment: .leading, spacing: 10) {
-            // MARK: Top line — status dot + name + trash + toggle
             HStack(spacing: 10) {
                 if isIdentifying {
                     Image(systemName: "light.beacon.max.fill")
@@ -521,21 +463,15 @@ struct DeviceRow: View {
                 Spacer()
 
                 if phase.isConnected {
-                    if isErasing {
-                        ProgressView()
-                            .scaleEffect(0.75)
-                            .frame(width: 20)
-                    } else {
-                        Button {
-                            onErase?()
-                        } label: {
-                            Image(systemName: "trash")
-                                .font(.caption)
-                                .foregroundColor(canErase ? .red : .gray.opacity(0.4))
-                        }
-                        .disabled(!canErase)
-                        .buttonStyle(.plain)
+                    Button {
+                        onErase?()
+                    } label: {
+                        Image(systemName: "trash")
+                            .font(.caption)
+                            .foregroundColor(canErase ? .red : .gray.opacity(0.4))
                     }
+                    .disabled(!canErase)
+                    .buttonStyle(.plain)
                 }
 
                 Toggle("", isOn: Binding(
@@ -558,42 +494,36 @@ struct DeviceRow: View {
                 }
             }
 
-            // MARK: Bottom line — Storage + Battery mini bars
             HStack(spacing: 12) {
-                if let dot = dot {
-                    LiveMiniBar(
-                        label: "Storage",
-                        dot: dot,
-                        valueKeyPath: \.storagePercentageUsed,
-                        colorFor: { pct in
-                            if pct > 90 { return .red }
-                            if pct > 70 { return .orange }
-                            return .blue
-                        },
-                        isConnected: phase.isConnected
-                    )
-                    LiveMiniBar(
-                        label: "Battery",
-                        dot: dot,
-                        valueKeyPath: \.batteryPercentage,
-                        colorFor: { pct in
-                            if pct < 10 { return .red }
-                            if pct < 20 { return .orange }
-                            return .green
-                        },
-                        isConnected: phase.isConnected
-                    )
-                } else {
-                    MiniBarPlaceholder(label: "Storage")
-                    MiniBarPlaceholder(label: "Battery")
-                }
+                LiveMiniBar(
+                    label: "Storage",
+                    dot: dot,
+                    valueKeyPath: \.storagePercentageUsed,
+                    colorFor: { pct in
+                        if pct > 90 { return .red }
+                        if pct > 70 { return .orange }
+                        return .blue
+                    },
+                    isConnected: phase.isConnected
+                )
+                LiveMiniBar(
+                    label: "Battery",
+                    dot: dot,
+                    valueKeyPath: \.batteryPercentage,
+                    colorFor: { pct in
+                        if pct < 10 { return .red }
+                        if pct < 20 { return .orange }
+                        return .green
+                    },
+                    isConnected: phase.isConnected
+                )
             }
         }
     }
 
     var body: some View {
         VStack {
-            if isCorrupted {
+            if dot.flashCorrupted {
                 CorruptedSensorRow(
                     displayName: title,
                     isRepairing: isErasing,
@@ -603,6 +533,18 @@ struct DeviceRow: View {
                     insertion: .push(from: .bottom),
                     removal: .push(from: .top)
                 ))
+            } else if dot.isErasingFromPreviousSession {
+                ErasingSensorRow(displayName: title)
+                    .transition(.asymmetric(
+                        insertion: .push(from: .bottom),
+                        removal: .push(from: .top)
+                    ))
+            } else if isUserErasing {
+                ClearingSensorRow(displayName: title)
+                    .transition(.asymmetric(
+                        insertion: .push(from: .bottom),
+                        removal: .push(from: .top)
+                    ))
             } else {
                 normalRow
                     .transition(.asymmetric(
@@ -614,13 +556,119 @@ struct DeviceRow: View {
         .padding()
         .background(rowBackgroundView)
         .cornerRadius(10)
-        .contentShape(Rectangle())
-        .onTapGesture(count: 2) { onIdentify?() }
-        .animation(.easeInOut(duration: 0.3), value: isIdentifying)
-        .animation(.easeInOut(duration: 0.4), value: isCorrupted)
+        .animation(.easeInOut(duration: 0.4), value: dot.flashCorrupted)
+        .animation(.easeInOut(duration: 0.4), value: dot.isErasingFromPreviousSession)
+        .animation(.easeInOut(duration: 0.4), value: isUserErasing)
         .onChange(of: isErasing) { erasing in
             if !erasing { eraseBreathe = false }
         }
+    }
+}
+
+// MARK: - Device Row
+
+struct DeviceRow: View {
+    let title: String
+    let phase: ConnectionPhase
+    var isIdentifying: Bool = false
+    var dot: Dot? = nil
+    var sessionBusy: Bool = false
+    var isErasing: Bool = false
+    var isEditing: Bool = false
+    var editText: Binding<String>? = nil
+    let onToggle: () -> Void
+    var onErase: (() -> Void)? = nil
+    var onRepairErase: (() -> Void)? = nil
+    var onNameTap: (() -> Void)? = nil
+    var onNameCommit: (() -> Void)? = nil
+    var onIdentify: (() -> Void)? = nil
+
+    @ViewBuilder
+    private var disconnectedBackground: some View {
+        if isIdentifying {
+            Color.orange.opacity(0.08)
+        } else if phase.isFailed {
+            Color.orange.opacity(0.06)
+        } else if phase.isBusy {
+            Color.green.opacity(0.06)
+        } else {
+            Color.gray.opacity(0.1)
+        }
+    }
+
+    @ViewBuilder
+    private var disconnectedNormalRow: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 10) {
+                if isIdentifying {
+                    Image(systemName: "light.beacon.max.fill")
+                        .foregroundColor(.orange)
+                        .font(.system(size: 10))
+                        .symbolEffect(.pulse)
+                } else if phase == .connecting {
+                    ProgressView()
+                        .scaleEffect(0.75)
+                        .fixedSize()
+                } else if phase.isFailed {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundColor(.orange)
+                        .font(.system(size: 10))
+                } else {
+                    Circle()
+                        .fill(Color.gray.opacity(0.3))
+                        .frame(width: 10, height: 10)
+                }
+
+                Text(title)
+                    .font(.headline)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+
+                Spacer()
+
+                Toggle("", isOn: Binding(
+                    get: { phase.isBusy },
+                    set: { _ in onToggle() }
+                ))
+                .labelsHidden()
+                .disabled(sessionBusy || phase.isBusy)
+            }
+
+            HStack(spacing: 12) {
+                MiniBarPlaceholder(label: "Storage")
+                MiniBarPlaceholder(label: "Battery")
+            }
+        }
+    }
+
+    var body: some View {
+        Group {
+            if let dot = dot {
+                ObservedDotContent(
+                    dot: dot,
+                    title: title,
+                    phase: phase,
+                    isIdentifying: isIdentifying,
+                    isUserErasing: isErasing,
+                    sessionBusy: sessionBusy,
+                    isEditing: isEditing,
+                    editText: editText,
+                    onToggle: onToggle,
+                    onErase: onErase,
+                    onRepairErase: onRepairErase,
+                    onNameTap: onNameTap,
+                    onNameCommit: onNameCommit
+                )
+            } else {
+                disconnectedNormalRow
+                    .padding()
+                    .background(disconnectedBackground)
+                    .cornerRadius(10)
+            }
+        }
+        .contentShape(Rectangle())
+        .onTapGesture(count: 2) { onIdentify?() }
+        .animation(.easeInOut(duration: 0.3), value: isIdentifying)
     }
 }
 

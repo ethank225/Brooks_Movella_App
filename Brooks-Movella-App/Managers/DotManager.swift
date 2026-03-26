@@ -210,6 +210,7 @@ final class DotManager: NSObject, ObservableObject {
     func startScan() {
         stateQueue.async {
             if self.registry.isScanningInternal { return }
+            if self.registry.hasErasingFromPreviousSession { return }
 
             self.scanner.scan { [weak self] in
                 self?.stateQueue.async {
@@ -386,8 +387,12 @@ final class DotManager: NSObject, ObservableObject {
                 self.stateQueue.async {
                     if success {
                         self.setPhase(.idle, forRunner: runnerId)
-                        for dot in dots {
-                            dot.getFlashInfo { _ in }
+                        // Settle delay — sensor needs time to finalize flash
+                        // after stopping a resumed recording
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+                            for dot in dots {
+                                dot.getFlashInfo { _ in }
+                            }
                         }
                     } else {
                         self.setPhase(.error("Failed to stop recording. Please try again."), forRunner: runnerId)
@@ -878,6 +883,9 @@ extension DotManager: DotConnectionDelegate {
                 }
 
                 if let dot = self.registry.dot(forUuid: device.uuid) {
+                    dot.onEraseStateChanged = { [weak self] in
+                        self?.stateQueue.async { self?.notify() }
+                    }
                     setOnMain {
                         dot.isErasing = false
                         dot.isErasingFromPreviousSession = false
@@ -907,6 +915,9 @@ extension DotManager: DotConnectionDelegate {
                 }
 
                 if let dot = self.registry.dot(forUuid: device.uuid) {
+                    dot.onEraseStateChanged = { [weak self] in
+                        self?.stateQueue.async { self?.notify() }
+                    }
                     setOnMain {
                         dot.isErasing = false
                         dot.isErasingFromPreviousSession = false
@@ -936,6 +947,9 @@ extension DotManager: DotConnectionDelegate {
             }
 
             if let dot = self.registry.dot(forUuid: device.uuid) {
+                dot.onEraseStateChanged = { [weak self] in
+                    self?.stateQueue.async { self?.notify() }
+                }
                 setOnMain {
                     dot.isErasing = false
                     dot.isErasingFromPreviousSession = false
