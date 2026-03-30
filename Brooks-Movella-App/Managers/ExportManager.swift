@@ -775,20 +775,15 @@ final class ExportManager: ObservableObject {
         let grouped = Dictionary(grouping: snapshot) { $0.sessionId }
         var folderURLs: [URL] = []
 
-        for (_, sessionItems) in grouped {
+        for (sessionId, sessionItems) in grouped {
             let earliest = sessionItems
                 .map { $0.timestamp }
                 .min() ?? UInt32(Date().timeIntervalSince1970)
             let date = Date(timeIntervalSince1970: TimeInterval(earliest))
             let folderName = Self.sessionFolderFormatter.string(from: date)
 
-            // Disambiguate if folder already exists.
-            var sessionDir = baseDir.appendingPathComponent(folderName, isDirectory: true)
-            var suffix = 1
-            while FileManager.default.fileExists(atPath: sessionDir.path) {
-                sessionDir = baseDir.appendingPathComponent("\(folderName)_\(suffix)", isDirectory: true)
-                suffix += 1
-            }
+            // Reuse existing folder if its metadata.csv has the same Session ID (retry case).
+            let sessionDir = resolveSessionFolder(baseName: folderName, sessionId: sessionId, in: baseDir)
 
             do {
                 try FileManager.default.createDirectory(at: sessionDir, withIntermediateDirectories: true)
@@ -797,7 +792,7 @@ final class ExportManager: ObservableObject {
                 continue
             }
 
-            writeMetadataCSV(to: sessionDir, metadata: metadata, items: sessionItems)
+            writeMetadataCSV(to: sessionDir, metadata: metadata, items: sessionItems, sessionId: sessionId)
 
             for item in sessionItems {
                 let preferredName = sanitize(item.label) + ".csv"
@@ -895,9 +890,10 @@ final class ExportManager: ObservableObject {
     }
 
     /// Writes a metadata.csv file summarizing the export session.
-    private func writeMetadataCSV(to dir: URL, metadata: SessionMetadata, items: [TaskMoveInfo]) {
+    private func writeMetadataCSV(to dir: URL, metadata: SessionMetadata, items: [TaskMoveInfo], sessionId: UUID) {
         var rows: [[String]] = []
         rows.append(["Key", "Value"])
+        rows.append(["Session ID", sessionId.uuidString])
         rows.append(["Runner Name", metadata.runnerName])
         rows.append(["Shoe Brand", metadata.shoeBrand])
         rows.append(["Shoe Model", metadata.shoeModel])
@@ -933,6 +929,40 @@ final class ExportManager: ObservableObject {
 
         let url = dir.appendingPathComponent("metadata.csv")
         try? csv.data(using: .utf8)?.write(to: url, options: .atomic)
+    }
+
+    /// Reads the Session ID value from a metadata.csv inside the given folder.
+    /// Returns nil if the file doesn't exist, can't be read, or has no Session ID row.
+    private func readSessionId(from folderURL: URL) -> String? {
+        let metadataURL = folderURL.appendingPathComponent("metadata.csv")
+        guard let contents = try? String(contentsOf: metadataURL, encoding: .utf8) else { return nil }
+        for line in contents.components(separatedBy: "\n") {
+            let cols = line.components(separatedBy: ",")
+            if cols.count >= 2, cols[0] == "Session ID" {
+                return cols[1].trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
+        return nil
+    }
+
+    /// Resolves a session folder path, reusing an existing folder if its metadata.csv
+    /// contains the same Session ID (retry case). Otherwise picks the first available suffix.
+    private func resolveSessionFolder(baseName: String, sessionId: UUID, in baseDir: URL) -> URL {
+        let fm = FileManager.default
+        let sessionIdString = sessionId.uuidString
+
+        let candidate = baseDir.appendingPathComponent(baseName, isDirectory: true)
+        if !fm.fileExists(atPath: candidate.path) { return candidate }
+        if readSessionId(from: candidate) == sessionIdString { return candidate }
+
+        var suffix = 1
+        while suffix <= 100 {
+            let suffixed = baseDir.appendingPathComponent("\(baseName)_\(suffix)", isDirectory: true)
+            if !fm.fileExists(atPath: suffixed.path) { return suffixed }
+            if readSessionId(from: suffixed) == sessionIdString { return suffixed }
+            suffix += 1
+        }
+        return baseDir.appendingPathComponent("\(baseName)_\(suffix)", isDirectory: true)
     }
 
     /// Snapshots task data on main, organizes into session folders on `fileQueue`,

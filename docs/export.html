@@ -170,9 +170,189 @@ let progress = min(elapsedTime / estimatedDuration, 0.99)</code></pre>
 
   <p>There is no partial resume &mdash; the streaming pipeline has no intermediate binary format to resume from.</p>
 
+  <p>On retry, retried files are placed into the <strong>same session folder</strong> as the original export. The folder is matched by reading the Session ID from <code>metadata.csv</code> via <code>resolveSessionFolder(baseName:sessionId:in:)</code>.</p>
+
   <h2>Persistence</h2>
 
-  <p>Tasks are saved to <code>Documents/export_records.json</code> whenever status changes to <code>.success</code>, <code>.failed</code>, or <code>.canceled</code>. On next app launch, <code>restorePersistedTasks()</code> rehydrates tasks, verifies CSV files still exist on disk, and deletes orphaned partial CSVs from the export directory.</p>
+  <p>Tasks are saved to <code>Application&nbsp;Support/export_records.json</code> whenever status changes to <code>.success</code>, <code>.failed</code>, or <code>.canceled</code>. On next app launch, <code>restorePersistedTasks()</code> rehydrates tasks, verifies CSV files still exist on disk, and deletes orphaned partial CSVs from the ExportCache directory. A fallback read checks the old <code>Documents/export_records.json</code> path for upgrades from prior versions.</p>
+
+  <h2>File System Layout</h2>
+
+  <p>The export system uses two directories to separate temporary working files from user-facing output:</p>
+
+<pre><code>Application Support/
+  ExportCache/                    &larr; hidden from Files app
+    Heel_file0_28D3_f0_51593.csv  &larr; flat CSVs during BLE transfer
+    Shank_file1_1797_f1_23359.csv
+  export_records.json             &larr; task persistence
+  runners.json                    &larr; runner profiles
+
+Documents/
+  Exports/                        &larr; visible in iOS Files app
+    2026-03-22_17-30-00/          &larr; session folder (permanent user data)
+      metadata.csv
+      Heel_file0.csv
+      Shank_file1.csv
+    2026-03-22_17-45-00/
+      metadata.csv
+      Heel_file0.csv</code></pre>
+
+  <table>
+    <thead>
+      <tr><th>Directory</th><th>Purpose</th><th>Visibility</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>Application&nbsp;Support/ExportCache/</code></td>
+        <td>Flat CSVs during BLE transfer + uploads</td>
+        <td>Hidden (Application Support)</td>
+      </tr>
+      <tr>
+        <td><code>Documents/Exports/</code></td>
+        <td>Session folders with metadata.csv + renamed CSVs</td>
+        <td>Visible in Files app</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p><code>Info.plist</code> sets <code>UIFileSharingEnabled</code> and <code>LSSupportsOpeningDocumentsInPlace</code> so the <code>Documents/</code> directory appears in the iOS Files app. Sensitive files (<code>runners.json</code>, <code>export_records.json</code>) live in Application Support and are never exposed.</p>
+
+  <h2>Session Metadata</h2>
+
+  <p>Before export starts, CartView captures run details into a <code>SessionMetadata</code> struct and sets it on <code>ExportManager.sessionMetadata</code>:</p>
+
+<pre><code>struct SessionMetadata: Codable {
+    let runnerName: String
+    let shoeBrand: String
+    let shoeModel: String
+    let shoeGeneration: String
+    let conditionType: String
+    let study: String
+    let test: String
+    let product: String
+    let outputRate: Int      // from DotManager.selectedOutputRate
+    let filterIndex: Int     // from DotManager.selectedFilterIndex
+}</code></pre>
+
+  <p>This metadata is also persisted into the <code>ExportContext</code> (stored in UserDefaults) for crash recovery. If the app restarts mid-export, <code>restoreExportContextIfNeeded()</code> restores it.</p>
+
+  <h2>Post-Export Organization</h2>
+
+  <p>After all BLE transfers complete, <code>finalizeExport(generation:)</code> orchestrates session folder creation:</p>
+
+<pre><code>finalizeExport(generation:)
+    &boxur;&boxh; DispatchQueue.main.async:
+        Snapshot @Published task data (status, outputURL) &rarr; [TaskMoveInfo]
+        Capture sessionMetadata
+    &boxur;&boxh; fileQueue.async:
+        organizeIntoSessionFolders(snapshot:, metadata:)
+            &boxur;&boxh; Group tasks by sessionId
+            &boxur;&boxh; For each session:
+                resolveSessionFolder() &mdash; reuses existing folder if Session ID matches
+                Create directory (if new)
+                Write metadata.csv (includes Session ID)
+                safeCopy each CSV from ExportCache/ &rarr; session folder
+            &boxur;&boxh; Set exportedSessionFolderURLs
+    &boxur;&boxh; DispatchQueue.main.async:
+        exportPhase = .done
+        persistTasks()
+        sendCompletionNotification()</code></pre>
+
+  <h3>Threading contract</h3>
+  <p><code>@Published</code> properties on <code>ExportTask</code> (<code>status</code>, <code>outputURL</code>) must be read on the main thread. The <code>snapshotSuccessTasks()</code> method captures this data into plain <code>TaskMoveInfo</code> structs before dispatching to <code>fileQueue</code>. File operations only use the snapshot, never the live task objects.</p>
+
+  <h3>Copy, not move</h3>
+  <p>CSVs are <strong>copied</strong> (not moved) from ExportCache into session folders. The original flat CSV stays in place so Supabase uploads (which fire per-task during BLE transfer via <code>onTaskCompleted</code>) can read from the stable path. Originals are cleaned up when the user taps &ldquo;Clear &amp; Start Over&rdquo;.</p>
+
+  <h3>Collision handling</h3>
+  <p>Folder names are resolved by <code>resolveSessionFolder(baseName:sessionId:in:)</code>. If a folder with the target name exists and its <code>metadata.csv</code> contains the same Session ID, the folder is reused (retry case). Otherwise, <code>_1</code>, <code>_2</code> suffixes are tried until a non-existent or matching folder is found. This prevents duplicate folders when retrying failed exports.</p>
+  <p><code>safeCopy()</code> checks <code>FileManager.fileExists(atPath:)</code> at the target path <strong>before</strong> calling <code>copyItem</code>. If a file with the same name already exists, it appends the first 6 characters of the task ID to the filename stem.</p>
+
+  <h2>Session Folder Structure</h2>
+
+<pre><code>2026-03-22_17-30-00/
+  metadata.csv          &larr; key-value pairs
+  Heel_file0.csv        &larr; from CartItem.label (includes sensor display name)
+  Shank_file1.csv</code></pre>
+
+  <p>The folder name comes from the earliest recording timestamp in the session group, formatted as <code>yyyy-MM-dd_HH-mm-ss</code>. If a folder with that name already exists and belongs to a different session, a <code>_1</code>, <code>_2</code> suffix is appended. If it belongs to the same session (matched by Session ID in <code>metadata.csv</code>), the existing folder is reused.</p>
+
+  <p><code>metadata.csv</code> is a two-column key-value CSV:</p>
+
+<pre><code>Key,Value
+Session ID,A1B2C3D4-E5F6-7890-ABCD-EF1234567890
+Runner Name,Jane Smith
+Shoe Brand,Brooks
+Shoe Model,Ghost 16
+Shoe Generation,3
+Condition Type,road
+Study,Gait Analysis 2026
+Test,Baseline
+Product,Ghost
+Output Rate (Hz),120
+Filter Profile,0
+Sensor,Heel (25164D4D-9F56-46A8-3065-C8451FE928D3)
+Sensor,Shank (9A9D7AF5-C9B2-9893-4367-A2EA5DCC1797)
+Recording (Heel_file0),2026-03-22T17:30:00Z
+Recording (Shank_file1),2026-03-22T17:30:01Z</code></pre>
+
+  <h2>Share Packaging</h2>
+
+  <p>The share button in <code>ExportResultsSection</code> calls <code>packageForSharing()</code>, which creates a single shareable bundle:</p>
+
+<pre><code>packageForSharing() &rarr; URL?
+    &boxur;&boxh; Create tmp/BrooksExport_yyyy-MM-dd/
+    &boxur;&boxh; Copy each session folder from Documents/Exports/ into it
+    &boxur;&boxh; Return the top-level directory URL
+
+Result:
+  tmp/BrooksExport_2026-03-22/
+    2026-03-22_17-30-00/
+      metadata.csv
+      Heel_file0.csv
+      Shank_file1.csv
+    2026-03-22_17-45-00/
+      metadata.csv
+      ...</code></pre>
+
+  <p>This single URL is passed to <code>UIActivityViewController</code>. AirDrop sends the entire folder hierarchy. A fallback path shares individual file URLs if packaging fails.</p>
+
+  <p>A hint below the share button reads &ldquo;Files also saved to Files &rarr; Exports&rdquo; so users know the persistent copy exists.</p>
+
+  <h2>Cleanup Rules</h2>
+
+  <table>
+    <thead>
+      <tr><th>Location</th><th>What</th><th>When</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>Application&nbsp;Support/ExportCache/</code></td>
+        <td>Orphaned CSVs (not in persisted records)</td>
+        <td>App launch (<code>restorePersistedTasks</code>)</td>
+      </tr>
+      <tr>
+        <td><code>Application&nbsp;Support/ExportCache/</code></td>
+        <td>All flat CSVs</td>
+        <td><code>resetExport()</code> (&ldquo;Clear &amp; Start Over&rdquo;)</td>
+      </tr>
+      <tr>
+        <td><code>Documents/Exports/</code></td>
+        <td>Session folders</td>
+        <td><strong>Never.</strong> Permanent user data &mdash; managed via Files app.</td>
+      </tr>
+      <tr>
+        <td><code>tmp/BrooksExport_*/</code></td>
+        <td>Share packages</td>
+        <td>App launch + <code>resetExport()</code></td>
+      </tr>
+      <tr>
+        <td><code>ExportCache/</code> (in-flight)</td>
+        <td>Partial CSV from failed/canceled transfer</td>
+        <td>Immediately on failure, cancel, or timeout</td>
+      </tr>
+    </tbody>
+  </table>
 
   <div class="page-nav">
     <a href="operations.html">&larr; DotOperationRunner</a>

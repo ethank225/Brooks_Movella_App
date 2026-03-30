@@ -126,6 +126,21 @@
     </tbody>
   </table>
 
+  <h2>Manual Test: Export Retry Folder Matching</h2>
+
+  <p>Verifies that retried export files land in the same session folder instead of creating a duplicate with a <code>_1</code> suffix.</p>
+
+  <ol>
+    <li>Connect 2+ sensors and record a session.</li>
+    <li>Go to Export, fetch recordings, and start an export of 3+ files from one session.</li>
+    <li>During the BLE transfer, force-fail one file (e.g., move a sensor out of BLE range or power it off).</li>
+    <li>Wait for the export to complete with at least 1 failed file.</li>
+    <li>Open the Files app and navigate to <code>Brooks-Movella-App/Exports/</code>. Verify the session folder (e.g., <code>2026-03-28_14-30-00/</code>) contains the successful CSVs and a <code>metadata.csv</code> with a <code>Session ID</code> row.</li>
+    <li>Back in the app, tap <strong>Retry Failed</strong>.</li>
+    <li>After the retry completes, check the Files app again. The retried file should appear in the <strong>same</strong> session folder &mdash; no <code>_1</code> duplicate folder should exist.</li>
+    <li>Open <code>metadata.csv</code> and verify it now includes the retried file&rsquo;s recording timestamp alongside the originals.</li>
+  </ol>
+
   <h2>Testability Patterns</h2>
 
   <h3>Dependency injection for isolation</h3>
