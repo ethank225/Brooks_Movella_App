@@ -64,8 +64,9 @@
     <li>Phases: <code>idle &rarr; connecting &rarr; initializing &rarr; ready</code></li>
     <li>After BLE connect succeeds, the sensor needs initialization (getFlashInfo for storage info)</li>
     <li>getFlashInfo will NOT respond if the sensor is currently recording &mdash; this times out and causes "initialization failed"</li>
-    <li>Fix: before calling refreshStorage/getFlashInfo, query recording status with <code>checkRecordingStatus(completion:)</code> which waits for the actual SDK callback. If recording, skip flash query and go straight to <code>.ready</code></li>
-    <li><code>refreshRecordingStatus()</code> is async with two queue hops (sdkQueue &rarr; SDK callback &rarr; main) &mdash; checking isRecording immediately after calling it will see stale data. Always use the callback-based checkRecordingStatus instead.</li>
+    <li>Fix: before calling refreshStorage/getFlashInfo, query recording status with <code>checkSensorActivity(completion:)</code> which uses three racing paths (see Connections docs). If recording, skip flash query and go straight to <code>.ready</code></li>
+    <li><code>refreshRecordingStatus()</code> is async with two queue hops (sdkQueue &rarr; SDK callback &rarr; main) &mdash; checking isRecording immediately after calling it will see stale data. Always use the callback-based checkSensorActivity instead.</li>
+    <li>Battery and flash data are unavailable on the fast recording reconnect path (getFlashInfo won't respond during recording). The UI shows a hatched bar with &ldquo;&mdash;&rdquo; until data becomes available after recording stops.</li>
     <li>The SDK fires disconnect/reconnect events during sync &mdash; suppress these when <code>syncingUuids</code> contains the device UUID, not based on a global sync flag.</li>
   </ul>
 
@@ -75,7 +76,9 @@
     <li>Recording starts/stops via SDK commands</li>
     <li>0xFFFF = record indefinitely until explicitly stopped</li>
     <li>Sensor continues recording even if BLE disconnects or app is killed</li>
-    <li>On reconnect, <code>device.isRecording()</code> from the SDK is the source of truth for recording state</li>
+    <li>On reconnect, <code>device.recording.recordingStatus</code> from the SDK is the source of truth for recording state</li>
+    <li><code>dot.isRecording</code> is <code>@Published private(set)</code> &mdash; only writable from within Dot via <code>syncRecordingState()</code>. This single method reads <code>device.recording.recordingStatus</code> (the live SDK stored property) and pushes the result to <code>@Published</code> on main thread. All recording state updates &mdash; SDK callbacks, polling success, idle-sensor skip paths &mdash; go through this one method. The <code>private(set)</code> makes any external write a compile error.</li>
+    <li><code>waitForRecordingState</code> polls <code>device.recording.recordingStatus</code> on <code>sdkQueue</code> every 0.3s. On success, calls <code>syncRecordingState()</code> on main thread before the completion handler, ensuring the UI flag is updated before the runner phase transition.</li>
     <li>No recovery persistence file needed &mdash; isRecording + RunnerStore runner assignments restore everything</li>
   </ul>
 
@@ -132,6 +135,7 @@
     <li>SampleTimeFine is a relative microsecond clock that resets on sensor reboot. It has no relationship to UTC.</li>
     <li>iOS Bluetooth UUIDs are phone-specific and can theoretically change, but are stable enough for single-phone workflows.</li>
     <li>The sensor's MAC address (D4:22:CD:xx:xx:xx) is the only truly permanent identifier across devices.</li>
+    <li>The Movella SDK sometimes reuses the same device object (same pointer) after reconnect. Stored properties on reused objects retain stale values from the previous session, and block-based callbacks (<code>updateRecordingStatus</code>, battery updates) are silently broken. Always verify state via fresh BLE reads (<code>getRecordingStatus</code>) or property polling rather than trusting cached properties or callbacks on reconnected devices.</li>
   </ul>
 
   <div class="page-nav">

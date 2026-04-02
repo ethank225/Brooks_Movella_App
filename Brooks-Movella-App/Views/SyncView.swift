@@ -168,7 +168,7 @@ struct SyncView: View {
     private var primaryButtonColor: Color {
         switch phase {
         case .idle:                return (noSensors || sensorsInitializing || manager.hasPendingConnections) ? .gray : (manager.isErasing || manager.hasFlashIssue) ? flashIssueColor : .green
-        case .recording:           return noSensors ? .gray : .red
+        case .recording:           return (noSensors || sensorsInitializing) ? .gray : .red
         case .error:               return (noSensors || sensorsInitializing || manager.hasPendingConnections) ? .gray : (manager.isErasing || manager.hasFlashIssue) ? flashIssueColor : .green
         default:                   return .gray
         }
@@ -177,7 +177,7 @@ struct SyncView: View {
     private var primaryButtonDisabled: Bool {
         switch phase {
         case .idle:    return noSensors || sensorsInitializing || manager.hasPendingConnections || manager.isErasing || manager.hasFlashIssue
-        case .recording: return false
+        case .recording: return sensorsInitializing
         case .error:   return noSensors || sensorsInitializing || manager.hasPendingConnections || manager.isErasing || manager.hasFlashIssue
         default:       return true
         }
@@ -313,7 +313,8 @@ struct DotStatusRow: View {
                         if pct > 70 { return .orange }
                         return .blue
                     },
-                    isConnected: dot.isConnected
+                    isConnected: dot.isConnected,
+                    dataAvailable: dot.flashTotalBytes > 1
                 )
                 LiveMiniBar(
                     label: "Battery",
@@ -324,7 +325,8 @@ struct DotStatusRow: View {
                         if pct < 20 { return .orange }
                         return .green
                     },
-                    isConnected: dot.isConnected
+                    isConnected: dot.isConnected,
+                    dataAvailable: dot.batteryLevel > 0
                 )
             }
         }

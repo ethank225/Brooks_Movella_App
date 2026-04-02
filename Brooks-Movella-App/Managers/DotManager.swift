@@ -374,6 +374,11 @@ final class DotManager: NSObject, ObservableObject {
             let dots = runner.sensorUuids.compactMap { uuid -> Dot? in
                 guard let dot = self.registry.dot(forUuid: uuid),
                       dot.isConnected else { return nil }
+                let phase = self.registry.byUuid[uuid]?.connectionPhase
+                guard phase == .ready else {
+                    print("⏭️ [\(uuid)] Still initializing — skipping stop")
+                    return nil
+                }
                 return dot
             }
 
@@ -381,11 +386,27 @@ final class DotManager: NSObject, ObservableObject {
 
             self.operations.runAll(
                 dots: dots,
-                operation: { dot, done in dot.stopRecording(completion: done) }
+                operation: { dot, done in
+                    let liveStatus = dot.device.recording.recordingStatus
+                    guard liveStatus == .isRecording else {
+                        print("⏭️ [\(dot.address)] SDK recordingStatus=\(liveStatus.rawValue) — skipping stop")
+                        DispatchQueue.main.async { dot.syncRecordingState() }
+                        done(true)
+                        return
+                    }
+                    dot.stopRecording(completion: done)
+                }
             ) { [weak self] success in
                 guard let self else { return }
                 self.stateQueue.async {
                     if success {
+                        
+                        //make sure that you stop the sync for each of the devices
+                        self.sdkQueue.async {
+                            let devices = dots.map { $0.device }
+                            DotSyncManager.stopSync(devices)
+                        }
+                        
                         self.setPhase(.idle, forRunner: runnerId)
                         // Settle delay — sensor needs time to finalize flash
                         // after stopping a resumed recording
@@ -538,7 +559,15 @@ final class DotManager: NSObject, ObservableObject {
 
         sdkQueue.async { [weak self] in
             guard let self else { return }
-
+            
+            
+            //If it is already syncing from before, make sure the syncing is stopping. Should already be stopped but this is just to handle the edge case.
+            for device in devices where device.isSynced() {
+                print("⚠️ [\(device.uuid)] Already synced — stopping before re-sync")
+                DotSyncManager.stopSync([device])
+            }
+            
+            //Just print out the devices that are being initialized
             for device in devices {
                 print("🔍 [PRE-SYNC] \(device.uuid): isInitialized=\(device.isInitialized())")
             }
@@ -665,6 +694,21 @@ final class DotManager: NSObject, ObservableObject {
                         return
                     }
 
+                    if recStatus == .isRecording {
+                        print("⏳ [\(uuid)] Flash timeout but sensor is recording — recovering to .ready")
+                        self.registry.setConnectionPhase(uuid, .ready)
+
+                        if let runner = RunnerStore.shared.runner(forSensorUuid: uuid) {
+                            let phase = self.runnerPhasesInternal[runner.id] ?? .idle
+                            if phase == .idle || phase.isError {
+                                print("🔄 [\(uuid)] Restoring .recording for runner \(runner.id)")
+                                self.setPhase(.recording, forRunner: runner.id)
+                            }
+                        }
+                        self.notify()
+                        return
+                    }
+
                     print("⚠️ [\(uuid)] Init failed — not marking .ready")
                     self.registry.setConnectionPhase(uuid, .failed("Initialization timed out"))
                     self.notify()
@@ -722,7 +766,6 @@ final class DotManager: NSObject, ObservableObject {
                     self.registry.initializationInProgress.remove(uuid)
                     self.registry.setConnectionPhase(uuid, .ready)
                     print("✅ [\(uuid)] phase now .ready (recording device, flash skipped)")
-                    dot.refreshBattery()
 
                     if let runner = RunnerStore.shared.runner(forSensorUuid: uuid) {
                         let phase = self.runnerPhasesInternal[runner.id] ?? .idle

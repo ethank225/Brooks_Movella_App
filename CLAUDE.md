@@ -53,6 +53,8 @@ Singleton owning all Bluetooth and session state. Delegates to three sub-compone
 
 `ObservableObject` wrapping a `DotDevice`. Publishes `connectionPhase`, `isRecording`, `sessionSynced`, flash storage bytes, and recording file list. All `@Published` mutations go through `setOnMain(_:)`.
 
+`isRecording` is `@Published private(set)` — only writable via `syncRecordingState()`, which reads the live SDK property `device.recording.recordingStatus` and pushes to `@Published` on main. All recording state updates (SDK callbacks, polling success, idle-sensor skip paths) go through this one method. Never set `isRecording` directly.
+
 Key details:
 - `device` reference can change after reconnect — `updateDevice(_:)` re-installs the recording callback.
 - `getFlashInfo` and `getExportFileInfo` both use a single-flight gatekeeper (`inFlight` flag + waiter queue) to guard against the SDK's double-firing callbacks.

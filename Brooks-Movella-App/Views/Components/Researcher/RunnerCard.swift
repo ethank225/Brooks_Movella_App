@@ -337,11 +337,12 @@ struct RunnerCard: View {
                 .font(.subheadline.weight(.semibold))
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 10)
-                .background(Color.red)
+                .background(allDotsReady ? Color.red : Color.gray)
                 .foregroundColor(.white)
                 .cornerRadius(8)
             }
             .buttonStyle(.plain)
+            .disabled(!allDotsReady)
 
         case .stoppingRecording:
             busyRow("Stopping recording...")

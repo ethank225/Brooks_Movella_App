@@ -428,7 +428,7 @@ private struct ObservedDotContent: View {
                         .font(.system(size: 10))
                 } else {
                     Circle()
-                        .fill(phase.isConnected ? Color.green : Color.gray.opacity(0.3))
+                        .fill(phase.isConnected && !isBusy ? Color.green : Color.gray.opacity(0.3))
                         .frame(width: 10, height: 10)
                 }
 
@@ -504,7 +504,8 @@ private struct ObservedDotContent: View {
                         if pct > 70 { return .orange }
                         return .blue
                     },
-                    isConnected: phase.isConnected
+                    isConnected: phase.isConnected,
+                    dataAvailable: dot.flashTotalBytes > 1
                 )
                 LiveMiniBar(
                     label: "Battery",
@@ -515,7 +516,8 @@ private struct ObservedDotContent: View {
                         if pct < 20 { return .orange }
                         return .green
                     },
-                    isConnected: phase.isConnected
+                    isConnected: phase.isConnected,
+                    dataAvailable: dot.batteryLevel > 0
                 )
             }
         }
@@ -605,10 +607,6 @@ struct DeviceRow: View {
                         .foregroundColor(.orange)
                         .font(.system(size: 10))
                         .symbolEffect(.pulse)
-                } else if phase == .connecting {
-                    ProgressView()
-                        .scaleEffect(0.75)
-                        .fixedSize()
                 } else if phase.isFailed {
                     Image(systemName: "exclamationmark.triangle.fill")
                         .foregroundColor(.orange)
@@ -623,6 +621,12 @@ struct DeviceRow: View {
                     .font(.headline)
                     .lineLimit(1)
                     .truncationMode(.tail)
+
+                if phase == .connecting {
+                    ProgressView()
+                        .scaleEffect(0.75)
+                        .fixedSize()
+                }
 
                 Spacer()
 

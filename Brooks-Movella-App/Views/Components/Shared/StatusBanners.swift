@@ -20,15 +20,15 @@ private struct ShimmerBar: View {
                         .offset(x: animating
                                 ? (geo.size.width - barWidth) / 2
                                 : -(geo.size.width - barWidth) / 2)
+                        .animation(.easeInOut(duration: 1.4).repeatForever(autoreverses: true), value: animating)
                 )
                 .clipShape(Capsule())
         }
         .frame(height: 4)
+        .transaction { $0.animation = nil }
         .onAppear {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                withAnimation(.easeInOut(duration: 1.4).repeatForever(autoreverses: true)) {
-                    animating = true
-                }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                animating = true
             }
         }
     }

@@ -42,7 +42,7 @@ final class Dot: ObservableObject, Identifiable {
     @Published private(set) var connectionPhase: ConnectionPhase = .idle
 
     var isConnected: Bool { connectionPhase.isConnected }
-    @Published var isRecording = false
+    @Published private(set) var isRecording = false
     @Published var sessionSynced = false
     @Published var isErasing = false
     @Published private(set) var recordingFiles: [DotRecordingFile] = []
@@ -139,7 +139,7 @@ final class Dot: ObservableObject, Identifiable {
             case .isRecordingStopped, .isIdle: isRec = false
             default: return
             }
-            setOnMain { self.isRecording = isRec }
+            self.syncRecordingState()
             // Fire one-shot completion if pending
             self.sdkQueue.async {
                 if let cb = self.recordingStatusCompletion {
@@ -158,6 +158,13 @@ final class Dot: ObservableObject, Identifiable {
 
     func setSessionSynced(_ value: Bool) {
         setOnMain { self.sessionSynced = value }
+    }
+
+    /// Single source of truth for isRecording updates.
+    /// Reads the live SDK property and pushes to @Published on main.
+    func syncRecordingState() {
+        let isRec = (device.recording.recordingStatus == .isRecording)
+        setOnMain { self.isRecording = isRec }
     }
 
     // MARK: - Commands
@@ -193,12 +200,19 @@ final class Dot: ObservableObject, Identifiable {
 
     /// Queries the SDK for current recording/erasing state and calls completion with the result.
     /// Completion fires on `sdkQueue`. Includes a 3s timeout (assumes idle on timeout).
+    ///
+    /// Three racing paths, first to complete wins via `hasCompleted`:
+    /// 1. One-shot callback — fastest for new device objects (~0.3s)
+    /// 2. Property polling loop — fallback for reused device objects where the
+    ///    SDK silently updates the property without firing the callback (~0.6-1s)
+    /// 3. 3s timeout — last resort, assumes idle
     func checkSensorActivity(completion: @escaping (SensorActivity) -> Void) {
         sdkQueue.async {
             var hasCompleted = false
 
-            // Check the property immediately — the SDK may already know the state
-            // from the connection handshake before we even ask.
+            // Check the property immediately — only trust .isErasing (set by
+            // the app, always fresh). Don't trust .isRecording here because
+            // reused device objects retain the stale value from before disconnect.
             let currentStatus = self.device.recording.recordingStatus
             print("🔎 [\(self.address)] recordingStatus at connect = \(currentStatus.rawValue)")
             if currentStatus == .isErasing {
@@ -206,29 +220,63 @@ final class Dot: ObservableObject, Identifiable {
                 return
             }
 
-            // Install one-shot for recording states (fired by installRecordingStatusHandler)
+            // Path 1: One-shot callback (fired by installRecordingStatusHandler).
+            // Works for new device objects; silently broken on reused objects.
             self.recordingStatusCompletion = { isRec in
                 guard !hasCompleted else { return }
                 hasCompleted = true
                 completion(isRec ? .recording : .idle)
             }
 
+            // Trigger a fresh BLE read — updates the stored property and
+            // (on new device objects) fires the updateRecordingStatus callback.
             self.device.getRecordingStatus()
 
-            // The recording status handler ignores .isErasing, so re-check the property
-            // after giving the SDK time to process the response.
-            self.sdkQueue.asyncAfter(deadline: .now() + 0.5) {
-                guard !hasCompleted else { return }
-                let status = self.device.recording.recordingStatus
-                print("🔎 [\(self.address)] recordingStatus after 0.5s = \(status.rawValue)")
-                if status == .isErasing {
-                    hasCompleted = true
-                    self.recordingStatusCompletion = nil
-                    completion(.erasing)
+            // Path 2: Property polling loop — catches reused device objects
+            // where getRecordingStatus() updates the property but the callback
+            // never fires. Polls every 0.3s for up to 2.5s.
+            //
+            // On a fresh connection the SDK property starts at 0 (.isIdle) before
+            // the BLE read completes, so we don't trust .isIdle/.isRecordingStopped
+            // until 1s has elapsed — enough time for getRecordingStatus() to round-trip.
+            // .isRecording and .isErasing are trusted immediately since the default is 0.
+            let pollStart = Date()
+            func poll() {
+                self.sdkQueue.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                    guard let self, !hasCompleted else { return }
+                    let status = self.device.recording.recordingStatus
+                    let elapsed = Date().timeIntervalSince(pollStart)
+
+                    switch status {
+                    case .isRecording:
+                        hasCompleted = true
+                        self.recordingStatusCompletion = nil
+                        completion(.recording)
+                    case .isErasing:
+                        hasCompleted = true
+                        self.recordingStatusCompletion = nil
+                        completion(.erasing)
+                    case .isIdle, .isRecordingStopped:
+                        // Only trust idle/stopped after 1s — before that the
+                        // property may just be the uninitialized default (0).
+                        if elapsed >= 1.0 {
+                            hasCompleted = true
+                            self.recordingStatusCompletion = nil
+                            completion(.idle)
+                        } else if elapsed < 2.5 {
+                            poll()
+                        }
+                    default:
+                        if elapsed < 2.5 {
+                            poll()
+                        }
+                        // else fall through to the 3s timeout
+                    }
                 }
             }
+            poll()
 
-            // Timeout — if SDK doesn't respond, assume idle
+            // Path 3: Timeout — if neither callback nor poll resolves, assume idle.
             DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
                 self?.sdkQueue.async {
                     guard !hasCompleted else { return }
@@ -421,8 +469,10 @@ final class Dot: ObservableObject, Identifiable {
 
     /// Reads the current battery level from the SDK and publishes it.
     func refreshBattery() {
-        let battery: Int = device.battery?.value ?? 0
-        setOnMain { self.batteryLevel = battery }
+        sdkQueue.async {
+            let battery: Int = self.device.battery?.value ?? 0
+            DispatchQueue.main.async { self.batteryLevel = battery }
+        }
     }
 
     // MARK: - Recording
@@ -480,9 +530,10 @@ final class Dot: ObservableObject, Identifiable {
         }
     }
 
-    /// Polls `isRecording` every 0.3s until it matches `target` or times out.
-    /// The SDK doesn't push recording state reliably, so we poll `getRecordingStatus()`
-    /// and check the value that the recording status handler updates.
+    /// Polls `device.recording.recordingStatus` every 0.3s until it matches
+    /// `target` or times out. Checks the live SDK property on `sdkQueue` rather
+    /// than the `@Published` flag, which can go stale when the SDK's
+    /// `updateRecordingStatus` callback breaks after a reconnect.
     private func waitForRecordingState(_ target: Bool, timeout: TimeInterval, completion: @escaping (Bool) -> Void) {
         let start = Date()
 
@@ -491,9 +542,15 @@ final class Dot: ObservableObject, Identifiable {
                 self.device.getRecordingStatus()
             }
 
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-                if self.isRecording == target {
-                    completion(true)
+            self.sdkQueue.asyncAfter(deadline: .now() + 0.3) {
+                let liveStatus = self.device.recording.recordingStatus
+                let liveIsRecording = liveStatus == .isRecording
+
+                if liveIsRecording == target {
+                    DispatchQueue.main.async {
+                        self.syncRecordingState()
+                        completion(true)
+                    }
                     return
                 }
                 if Date().timeIntervalSince(start) > timeout {

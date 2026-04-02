@@ -51,9 +51,10 @@
   <p>Flash issues are detected at four points. Each covers a different timing scenario:</p>
 
   <ol>
-    <li><strong><code>checkSensorActivity</code></strong> (Dot.swift) &mdash; On connect, checks <code>recordingStatus</code> before any flash query. If <code>.isErasing</code>, skips flash query and starts polling. Fastest path.</li>
+    <li><strong><code>checkSensorActivity</code></strong> (Dot.swift) &mdash; On connect, checks <code>recordingStatus</code> before any flash query. If <code>.isErasing</code>, skips flash query and starts polling. If <code>.isRecording</code>, skips flash query and goes straight to <code>.ready</code>. Fastest path.</li>
     <li><strong><code>getFlashInfo</code> callback</strong> (Dot.swift) &mdash; If the SDK responds with 0/0 or <code>.isUninitialized</code>, checks <code>recordingStatus</code>. If <code>.isErasing</code>, starts polling. If not, marks <code>flashCorrupted</code>.</li>
     <li><strong><code>refreshStorage</code> timeout</strong> (DotManager.swift) &mdash; If <code>getFlashInfo</code> times out after 5s (SDK won't respond during erase), checks <code>recordingStatus</code> as fallback. If <code>.isErasing</code>, starts polling instead of marking failed.</li>
+    <li><strong>Flash timeout with active recording</strong> (DotManager.swift) &mdash; When <code>getFlashInfo</code> times out and <code>recordingStatus</code> shows <code>.isRecording</code>, the sensor is recovered to <code>.ready</code> with <code>restoreRecordingPhase</code>. This handles the app-relaunch scenario where <code>checkSensorActivity</code> missed the recording state because the SDK was too slow to populate the property on a fresh connection.</li>
     <li><strong>Erase poll limit</strong> (Dot.swift) &mdash; After 60 polls (3 minutes), gives up and marks <code>flashCorrupted</code>. Safety net for stuck erases.</li>
   </ol>
 

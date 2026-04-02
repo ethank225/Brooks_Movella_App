@@ -150,16 +150,22 @@ var connectInProgress: String?   // UUID currently being connected (nil = idle)<
 <pre><code>func initializeAfterConnect(uuid: String, settleDelay: TimeInterval = 0) {
     guard let dot = registry.dot(forUuid: uuid) else { return }
 
-    dot.checkRecordingStatus { [weak self] isRecording in
+    dot.checkSensorActivity { [weak self] activity in
         guard let self else { return }
         self.stateQueue.async {
-            if isRecording {
+            switch activity {
+            case .recording:
                 // Sensor is mid-recording &mdash; skip flash query (it won't respond)
                 self.registry.setConnectionPhase(uuid, .ready)
                 self.registry.initializationInProgress.remove(uuid)
                 self.restoreRecordingPhase(for: uuid)
                 self.notify()
-            } else {
+            case .erasing:
+                // Sensor is mid-erase &mdash; skip flash, start polling
+                self.registry.setConnectionPhase(uuid, .ready)
+                dot.startErasePollFromManager()
+                self.notify()
+            case .idle:
                 // Safe to query flash
                 self.refreshStorage(uuids: [uuid], settleDelay: settleDelay)
             }
@@ -167,7 +173,14 @@ var connectInProgress: String?   // UUID currently being connected (nil = idle)<
     }
 }</code></pre>
 
-  <p><strong><code>checkRecordingStatus</code></strong> (on <code>Dot</code>): Installs a one-shot callback via <code>recordingStatusCompletion</code>, then calls <code>device.getRecordingStatus()</code> on <code>sdkQueue</code>. The callback fires when the SDK pushes the status. A 3-second timeout ensures the completion always fires (with <code>false</code> if SDK doesn't respond).</p>
+  <p><strong><code>checkSensorActivity</code></strong> (on <code>Dot</code>): Uses three racing paths to determine recording/erasing/idle state. First to complete wins via a <code>hasCompleted</code> flag:</p>
+  <ol>
+    <li><strong>One-shot callback</strong> &mdash; installs <code>recordingStatusCompletion</code>, then calls <code>device.getRecordingStatus()</code> on <code>sdkQueue</code>. Fastest path (~0.3s) when the SDK fires the callback. Works on new device objects; silently broken on reused objects.</li>
+    <li><strong>Property polling loop</strong> &mdash; polls <code>device.recording.recordingStatus</code> every 0.3s for up to 2.5s. Catches reused device objects where the SDK updates the property without firing the callback (~0.6&ndash;1s). Trusts <code>.isRecording</code> and <code>.isErasing</code> immediately (non-default values). Only trusts <code>.isIdle</code> after 1s (the default value 0 could be uninitialized).</li>
+    <li><strong>3-second timeout</strong> &mdash; assumes idle. Safety net for edge cases where both callback and property are unresponsive.</li>
+  </ol>
+
+  <p><strong>Flash timeout recovery:</strong> If <code>checkSensorActivity</code> returns <code>.idle</code> but the sensor is actually recording (SDK was too slow), <code>refreshStorage</code> calls <code>getFlashInfo</code> which times out. The timeout handler checks <code>recordingStatus</code> &mdash; if it now shows <code>.isRecording</code>, the sensor is recovered to <code>.ready</code> with <code>restoreRecordingPhase</code> instead of failing initialization. This makes the system self-healing for the app-relaunch scenario.</p>
 
   <p><strong><code>refreshStorage</code></strong>: Delegates to <code>DotOperationRunner.refreshStorage()</code> which calls <code>dot.getFlashInfo()</code> for each UUID. On completion, marks the dot <code>.ready</code> and calls <code>notify()</code>.</p>
 

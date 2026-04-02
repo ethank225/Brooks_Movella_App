@@ -137,6 +137,27 @@ if registry.syncInProgress &amp;&amp; registry.syncingUuids.contains(uuid) {
     notify()
 }</code></pre>
 
+  <h2><code>endSession(runnerId:)</code> &mdash; Stop Recording</h2>
+
+  <p>Called when the user taps &ldquo;Stop&rdquo;. Runs on <code>stateQueue</code>, sends stop commands via <code>DotOperationRunner.runAll</code>:</p>
+
+  <h3>Dot filtering</h3>
+  <ul>
+    <li>Filters runner&rsquo;s sensor UUIDs by <code>isConnected</code> AND <code>connectionPhase == .ready</code></li>
+    <li>Dots still in <code>.initializing</code> are skipped &mdash; sending stop during flash queries can interfere</li>
+    <li>The UI also disables the stop button while any runner dot is still initializing (same <code>sensorsInitializing</code> / <code>allDotsReady</code> guard used for the start button)</li>
+  </ul>
+
+  <h3>Per-sensor stop logic</h3>
+  <ul>
+    <li>Before calling <code>dot.stopRecording()</code>, reads the live SDK property <code>device.recording.recordingStatus</code></li>
+    <li>If not <code>.isRecording</code> (sensor already idle after power cycle or disconnect), skips stop and calls <code>done(true)</code>. Also calls <code>dot.syncRecordingState()</code> on main thread to sync the <code>@Published</code> flag with the live SDK state.</li>
+    <li>If <code>.isRecording</code>, calls <code>dot.stopRecording()</code> which sends the SDK command and enters <code>waitForRecordingState</code></li>
+  </ul>
+
+  <h3><code>waitForRecordingState</code></h3>
+  <p>Polls <code>device.recording.recordingStatus</code> (the live SDK property) on <code>sdkQueue</code> every 0.3s. On success, calls <code>syncRecordingState()</code> and then the completion handler in the same <code>DispatchQueue.main.async</code> block. <code>syncRecordingState()</code> uses <code>setOnMain</code> which runs synchronously when already on main thread, so the flag is guaranteed to update before the completion triggers the runner phase transition.</p>
+
   <div class="page-nav">
     <a href="connections.html">&larr; Connections</a>
     <a href="registry.html">DotRegistry &rarr;</a>
