@@ -28,8 +28,9 @@ nonisolated enum SessionPhase: Equatable, Sendable {
 
 extension SessionPhase {
 
-    /// True while a background operation is in flight and the UI should show a spinner.
-    var isBusy: Bool {
+    /// True while a transient background operation is in flight (syncing, starting, stopping).
+    /// NOT true during steady-state recording. Distinct from DotManager.isBusy which covers all active phases.
+    var isTransitioning: Bool {
         switch self {
         case .syncing, .startingRecording, .stoppingRecording:
             return true
@@ -78,6 +79,187 @@ nonisolated enum ConnectionPhase: Equatable, Sendable {
 
     var isConnected: Bool {
         self == .initializing || self == .ready
+    }
+}
+
+// MARK: - Testable Decision Logic
+
+/// Lightweight snapshot of a sensor's state for precondition checks.
+/// Avoids coupling test code to `Dot` (which wraps SDK objects).
+struct DotSnapshot {
+    let isReady: Bool
+    let isSynced: Bool
+    let isRecording: Bool
+}
+
+/// Which initialization path to take after a successful BLE connect.
+enum ConnectPath: Equatable {
+    case syncReconnect
+    case queuedButNotActive
+    case autoReconnect
+    case normalConnect(settleDelay: TimeInterval)
+}
+
+/// Extracted pure functions for unit testing without Bluetooth.
+/// Each function mirrors a decision point inside DotManager but takes
+/// value-type inputs and returns value-type outputs — no SDK, no queues.
+enum DotManagerLogic {
+
+    // MARK: - Begin Session Preconditions
+
+    /// Validates whether a recording session can start for the given runner state.
+    /// Returns `nil` on success, or an error message describing why it's blocked.
+    static func validateBeginSession(
+        currentPhase: SessionPhase,
+        connectQueueEmpty: Bool,
+        dots: [DotSnapshot],
+        runnerExists: Bool
+    ) -> String? {
+        guard currentPhase == .idle || currentPhase.isError else {
+            return "Runner is busy (\(currentPhase))"
+        }
+        guard connectQueueEmpty else {
+            return "Connections still pending"
+        }
+        guard runnerExists else {
+            return "Runner not found"
+        }
+        let readyDots = dots.filter(\.isReady)
+        guard !readyDots.isEmpty else {
+            return "No ready sensors"
+        }
+        if readyDots.count >= 2 && !readyDots.allSatisfy(\.isSynced) {
+            return "Sensors not synced"
+        }
+        if readyDots.contains(where: \.isRecording) {
+            return "Sensor already recording"
+        }
+        return nil
+    }
+
+    // MARK: - Resync Preconditions
+
+    /// Validates whether a resync can start for the given runner state.
+    static func validateResync(
+        currentPhase: SessionPhase,
+        anySyncActive: Bool,
+        readyDotCount: Int
+    ) -> String? {
+        guard currentPhase == .idle else {
+            return "Runner is not idle (\(currentPhase))"
+        }
+        guard !anySyncActive else {
+            return "Another runner is syncing"
+        }
+        guard readyDotCount >= 2 else {
+            return "Need 2+ ready sensors (have \(readyDotCount))"
+        }
+        return nil
+    }
+
+    // MARK: - Connect Path Selection
+
+    /// Determines which initialization path to take after BLE connect succeeds.
+    static func determineConnectPath(
+        syncInProgress: Bool,
+        isSyncingUuid: Bool,
+        isInConnectQueue: Bool,
+        isConnectInProgress: Bool,
+        hasDot: Bool
+    ) -> ConnectPath {
+        if syncInProgress && isSyncingUuid {
+            return .syncReconnect
+        }
+        if isInConnectQueue && !isConnectInProgress {
+            return .queuedButNotActive
+        }
+        if hasDot && !isConnectInProgress && !isInConnectQueue {
+            return .autoReconnect
+        }
+        let settleDelay: TimeInterval = hasDot ? 2.0 : 0
+        return .normalConnect(settleDelay: settleDelay)
+    }
+
+    // MARK: - Sync Result Parsing
+
+    /// Identifier for matching sync results back to dots.
+    struct DotIdentifier {
+        let address: String
+        let macAddress: String
+    }
+
+    /// Parses the raw SDK sync results array into a typed SyncResult.
+    static func parseSyncResults(
+        rawResults: [[String: Any]]?,
+        dots: [DotIdentifier]
+    ) -> DotManager.SyncResult {
+        guard let results = rawResults else {
+            let allUuids = Set(dots.map(\.address))
+            return DotManager.SyncResult(
+                allSuccess: false,
+                succeededUuids: [],
+                failedUuids: allUuids,
+                errorMsg: "Sync failed — no results from SDK."
+            )
+        }
+
+        var succeededUuids = Set<String>()
+        var failedUuids = Set<String>()
+
+        for result in results {
+            let addr = (result["address"] as? String) ?? "?"
+            let success = (result["success"] as? Bool) ?? false
+
+            if let dot = dots.first(where: { $0.macAddress == addr || $0.address == addr }) {
+                if success {
+                    succeededUuids.insert(dot.address)
+                } else {
+                    failedUuids.insert(dot.address)
+                }
+            }
+        }
+
+        // Dots not in results at all count as failed
+        for dot in dots where !succeededUuids.contains(dot.address) && !failedUuids.contains(dot.address) {
+            failedUuids.insert(dot.address)
+        }
+
+        let allSuccess = failedUuids.isEmpty
+        let errorMsg = allSuccess ? nil : "\(failedUuids.count) of \(dots.count) sensors failed to sync."
+        return DotManager.SyncResult(
+            allSuccess: allSuccess,
+            succeededUuids: succeededUuids,
+            failedUuids: failedUuids,
+            errorMsg: errorMsg
+        )
+    }
+
+    // MARK: - Phase Transition Side Effects
+
+    /// Computes what should change when a runner's phase transitions.
+    struct PhaseTransitionEffects {
+        let syncInProgress: Bool
+        let shouldClearSyncingUuids: Bool
+        let shouldClearExportCart: Bool
+        let shouldPurgeStaleConnections: Bool
+    }
+
+    static func computePhaseEffects(
+        newPhase: SessionPhase,
+        allPhases: [String: SessionPhase]
+    ) -> PhaseTransitionEffects {
+        // After updating the target runner, check if any runner is still sync-active
+        let syncInProgress = allPhases.values.contains { $0.isSyncActive }
+        let shouldClearSyncingUuids = !newPhase.isSyncActive
+        let shouldClearExportCart = newPhase == .recording
+        let shouldPurgeStaleConnections = newPhase == .idle
+
+        return PhaseTransitionEffects(
+            syncInProgress: syncInProgress,
+            shouldClearSyncingUuids: shouldClearSyncingUuids,
+            shouldClearExportCart: shouldClearExportCart,
+            shouldPurgeStaleConnections: shouldPurgeStaleConnections
+        )
     }
 }
 
@@ -148,6 +330,19 @@ final class DotManager: NSObject, ObservableObject {
     /// Published for SwiftUI. Updated on main thread from runnerPhasesInternal.
     @Published private(set) var runnerPhases: [String: SessionPhase] = [:]
 
+    /// Internal busy check — must be called on stateQueue.
+    private var isBusyInternal: Bool {
+        registry.syncInProgress
+        || runnerPhasesInternal.values.contains {
+            switch $0 {
+            case .syncing, .startingRecording, .recording, .stoppingRecording:
+                return true
+            default:
+                return false
+            }
+        }
+    }
+
     /// Aggregate phase across all runners. Used by views that need a single "is the system busy" answer.
     var sessionPhase: SessionPhase {
         Self.aggregateSessionPhase(from: runnerPhases)
@@ -169,14 +364,46 @@ final class DotManager: NSObject, ObservableObject {
         runnerPhases.values.contains { $0.isSyncActive }
     }
 
+    // MARK: - State Hierarchy
+    //
+    // DotManager.isBusy (UI gate — blocks export, erase, connect, scan)
+    // ├── isAnySyncing (runnerPhases contains .syncing)
+    // └── runnerPhases contains .startingRecording / .recording / .stoppingRecording
+    //
+    // DotManager.isBusyInternal (stateQueue gate — blocks refreshStorage, flash timers)
+    // ├── registry.syncInProgress (also used for sync-specific reconnect suppression)
+    // └── runnerPhasesInternal contains active phases
+    //
+    // DotManager.isErasing (derived from connectedDots — blocks export, recording start)
+    // DotManager.hasFlashIssue (derived — blocks recording start, shows banners)
+    //   └── isAnyErasingFromPreviousSession (subset — distinguishes "finishing erase" from "corrupted")
+
+    /// True when any operation requires exclusive BLE access.
+    /// Covers: syncing, recording, starting, stopping.
+    /// All BLE entry points (export, flash refresh, erase) must check this.
+    var isBusy: Bool {
+        runnerPhases.values.contains {
+            switch $0 {
+            case .syncing, .startingRecording, .recording, .stoppingRecording:
+                return true
+            default:
+                return false
+            }
+        }
+    }
+
     @Published private(set) var hasPendingConnections: Bool = false
 
-    @Published var isErasing: Bool = false
+    /// Derived from per-Dot erase state — self-healing, no manual set/clear needed.
+    var isErasing: Bool { connectedDots.contains { $0.isErasing } }
 
     var hasFlashIssue: Bool {
         connectedDots.contains { $0.flashCorrupted || $0.isErasingFromPreviousSession }
     }
 
+    /// Separate from hasFlashIssue because UI shows different banners/colors
+    /// for "actively finishing erase from prior session" vs "flash is corrupted."
+    /// FlashIssueBanner uses this to choose "Finishing Erase..." vs "Storage Needs Repair."
     var isAnyErasingFromPreviousSession: Bool {
         connectedDots.contains { $0.isErasingFromPreviousSession }
     }
@@ -211,6 +438,10 @@ final class DotManager: NSObject, ObservableObject {
         stateQueue.async {
             if self.registry.isScanningInternal { return }
             if self.registry.hasErasingFromPreviousSession { return }
+            if self.registry.syncInProgress {
+                print("🔍 Scan skipped — sync in progress")
+                return
+            }
 
             self.scanner.scan { [weak self] in
                 self?.stateQueue.async {
@@ -288,11 +519,10 @@ final class DotManager: NSObject, ObservableObject {
 
     /// Start a recording session for a specific runner.
     ///
-    /// If two or more of the runner's sensors are connected, clocks are
-    /// synchronized first to align multi-sensor data. With a single sensor,
-    /// recording starts immediately.
+    /// Start recording on a runner's sensors. All sensors with 2+ dots must
+    /// already be synced — call `resyncRunner(runnerId:)` first if needed.
     ///
-    /// Flow: `idle` → `syncing` → `startingRecording` → `recording`
+    /// Flow: `idle` → `startingRecording` → `recording`
     func beginSession(runnerId: String) {
         stateQueue.async {
             let currentPhase = self.runnerPhasesInternal[runnerId] ?? .idle
@@ -300,16 +530,6 @@ final class DotManager: NSObject, ObservableObject {
 
             guard self.registry.connectQueue.isEmpty && self.registry.connectInProgress == nil else {
                 print("⛔ beginSession(\(runnerId)) blocked — connections still pending (queue=\(self.registry.connectQueue.count), inProgress=\(self.registry.connectInProgress ?? "nil"))")
-                return
-            }
-
-            // DotSyncManager cannot handle concurrent sync calls.
-            let anotherSyncing = self.runnerPhasesInternal.contains { key, phase in
-                key != runnerId && phase.isSyncActive
-            }
-            if anotherSyncing {
-                print("⛔ beginSession(\(runnerId)) blocked — another runner is currently syncing")
-                self.setPhase(.error("Another session is syncing — please wait."), forRunner: runnerId)
                 return
             }
 
@@ -325,6 +545,12 @@ final class DotManager: NSObject, ObservableObject {
                 return dot
             }
             guard !dots.isEmpty else { return }
+
+            // Guard: multi-sensor groups must be synced before recording
+            if dots.count >= 2 && !dots.allSatisfy({ $0.device.isSynced() }) {
+                print("⛔ beginSession(\(runnerId)) blocked — sensors not synced")
+                return
+            }
 
             // Guard: none of these sensors are already recording
             for dot in dots where dot.isRecording {
@@ -346,20 +572,7 @@ final class DotManager: NSObject, ObservableObject {
                 dot.configure(outputRate: outputRate, filterIndex: filterIndex)
             }
 
-            if dots.count >= 2 {
-                self.registry.syncingUuids.formUnion(dots.map { $0.device.uuid })
-                self.setPhase(.syncing, forRunner: runnerId)
-                self.performSync(dots: dots, runnerId: runnerId) { [weak self] success, errorMsg in
-                    guard let self else { return }
-                    if success {
-                        self.performStartRecording(dots: dots, runnerId: runnerId)
-                    } else {
-                        self.setPhase(.error(errorMsg ?? "Sync failed. Please try again."), forRunner: runnerId)
-                    }
-                }
-            } else {
-                self.performStartRecording(dots: dots, runnerId: runnerId)
-            }
+            self.performStartRecording(dots: dots, runnerId: runnerId)
         }
     }
 
@@ -401,18 +614,15 @@ final class DotManager: NSObject, ObservableObject {
                 self.stateQueue.async {
                     if success {
                         
-                        //make sure that you stop the sync for each of the devices
-                        self.sdkQueue.async {
-                            let devices = dots.map { $0.device }
-                            DotSyncManager.stopSync(devices)
-                        }
-                        
                         self.setPhase(.idle, forRunner: runnerId)
                         // Settle delay — sensor needs time to finalize flash
                         // after stopping a resumed recording
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
-                            for dot in dots {
-                                dot.getFlashInfo { _ in }
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+                            self?.stateQueue.async {
+                                guard let self, !self.isBusyInternal else { return }
+                                for dot in dots {
+                                    dot.getFlashInfo { _ in }
+                                }
                             }
                         }
                     } else {
@@ -428,6 +638,68 @@ final class DotManager: NSObject, ObservableObject {
         stateQueue.async {
             if self.runnerPhasesInternal[runnerId]?.isError == true {
                 self.setPhase(.idle, forRunner: runnerId)
+            }
+        }
+    }
+
+    // MARK: - Resync
+
+    /// Whether a specific runner can be resynced right now.
+    func canResync(runnerId: String) -> Bool {
+        let phase = runnerPhases[runnerId] ?? .idle
+        guard phase == .idle else { return false }
+        guard !isAnySyncing else { return false }
+        guard let runner = RunnerStore.shared.runner(forId: runnerId) else { return false }
+        let connectedCount = runner.sensorUuids.filter { uuid in
+            connectedDots.contains { $0.address == uuid && $0.connectionPhase == .ready }
+        }.count
+        return connectedCount >= 2
+    }
+
+    /// Re-synchronize clocks for a runner's sensors without starting recording.
+    /// Available when the runner is idle and has 2+ connected sensors.
+    func resyncRunner(runnerId: String) {
+        stateQueue.async {
+            let currentPhase = self.runnerPhasesInternal[runnerId] ?? .idle
+            guard currentPhase == .idle else { return }
+            guard !self.runnerPhasesInternal.values.contains(where: { $0.isSyncActive }) else { return }
+
+            guard let runner = RunnerStore.shared.runner(forId: runnerId) else { return }
+
+            let dots = runner.sensorUuids.compactMap { uuid -> Dot? in
+                guard let dotState = self.registry.byUuid[uuid],
+                      dotState.connectionPhase == .ready,
+                      let dot = dotState.dot else { return nil }
+                return dot
+            }
+            guard dots.count >= 2 else { return }
+
+            self.setPhase(.syncing, forRunner: runnerId)
+            self.registry.syncingUuids.formUnion(dots.map { $0.device.uuid })
+
+            self.performSync(dots: dots, runnerId: runnerId) { [weak self] result in
+                guard let self else { return }
+                self.stateQueue.async {
+                    // setPhase handles syncInProgress and syncingUuids cleanup.
+                    if result.allSuccess {
+                        self.setPhase(.idle, forRunner: runnerId)
+                    } else {
+                        self.setPhase(.error(result.errorMsg ?? "Sync failed"), forRunner: runnerId)
+                        print("❌ Resync failed for runner \(runnerId): \(result.errorMsg ?? "unknown")")
+                    }
+
+                    // Refresh storage for sensors that are still connected.
+                    // After a failed sync the SDK has already reconnected the
+                    // devices, so they remain at .ready — no need to reset their
+                    // connection state. The runner's .error phase prompts the user
+                    // to retry.
+                    let connectedDots = dots.filter {
+                        self.registry.byUuid[$0.address]?.connectionPhase == .ready
+                    }
+                    if !connectedDots.isEmpty {
+                        self.refreshStorage(dots: connectedDots)
+                    }
+                }
             }
         }
     }
@@ -481,6 +753,24 @@ final class DotManager: NSObject, ObservableObject {
     /// Single-runner mode: clears the error on the ephemeral runner.
     func dismissError() {
         dismissError(runnerId: Self.singleRunnerID)
+    }
+
+    /// Single-runner mode: creates/updates the ephemeral runner, then syncs its sensors.
+    /// Does NOT start recording — the user must tap "Start Recording" separately.
+    func syncSession() {
+        stateQueue.async {
+            let readyUuids = self.registry.connectedDots
+                .filter { self.registry.byUuid[$0.address]?.connectionPhase == .ready }
+                .map { $0.address }
+            guard readyUuids.count >= 2 else { return }
+
+            DispatchQueue.main.async {
+                RunnerStore.shared.setRunner(
+                    Runner(id: Self.singleRunnerID, label: "Session", sensorUuids: readyUuids)
+                )
+                self.resyncRunner(runnerId: Self.singleRunnerID)
+            }
+        }
     }
 
     /// Promotes the `__single__` runner to a real runner with a new UUID.
@@ -551,7 +841,15 @@ final class DotManager: NSObject, ObservableObject {
     /// The SDK internally disconnects and reconnects each device during sync;
     /// delegate methods suppress those events when `isSyncActive` is true.
     /// Completion is dispatched back to `stateQueue`.
-    private func performSync(dots: [Dot], runnerId: String, completion: @escaping (Bool, String?) -> Void) {
+    /// Result of a sync operation, with per-sensor success info.
+    struct SyncResult {
+        let allSuccess: Bool
+        let succeededUuids: Set<String>
+        let failedUuids: Set<String>
+        let errorMsg: String?
+    }
+
+    private func performSync(dots: [Dot], runnerId: String, completion: @escaping (SyncResult) -> Void) {
         // Snapshot device references now (on stateQueue) before sync mutates anything.
         // The registry freezes these references while syncInProgress is true.
         let devices = dots.map { $0.device }
@@ -559,15 +857,13 @@ final class DotManager: NSObject, ObservableObject {
 
         sdkQueue.async { [weak self] in
             guard let self else { return }
-            
-            
-            //If it is already syncing from before, make sure the syncing is stopping. Should already be stopped but this is just to handle the edge case.
+
+            // If already synced from before, stop first to handle the edge case.
             for device in devices where device.isSynced() {
                 print("⚠️ [\(device.uuid)] Already synced — stopping before re-sync")
                 DotSyncManager.stopSync([device])
             }
-            
-            //Just print out the devices that are being initialized
+
             for device in devices {
                 print("🔍 [PRE-SYNC] \(device.uuid): isInitialized=\(device.isInitialized())")
             }
@@ -576,10 +872,14 @@ final class DotManager: NSObject, ObservableObject {
                 self.stateQueue.async {
                     guard let results = results as? [[String: Any]] else {
                         print("❌ Sync failed - no results")
-                        dots.forEach { $0.setSessionSynced(false) }
-                        completion(false, "Sync failed — no results from SDK.")
+                        dots.forEach { $0.refreshSyncStatus() }
+                        let allUuids = Set(dots.map { $0.address })
+                        completion(SyncResult(allSuccess: false, succeededUuids: [], failedUuids: allUuids, errorMsg: "Sync failed — no results from SDK."))
                         return
                     }
+
+                    var succeededUuids = Set<String>()
+                    var failedUuids = Set<String>()
 
                     for result in results {
                         let addr = (result["address"] as? String) ?? "?"
@@ -587,26 +887,36 @@ final class DotManager: NSObject, ObservableObject {
                         let success = (result["success"] as? Bool) ?? false
                         let done = (result["doneSuccess"] as? Int) ?? -1
                         print("🔄 [SYNC RESULT] \(addr): status=\(status) success=\(success) doneSuccess=\(done)")
+
+                        // Match result address back to dot UUID
+                        if let dot = dots.first(where: { $0.device.macAddress == addr || $0.address == addr }) {
+                            if success {
+                                succeededUuids.insert(dot.address)
+                            } else {
+                                failedUuids.insert(dot.address)
+                            }
+                        }
                     }
 
-                    let allSuccess = results.allSatisfy { ($0["success"] as? Bool) ?? false }
-                    dots.forEach { $0.setSessionSynced(allSuccess) }
+                    // Any dots not in results at all count as failed
+                    for dot in dots where !succeededUuids.contains(dot.address) && !failedUuids.contains(dot.address) {
+                        failedUuids.insert(dot.address)
+                    }
+
+                    let allSuccess = failedUuids.isEmpty
+                    dots.forEach { $0.refreshSyncStatus() }
 
                     if allSuccess {
                         print("✅ Sync completed")
                     } else {
-                        let failCount = results.filter { !(($0["success"] as? Bool) ?? false) }.count
-                        print("❌ Sync failed — \(failCount) of \(results.count) devices")
+                        print("❌ Sync failed — \(failedUuids.count) of \(dots.count) devices")
                     }
 
-                    self.refreshStorage(dots: dots)
+                    // NOTE: refreshStorage is NOT called here. The caller is responsible
+                    // for calling it on successful sensors AFTER cleaning up syncingUuids.
 
-                    if allSuccess {
-                        completion(true, nil)
-                    } else {
-                        let failCount = results.filter { !(($0["success"] as? Bool) ?? false) }.count
-                        completion(false, "\(failCount) of \(results.count) sensors failed to sync. Please try again.")
-                    }
+                    let errorMsg = allSuccess ? nil : "\(failedUuids.count) of \(dots.count) sensors failed to sync. Please try again."
+                    completion(SyncResult(allSuccess: allSuccess, succeededUuids: succeededUuids, failedUuids: failedUuids, errorMsg: errorMsg))
                 }
             }
         }
@@ -643,13 +953,11 @@ final class DotManager: NSObject, ObservableObject {
                 return
             }
             let dotsSnapshot = self.registry.connectedDots
-            DispatchQueue.main.async { self.isErasing = true }
 
             self.operations.runAll(
                 dots: dotsSnapshot,
                 operation: { dot, done in dot.eraseFlash(completion: done) },
                 completion: { success in
-                    DispatchQueue.main.async { self.isErasing = false }
                     completion(success)
                 }
             )
@@ -657,6 +965,19 @@ final class DotManager: NSObject, ObservableObject {
     }
 
     // MARK: - Internal Helpers
+
+    /// Reset erase-related flags and install the erase-state-change callback on a
+    /// freshly (re)connected dot. Called from each path in `onDeviceConnectSucceeded`.
+    private func resetEraseState(_ dot: Dot) {
+        dot.onEraseStateChanged = { [weak self] in
+            self?.stateQueue.async { self?.notify() }
+        }
+        setOnMain {
+            dot.isErasing = false
+            dot.isErasingFromPreviousSession = false
+            dot.flashCorrupted = false
+        }
+    }
 
     /// Dequeue the next device and issue a connect call. Must be called on `stateQueue`.
     private func processConnectQueue() {
@@ -670,6 +991,10 @@ final class DotManager: NSObject, ObservableObject {
 
     /// Fetch flash usage for each dot after sync or connection. Must be called on `stateQueue`.
     private func refreshStorage(dots: [Dot], settleDelay: TimeInterval = 0) {
+        guard !isBusyInternal else {
+            print("💾 Storage refresh skipped — system busy")
+            return
+        }
         operations.refreshStorage(dots: dots, settleDelay: settleDelay) { [weak self] dot, success in
             self?.stateQueue.async {
                 guard let self else { return }
@@ -688,6 +1013,7 @@ final class DotManager: NSObject, ObservableObject {
                         print("⏳ [\(uuid)] Sensor is mid-erase — marking .ready and polling")
                         self.registry.setConnectionPhase(uuid, .ready)
                         dot.refreshBattery()
+                        dot.refreshSyncStatus()
                         setOnMain { dot.isErasingFromPreviousSession = true }
                         dot.startErasePollFromManager()
                         self.notify()
@@ -697,6 +1023,7 @@ final class DotManager: NSObject, ObservableObject {
                     if recStatus == .isRecording {
                         print("⏳ [\(uuid)] Flash timeout but sensor is recording — recovering to .ready")
                         self.registry.setConnectionPhase(uuid, .ready)
+                        dot.refreshSyncStatus()
 
                         if let runner = RunnerStore.shared.runner(forSensorUuid: uuid) {
                             let phase = self.runnerPhasesInternal[runner.id] ?? .idle
@@ -718,30 +1045,13 @@ final class DotManager: NSObject, ObservableObject {
                 self.registry.setConnectionPhase(uuid, .ready)
                 print("✅ [\(uuid)] phase now .ready")
                 dot.refreshBattery()
+                dot.refreshSyncStatus()
 
                 // Re-query actual recording state after reconnect.
                 // SDK does not push this automatically, so isRecording stays stale otherwise.
                 dot.refreshRecordingStatus()
 
-                // If the sensor is still recording (e.g. after BT reset or app relaunch),
-                // restore the runner's phase so the UI reflects the active session.
-//                if dot.isRecording,
-//                   let runner = RunnerStore.shared.runner(forSensorUuid: uuid) {
-//                    let phase = self.runnerPhasesInternal[runner.id] ?? .idle
-//                    if phase == .idle || phase.isError {
-//                        print("🔄 [\(uuid)] Restoring .recording for runner \(runner.id)")
-//                        self.setPhase(.recording, forRunner: runner.id)
-//                    }
-//                }
-
                 self.notify()
-
-                // DEBUG ONLY — remove after testing
-//                setOnMain { dot.flashCorrupted = true }
-                
-                DispatchQueue.main.async {
-                    self.objectWillChange.send()
-                }
             }
         } completion: {}
     }
@@ -765,6 +1075,7 @@ final class DotManager: NSObject, ObservableObject {
                     print("⏳ [\(uuid)] Still recording — skipping flash query")
                     self.registry.initializationInProgress.remove(uuid)
                     self.registry.setConnectionPhase(uuid, .ready)
+                    dot.refreshSyncStatus()
                     print("✅ [\(uuid)] phase now .ready (recording device, flash skipped)")
 
                     if let runner = RunnerStore.shared.runner(forSensorUuid: uuid) {
@@ -780,6 +1091,7 @@ final class DotManager: NSObject, ObservableObject {
                     print("⏳ [\(uuid)] Still erasing from previous session — skipping flash query")
                     self.registry.initializationInProgress.remove(uuid)
                     self.registry.setConnectionPhase(uuid, .ready)
+                    dot.refreshSyncStatus()
                     print("✅ [\(uuid)] phase now .ready (erasing device, flash skipped)")
                     dot.refreshBattery()
                     setOnMain { dot.isErasingFromPreviousSession = true }
@@ -926,14 +1238,7 @@ extension DotManager: DotConnectionDelegate {
                 }
 
                 if let dot = self.registry.dot(forUuid: device.uuid) {
-                    dot.onEraseStateChanged = { [weak self] in
-                        self?.stateQueue.async { self?.notify() }
-                    }
-                    setOnMain {
-                        dot.isErasing = false
-                        dot.isErasingFromPreviousSession = false
-                        dot.flashCorrupted = false
-                    }
+                    self.resetEraseState(dot)
                     self.initializeAfterConnect(dot: dot)
                 }
                 self.notify()
@@ -958,14 +1263,7 @@ extension DotManager: DotConnectionDelegate {
                 }
 
                 if let dot = self.registry.dot(forUuid: device.uuid) {
-                    dot.onEraseStateChanged = { [weak self] in
-                        self?.stateQueue.async { self?.notify() }
-                    }
-                    setOnMain {
-                        dot.isErasing = false
-                        dot.isErasingFromPreviousSession = false
-                        dot.flashCorrupted = false
-                    }
+                    self.resetEraseState(dot)
                     self.initializeAfterConnect(dot: dot)
                 }
                 self.notify()
@@ -990,14 +1288,7 @@ extension DotManager: DotConnectionDelegate {
             }
 
             if let dot = self.registry.dot(forUuid: device.uuid) {
-                dot.onEraseStateChanged = { [weak self] in
-                    self?.stateQueue.async { self?.notify() }
-                }
-                setOnMain {
-                    dot.isErasing = false
-                    dot.isErasingFromPreviousSession = false
-                    dot.flashCorrupted = false
-                }
+                self.resetEraseState(dot)
                 self.initializeAfterConnect(dot: dot, settleDelay: settleDelay)
 
                 self.registry.advanceConnectQueue(expect: device.uuid)

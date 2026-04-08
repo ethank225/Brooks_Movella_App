@@ -52,6 +52,8 @@
 
   <h2>Export Flow</h2>
 
+  <p><strong>Guards:</strong> <code>fetchRecordings</code>, <code>startExport</code>, and <code>retryFailed</code> all check <code>DotManager.shared.isBusy</code> &mdash; export is blocked during sync and recording. <code>isTransferring</code> writes are wrapped in <code>setOnMain</code> for thread safety.</p>
+
 <pre><code>fetchRecordings(for: dots)
     &boxur;&boxh; For each dot (DispatchGroup):
         dot.getExportFileInfo &rarr; recordings[dot.address] = files
@@ -169,6 +171,8 @@ let progress = min(elapsedTime / estimatedDuration, 0.99)</code></pre>
   </ul>
 
   <p>There is no partial resume &mdash; the streaming pipeline has no intermediate binary format to resume from.</p>
+
+  <p><strong>Semaphore timeout:</strong> All <code>semaphore.wait()</code> calls in retry paths use a 5-minute timeout (<code>.now() + 300</code>). If a BLE transfer callback never fires (e.g. sensor disconnected mid-transfer), the semaphore unblocks and the task is marked failed instead of hanging the export queue forever.</p>
 
   <p>On retry, retried files are placed into the <strong>same session folder</strong> as the original export. The folder is matched by reading the Session ID from <code>metadata.csv</code> via <code>resolveSessionFolder(baseName:sessionId:in:)</code>.</p>
 

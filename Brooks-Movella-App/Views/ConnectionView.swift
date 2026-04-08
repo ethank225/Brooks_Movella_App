@@ -25,7 +25,7 @@ struct ConnectionView: View {
 
     private var canEraseAll: Bool {
         manager.connectedDots.contains { $0.connectionPhase == .ready }
-        && manager.sessionPhase == .idle
+        && !manager.isBusy
         && !manager.isErasing
     }
 
@@ -163,7 +163,7 @@ struct ConnectionView: View {
                         phase: phase,
                         isIdentifying: identifyingUuid == uuid,
                         dot: dot,
-                        sessionBusy: manager.sessionPhase.isBusy,
+                        sessionBusy: manager.isBusy,
                         isErasing: erasingUuids.contains(uuid),
                         isEditing: editingUuid == uuid,
                         editText: editingUuid == uuid ? $editText : nil,
@@ -185,7 +185,12 @@ struct ConnectionView: View {
                             triggerIdentify(uuid: uuid)
                         } : nil
                     )
+                    .transition(.asymmetric(
+                        insertion: .scale(scale: 0.8).combined(with: .opacity),
+                        removal: .scale(scale: 0.8).combined(with: .opacity)
+                    ))
                 }
+                .animation(AppAnimation.interactive, value: discoveredList.map(\.uuid))
             }
         }
     }
@@ -199,7 +204,7 @@ struct ConnectionView: View {
 
                     // MARK: - Session Busy Banner
 
-                    if manager.sessionPhase.isBusy {
+                    if manager.isBusy {
                         HStack(spacing: 8) {
                             ProgressView()
                                 .progressViewStyle(CircularProgressViewStyle(tint: sessionBusyColor))
@@ -230,7 +235,7 @@ struct ConnectionView: View {
                         if manager.isScanning { ProgressView() }
                         else { Image(systemName: "arrow.clockwise") }
                     }
-                    .disabled(manager.isScanning || manager.sessionPhase.isBusy || manager.isErasing)
+                    .disabled(manager.isScanning || manager.isBusy || manager.isErasing)
                 }
             }
             .alert("Cannot Switch Modes", isPresented: $showModeToggleAlert) {
@@ -286,7 +291,7 @@ struct ConnectionView: View {
 
         // If currently busy, ignore repeated taps
         if phase.isBusy { return }
-        if manager.sessionPhase.isBusy { return }
+        if manager.isBusy { return }
 
         if manager.dot(forUuid: uuid)?.isConnected == true {
             if let dot = manager.dot(forUuid: uuid) {
@@ -311,11 +316,9 @@ struct ConnectionView: View {
     private func repairErase(uuid: String) {
         guard let dot = manager.dot(forUuid: uuid) else { return }
         erasingUuids.insert(uuid)
-        manager.isErasing = true
         dot.eraseFlash { _ in
             DispatchQueue.main.async {
                 self.erasingUuids.remove(uuid)
-                self.manager.isErasing = false
             }
         }
     }
@@ -324,11 +327,9 @@ struct ConnectionView: View {
         guard let uuid = eraseTargetUuid,
               let dot = manager.dot(forUuid: uuid) else { return }
         erasingUuids.insert(uuid)
-        manager.isErasing = true
         dot.eraseFlash { _ in
             DispatchQueue.main.async {
                 self.erasingUuids.remove(uuid)
-                self.manager.isErasing = false
             }
         }
         eraseTargetUuid = nil
@@ -558,9 +559,9 @@ private struct ObservedDotContent: View {
         .padding()
         .background(rowBackgroundView)
         .cornerRadius(10)
-        .animation(.easeInOut(duration: 0.4), value: dot.flashCorrupted)
-        .animation(.easeInOut(duration: 0.4), value: dot.isErasingFromPreviousSession)
-        .animation(.easeInOut(duration: 0.4), value: isUserErasing)
+        .animation(AppAnimation.deviceState, value: dot.flashCorrupted)
+        .animation(AppAnimation.deviceState, value: dot.isErasingFromPreviousSession)
+        .animation(AppAnimation.deviceState, value: isUserErasing)
         .onChange(of: isErasing) { erasing in
             if !erasing { eraseBreathe = false }
         }
@@ -672,7 +673,7 @@ struct DeviceRow: View {
         }
         .contentShape(Rectangle())
         .onTapGesture(count: 2) { onIdentify?() }
-        .animation(.easeInOut(duration: 0.3), value: isIdentifying)
+        .animation(AppAnimation.phase, value: isIdentifying)
     }
 }
 

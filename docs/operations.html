@@ -49,6 +49,8 @@
     <li><code>eraseAllFlash</code> &mdash; calls <code>dot.eraseFlash()</code> on each dot</li>
   </ul>
 
+  <p><strong>Known limitation:</strong> <code>runAll</code> returns a single <code>Bool</code>. If 1 of 3 sensors fails, the entire operation is reported as failed and the runner moves to <code>.error</code>. There is no per-sensor failure reporting or partial success handling. See <a href="overview.html">Vulnerabilities</a> #1.</p>
+
   <h2><code>executeSequentially(items:operation:completion:)</code></h2>
 
   <p>Generic recursive helper:</p>

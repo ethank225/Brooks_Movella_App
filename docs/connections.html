@@ -24,7 +24,77 @@
 
 <div class="container">
   <h1>Deep Dive: Connection Queue &amp; Reconnect Logic</h1>
-  <p class="subtitle">Serial connection queue, timeout handling, and four reconnection paths.</p>
+  <p class="subtitle">Serial connection queue, timeout handling, four reconnection paths, and Bluetooth power-off recovery.</p>
+
+  <h2>Step-by-Step: User Tap to .ready</h2>
+
+  <p>The complete chain from &ldquo;user taps Connect&rdquo; to &ldquo;sensor shows as <code>.ready</code> in the UI&rdquo;. Typical time: ~3 seconds for first connect, ~5 seconds for BT-reset reconnect (includes 2s settle delay).</p>
+
+  <p><strong>1. Queue the UUID</strong> (stateQueue)</p>
+<pre><code>connectByUuid(uuid)
+  &boxvr;&boxh; connectQueue.append(uuid)
+  &boxvr;&boxh; connectionPhase = .connecting          // UI shows "Connecting..."
+  &boxvr;&boxh; startScan()                            // BLE scan begins
+  &boxvr;&boxh; startConnectTimer(uuid)                // 10-second timeout
+  &boxur;&boxh; processConnectQueue()                   // dequeue and connect</code></pre>
+
+  <p><strong>2. Dequeue and issue SDK connect</strong> (stateQueue &rarr; sdkQueue)</p>
+<pre><code>processConnectQueue()
+  &boxvr;&boxh; dequeueNextConnection()
+  &boxv;     guard: connectInProgress == nil         // one at a time
+  &boxv;     guard: !syncInProgress                  // blocked during sync
+  &boxv;     &boxur;&boxh; connectInProgress = uuid
+  &boxur;&boxh; sdkQueue: DotConnectionManager.connect(device)</code></pre>
+
+  <p><strong>3. SDK connect succeeds</strong> (SDK thread &rarr; stateQueue)</p>
+<pre><code>onDeviceConnectSucceeded(device)
+  &boxvr;&boxh; cancelConnectTimer(uuid)
+  &boxvr;&boxh; recordConnection(device)               // creates Dot if first time
+  &boxv;     connectionPhase = .initializing          // UI shows "Initializing..."
+  &boxvr;&boxh; sdkQueue: DotDevicePool.bindDevice(device)
+  &boxvr;&boxh; resetEraseState(dot)                   // clear erase flags
+  &boxvr;&boxh; advanceConnectQueue()                  // start next device
+  &boxur;&boxh; initializeAfterConnect(dot, settleDelay)</code></pre>
+
+  <p><strong>4. Check sensor activity</strong> (sdkQueue, ~0.3&ndash;3s)</p>
+<pre><code>checkSensorActivity { activity in ... }
+  Three racing paths (first wins):
+  &boxvr;&boxh; One-shot callback (~0.3s)              // fastest, new device objects
+  &boxvr;&boxh; Property polling every 0.3s (~0.6s)    // catches reused objects
+  &boxur;&boxh; 3-second timeout                       // assumes idle</code></pre>
+
+  <p><strong>5. Branch on result</strong> (stateQueue)</p>
+<pre><code>if .idle:
+  &boxur;&boxh; refreshStorage(dot, settleDelay)       // query flash &rarr; step 6
+
+if .recording:
+  &boxvr;&boxh; connectionPhase = .ready               // skip flash query
+  &boxvr;&boxh; refreshSyncStatus()
+  &boxur;&boxh; restore runner phase to .recording      // DONE
+
+if .erasing:
+  &boxvr;&boxh; connectionPhase = .ready
+  &boxvr;&boxh; isErasingFromPreviousSession = true
+  &boxur;&boxh; startErasePollFromManager()             // DONE (polls until complete)</code></pre>
+
+  <p><strong>6. Flash storage query</strong> (sdkQueue, ~0.5&ndash;1s)</p>
+<pre><code>refreshStorage()
+  &boxvr;&boxh; waitForInitialization (poll every 0.2s, 5s timeout)
+  &boxv;     if settleDelay: wait extra 2s after isInitialized == true
+  &boxur;&boxh; getFlashInfo()
+      &boxvr;&boxh; SDK callback: used/total bytes
+      &boxur;&boxh; 5-second safety timeout</code></pre>
+
+  <p><strong>7. Finalize</strong> (stateQueue &rarr; main)</p>
+<pre><code>connectionPhase = .ready                   // &star; SENSOR IS READY
+refreshBattery()
+refreshSyncStatus()                        // device.isSynced() &rarr; sessionSynced
+refreshRecordingStatus()
+notify()                                   // push all state to UI</code></pre>
+
+  <p>Sensor now appears in the UI with green indicator, battery percentage, and storage bar. Proceed to <a href="sync.html">Sync &amp; Record</a> for the next steps.</p>
+
+  <hr>
 
   <h2>Connection Queue</h2>
 
@@ -94,61 +164,71 @@ var connectInProgress: String?   // UUID currently being connected (nil = idle)<
 
   <h2>Reconnect Logic</h2>
 
-  <p><code>onDeviceConnectSucceeded</code> handles three distinct reconnection scenarios, each with different initialization paths.</p>
+  <p><code>onDeviceConnectSucceeded</code> handles four distinct connection scenarios, each with different initialization paths. All non-sync paths call <code>resetEraseState(dot)</code> &mdash; an extracted helper that installs the <code>onEraseStateChanged</code> callback and clears erase flags (<code>isErasing</code>, <code>isErasingFromPreviousSession</code>, <code>flashCorrupted</code>). This was previously duplicated inline in each path.</p>
 
   <h3>Entry Point: <code>onDeviceConnectSucceeded(_ device: DotDevice)</code></h3>
 
   <p>Everything below runs on <code>stateQueue</code>:</p>
 
 <pre><code>func onDeviceConnectSucceeded(_ device: DotDevice) {
-    stateQueue.async { [self] in
-        let uuid = device.uuid
-
-        // Cancel timeout timer
-        connectTimers[uuid]?.cancel()
-        connectTimers[uuid] = nil
+    stateQueue.async {
+        cancelConnectTimer(device.uuid)
 
         // PATH 1: Sync reconnect
+        // SDK internally reconnects during sync. Lightweight update only.
         if registry.syncInProgress &amp;&amp; registry.syncingUuids.contains(uuid) {
-            registry.recordReconnection(device)  // lightweight update, no phase change
-            advanceConnectQueue()
-            notify()
+            registry.recordReconnection(device)
+            return  // No init, no phase change, no notify
+        }
+
+        // PATH 2: Queued-but-not-active
+        // SDK auto-reconnected before we dequeued this UUID.
+        // Remove from queue (do NOT advanceConnectQueue &mdash; it wasn't connectInProgress).
+        if registry.connectQueue.contains(uuid)
+            &amp;&amp; registry.connectInProgress != uuid {
+            registry.connectQueue.removeAll { $0 == uuid }
+            registry.recordReconnection(device)
+            registry.setConnectionPhase(uuid, .initializing)
+            sdkQueue.async { DotDevicePool.bindDevice(device) }
+            initializeAfterConnect(dot: dot)
             return
         }
 
-        let alreadyKnown = registry.byUuid[uuid]?.dot != nil
-        let wasQueued = registry.connectInProgress == uuid
-
-        if alreadyKnown &amp;&amp; !wasQueued {
-            // PATH 2: Auto-reconnect (iOS reconnected without us asking)
+        // PATH 3: Auto-reconnect
+        // Previously connected (dot exists), not in queue, not in progress.
+        let isAutoReconnect = registry.byUuid[uuid]?.dot != nil
+            &amp;&amp; registry.connectInProgress != uuid
+            &amp;&amp; !registry.connectQueue.contains(uuid)
+        if isAutoReconnect {
             registry.recordReconnection(device)
             registry.setConnectionPhase(uuid, .initializing)
-            initializeAfterConnect(uuid: uuid)
-
-        } else if alreadyKnown &amp;&amp; wasQueued {
-            // PATH 3: BT-reset reconnect (we re-queued after BT power cycle)
-            registry.recordConnection(device)
-            advanceConnectQueue()
-            initializeAfterConnect(uuid: uuid, settleDelay: 2.0)
-
-        } else {
-            // PATH 4: First-time connection
-            registry.recordConnection(device)
-            advanceConnectQueue()
             sdkQueue.async { DotDevicePool.bindDevice(device) }
-            initializeAfterConnect(uuid: uuid)
+            initializeAfterConnect(dot: dot)
+            return
         }
 
+        // PATH 4: Normal queue connection / BT-reset reconnect
+        // Device at head of queue (connectInProgress == uuid).
+        // If reconnecting (dot already exists), add 2s settle delay.
+        let isReconnect = registry.byUuid[uuid]?.dot != nil
+        let settleDelay: TimeInterval = isReconnect ? 2.0 : 0
+        registry.recordConnection(device)  // creates Dot if first time
+        sdkQueue.async { DotDevicePool.bindDevice(device) }
+        initializeAfterConnect(dot: dot, settleDelay: settleDelay)
+        registry.advanceConnectQueue(expect: device.uuid)  // safe version
+        processConnectQueue()
         notify()
     }
 }</code></pre>
 
-  <h3><code>initializeAfterConnect(uuid:settleDelay:)</code></h3>
+  <p><strong>Key detail:</strong> Path 4 uses <code>advanceConnectQueue(expect: device.uuid)</code> which only clears <code>connectInProgress</code> if it matches the expected UUID. This guards against the race condition where a different device connects while this UUID is <code>connectInProgress</code> (see <a href="flash-recovery.html">Flash Recovery</a> for the original bug).</p>
 
-  <p>This method decides whether to query flash storage or skip straight to <code>.ready</code>:</p>
+  <h3><code>initializeAfterConnect(dot:settleDelay:)</code></h3>
 
-<pre><code>func initializeAfterConnect(uuid: String, settleDelay: TimeInterval = 0) {
-    guard let dot = registry.dot(forUuid: uuid) else { return }
+  <p>Takes a <code>Dot</code> (not a UUID) and decides whether to query flash storage or skip straight to <code>.ready</code>:</p>
+
+<pre><code>private func initializeAfterConnect(dot: Dot, settleDelay: TimeInterval = 0) {
+    let uuid = dot.address
 
     dot.checkSensorActivity { [weak self] activity in
         guard let self else { return }
@@ -156,18 +236,32 @@ var connectInProgress: String?   // UUID currently being connected (nil = idle)<
             switch activity {
             case .recording:
                 // Sensor is mid-recording &mdash; skip flash query (it won't respond)
-                self.registry.setConnectionPhase(uuid, .ready)
                 self.registry.initializationInProgress.remove(uuid)
-                self.restoreRecordingPhase(for: uuid)
+                self.registry.setConnectionPhase(uuid, .ready)
+                dot.refreshSyncStatus()
+
+                // Restore runner phase inline (no separate function)
+                if let runner = RunnerStore.shared.runner(forSensorUuid: uuid) {
+                    let phase = self.runnerPhasesInternal[runner.id] ?? .idle
+                    if phase == .idle || phase.isError {
+                        self.setPhase(.recording, forRunner: runner.id)
+                    }
+                }
                 self.notify()
+
             case .erasing:
                 // Sensor is mid-erase &mdash; skip flash, start polling
+                self.registry.initializationInProgress.remove(uuid)
                 self.registry.setConnectionPhase(uuid, .ready)
+                dot.refreshSyncStatus()
+                dot.refreshBattery()
+                setOnMain { dot.isErasingFromPreviousSession = true }
                 dot.startErasePollFromManager()
                 self.notify()
+
             case .idle:
                 // Safe to query flash
-                self.refreshStorage(uuids: [uuid], settleDelay: settleDelay)
+                self.refreshStorage(dots: [dot], settleDelay: settleDelay)
             }
         }
     }
@@ -180,7 +274,15 @@ var connectInProgress: String?   // UUID currently being connected (nil = idle)<
     <li><strong>3-second timeout</strong> &mdash; assumes idle. Safety net for edge cases where both callback and property are unresponsive.</li>
   </ol>
 
-  <p><strong>Flash timeout recovery:</strong> If <code>checkSensorActivity</code> returns <code>.idle</code> but the sensor is actually recording (SDK was too slow), <code>refreshStorage</code> calls <code>getFlashInfo</code> which times out. The timeout handler checks <code>recordingStatus</code> &mdash; if it now shows <code>.isRecording</code>, the sensor is recovered to <code>.ready</code> with <code>restoreRecordingPhase</code> instead of failing initialization. This makes the system self-healing for the app-relaunch scenario.</p>
+  <h3>Flash Timeout Recovery</h3>
+
+  <p>If <code>checkSensorActivity</code> returns <code>.idle</code> but the sensor is actually recording (SDK was too slow to populate the property), <code>refreshStorage</code> calls <code>getFlashInfo</code> which times out (the SDK won't respond during recording). The timeout handler in <code>refreshStorage</code> checks <code>recordingStatus</code> as a fallback:</p>
+
+  <ul>
+    <li><strong><code>.isRecording</code>:</strong> Sensor recovers to <code>.ready</code> with recording phase restoration &mdash; looks up the runner via <code>RunnerStore</code> and sets its phase to <code>.recording</code> if idle/error. Self-healing for the app-relaunch scenario.</li>
+    <li><strong><code>.isErasing</code>:</strong> Sensor recovers to <code>.ready</code> with <code>isErasingFromPreviousSession = true</code> and starts erase polling. See <a href="flash-recovery.html">Flash Recovery</a>.</li>
+    <li><strong>Other (genuine failure):</strong> Connection phase set to <code>.failed("Initialization timed out")</code>.</li>
+  </ul>
 
   <p><strong><code>refreshStorage</code></strong>: Delegates to <code>DotOperationRunner.refreshStorage()</code> which calls <code>dot.getFlashInfo()</code> for each UUID. On completion, marks the dot <code>.ready</code> and calls <code>notify()</code>.</p>
 
@@ -193,6 +295,28 @@ var connectInProgress: String?   // UUID currently being connected (nil = idle)<
   <p>After a Bluetooth power-off/reset, iOS reconnects devices but the SDK's internal BLE handshake isn't fully complete when <code>onDeviceConnectSucceeded</code> fires. <code>bindDevice()</code> returns immediately and <code>device.isInitialized</code> reports <code>true</code>, but <code>getFlashInfo()</code> never gets a callback because the underlying GATT services aren't ready.</p>
 
   <p>The 2-second <code>settleDelay</code> (passed through to <code>DotOperationRunner.waitForInitialization</code>) adds a pause after <code>isInitialized</code> returns <code>true</code> but before calling <code>getFlashInfo()</code>. This gives the SDK time to finish its internal re-initialization.</p>
+
+  <h2 id="bt-recovery">Bluetooth Power-Off Recovery</h2>
+
+  <p>When Bluetooth powers off or resets, <code>onManagerStateUpdate</code> fires with <code>.poweredOff</code> or <code>.resetting</code>:</p>
+
+  <h3>Power Off / Reset</h3>
+  <ul>
+    <li><code>cancelAllConnectTimers()</code> &mdash; cancel all pending timeout work items</li>
+    <li><code>registry.clearBusyFlags()</code> &mdash; wipes <code>connectInProgress</code>, <code>initializationInProgress</code>, <code>syncInProgress</code>, <code>syncingUuids</code>, <code>isScanningInternal</code></li>
+    <li><code>registry.markAllDisconnected()</code> &mdash; sets every UUID's phase to <code>.idle</code></li>
+    <li>All active runner phases are moved to <code>.error("Bluetooth disconnected.")</code></li>
+  </ul>
+
+  <h3>Power On</h3>
+  <ul>
+    <li>Re-queues all <code>previouslyConnectedUuids</code> into <code>connectQueue</code> (skipping duplicates)</li>
+    <li>Starts connect timers for every queued UUID (prevents silent connect failures from blocking the queue)</li>
+    <li>Calls <code>processConnectQueue()</code> using persisted <code>DotDevice</code> references from <code>byUuid</code> immediately &mdash; no need to wait for discovery</li>
+    <li>Starts scan as a fallback in case stored device references are stale</li>
+  </ul>
+
+  <p><strong>Known limitation:</strong> If BT powers off during a sync, <code>clearBusyFlags()</code> resets <code>syncInProgress</code> and <code>syncingUuids</code>. But <code>performSync</code>&rsquo;s SDK completion closure is still in flight with captured pre-reset data. If the closure fires after the reset, it dispatches back to <code>stateQueue</code> and could re-set <code>syncInProgress</code> or modify cleared state. See <a href="overview.html">Vulnerabilities &amp; Known Limitations</a> #5.</p>
 
   <div class="page-nav">
     <a href="queues.html">&larr; Queue Architecture</a>

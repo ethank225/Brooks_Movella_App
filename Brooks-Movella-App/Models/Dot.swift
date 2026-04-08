@@ -43,7 +43,7 @@ final class Dot: ObservableObject, Identifiable {
 
     var isConnected: Bool { connectionPhase.isConnected }
     @Published private(set) var isRecording = false
-    @Published var sessionSynced = false
+    @Published private(set) var sessionSynced = false
     @Published var isErasing = false
     @Published private(set) var recordingFiles: [DotRecordingFile] = []
 
@@ -71,9 +71,6 @@ final class Dot: ObservableObject, Identifiable {
 
     /// Whether the SDK has finished initializing this device after connection.
     var isInitialized: Bool { device.isInitialized() }
-
-    /// Whether the SDK considers this device time-synced with the host.
-    var isSynced: Bool { device.isSynced() }
 
     // MARK: - SDK Queue
 
@@ -115,10 +112,15 @@ final class Dot: ObservableObject, Identifiable {
 
     /// Replace the underlying device reference (e.g. after SDK reconnects during sync).
     /// Re-installs the recording callback since the old device object is stale.
-    func updateDevice(_ newDevice: DotDevice) {
+    /// When `isSyncing` is true, skips `refreshSyncStatus()` because the SDK
+    /// produces misleading intermediate values during its internal reconnects.
+    func updateDevice(_ newDevice: DotDevice, isSyncing: Bool = false) {
         self.device = newDevice
         sdkQueue.async {
             self.installRecordingStatusHandler()
+        }
+        if !isSyncing {
+            refreshSyncStatus()
         }
         print("🔄 [\(address)] Device reference updated")
     }
@@ -156,10 +158,6 @@ final class Dot: ObservableObject, Identifiable {
         setOnMain { self.connectionPhase = phase }
     }
 
-    func setSessionSynced(_ value: Bool) {
-        setOnMain { self.sessionSynced = value }
-    }
-
     /// Single source of truth for isRecording updates.
     /// Reads the live SDK property and pushes to @Published on main.
     func syncRecordingState() {
@@ -187,6 +185,7 @@ final class Dot: ObservableObject, Identifiable {
     func refreshSyncStatus() {
         sdkQueue.async {
             let synced = self.device.isSynced()
+            print("🔄 [\(self.address)] refreshSyncStatus: device.isSynced() = \(synced)")
             setOnMain { self.sessionSynced = synced }
         }
     }
@@ -629,7 +628,10 @@ final class Dot: ObservableObject, Identifiable {
             self.device.setEraseDataDoneBlock { [weak self] success in
                 let ok = success != 0
                 print("🗑️ [\(self?.address ?? "?")] Erase: \(ok ? "success" : "failed")")
-                setOnMain { self?.isErasing = false }
+                setOnMain {
+                    self?.isErasing = false
+                    self?.onEraseStateChanged?()
+                }
                 if ok {
                     setOnMain {
                         self?.flashCorrupted = false

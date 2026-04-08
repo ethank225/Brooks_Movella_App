@@ -4,6 +4,7 @@ struct CartItemRow: View {
     let item: CartItem
     let sessionNumber: Int
     let sessions: [UUID]
+    var isCalibration: Bool = false
     let onLabelChange:   (String) -> Void
     let onRemove:        () -> Void
     let onSessionChange: (UUID) -> Void
@@ -17,13 +18,24 @@ struct CartItemRow: View {
             sessionBadge
 
             VStack(alignment: .leading, spacing: 4) {
-                TextField("File label", text: $editedLabel)
-                    .font(.subheadline.weight(.medium))
-                    .textFieldStyle(.plain)
-                    .disabled(disabled)
-                    .onChange(of: editedLabel) { newValue in
-                        onLabelChange(newValue)
+                HStack(spacing: 6) {
+                    TextField("File label", text: $editedLabel)
+                        .font(.subheadline.weight(.medium))
+                        .textFieldStyle(.plain)
+                        .disabled(disabled)
+                        .onChange(of: editedLabel) { newValue in
+                            onLabelChange(newValue)
+                        }
+                    if isCalibration {
+                        Text("CAL")
+                            .font(.system(size: 9, weight: .bold))
+                            .foregroundColor(.blue)
+                            .padding(.horizontal, 4)
+                            .padding(.vertical, 1)
+                            .background(Color.blue.opacity(0.12))
+                            .cornerRadius(3)
                     }
+                }
 
                 HStack(spacing: 8) {
                     Text(item.recording.formattedSize)
@@ -44,9 +56,8 @@ struct CartItemRow: View {
                 }
             }
         }
-        .padding(10)
-        .background(Color.gray.opacity(0.1))
-        .cornerRadius(10)
+        .padding(.vertical, 8)
+        .padding(.horizontal, 4)
         .onAppear { editedLabel = item.label }
     }
 

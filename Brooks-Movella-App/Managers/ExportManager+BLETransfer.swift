@@ -84,7 +84,7 @@ extension ExportManager {
                     // Log negotiated MTU
                     let mtu = dot.device.peripheral.maximumWriteValueLength(for: .withoutResponse)
                     print("📶 [\(dot.address)] Negotiated MTU: \(mtu) bytes")
-                    self.isTransferring = true
+                    setOnMain { self.isTransferring = true }
 
                     // Bump the generation so stale callbacks from prior attempts are ignored.
                     self.exportFileGenerations[dot.address, default: 0] += 1
@@ -109,7 +109,7 @@ extension ExportManager {
                         exportCompleted = true
 
                         self.activeWatchdogs.removeValue(forKey: dot.address)
-                        self.isTransferring = false
+                        setOnMain { self.isTransferring = false }
                         self.exportFileGenerations[dot.address, default: 0] += 1
                         device.setDidParseExportFileDataBlock(nil)
                         device.recording.exportFileDone = { _, _ in }
@@ -217,8 +217,8 @@ extension ExportManager {
                     // so we only record the signal here. The watchdog handles finalization
                     // once the packet stream goes silent.
                     device.recording.exportFileDone = { [weak self] _, _ in
-                        guard self != nil, !doneFired else { return }
-                        guard self!.exportFileGenerations[dot.address] == generation else { return }
+                        guard let self, !doneFired else { return }
+                        guard self.exportFileGenerations[dot.address] == generation else { return }
                         doneFired = true
                         print("📥 [\(dot.address)] exportFileDone at pkt \(packetsReceived) — waiting for stream to drain")
                         // Remaining packet callbacks keep flowing; watchdog will close the file.

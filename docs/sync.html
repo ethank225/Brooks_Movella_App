@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Sync Flow — Brooks Movella App</title>
+<title>Sync &amp; Record Flow — Brooks Movella App</title>
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -23,10 +23,165 @@
 </nav>
 
 <div class="container">
-  <h1>Deep Dive: Sync Flow</h1>
-  <p class="subtitle">Clock synchronization, per-UUID suppression, and device reference freezing.</p>
+  <h1>Deep Dive: Sync &amp; Record Flow</h1>
+  <p class="subtitle">Two-step sync-then-record process, per-UUID suppression, and device reference freezing.</p>
 
-  <h2>Entry: <code>beginSession(runnerId:)</code></h2>
+  <h2>Step-by-Step Lifecycle</h2>
+
+  <p>This is the complete chain from &ldquo;sensors are <code>.ready</code>&rdquo; through sync and recording. Sync is <strong>required</strong> before recording when 2+ sensors are assigned to a runner &mdash; <code>beginSession</code> guards on <code>device.isSynced()</code> and refuses to proceed otherwise.</p>
+
+  <h3>Sync (~15 seconds)</h3>
+
+  <p>User taps &ldquo;Sync Sensors&rdquo; &rarr;</p>
+
+  <p><strong>1. Lock down sync state</strong> (stateQueue)</p>
+<pre><code>resyncRunner(runnerId)
+  &boxvr;&boxh; guard: phase == .idle, no other runner syncing, 2+ ready dots
+  &boxvr;&boxh; resyncingRunnersInternal.insert(runnerId)
+  &boxvr;&boxh; registry.syncingUuids = {uuid1, uuid2}     // freeze device refs
+  &boxvr;&boxh; registry.syncInProgress = true              // block connections
+  &boxur;&boxh; notify()                                     // UI shows spinner</code></pre>
+
+  <p>At this point: connections are blocked, disconnect events for these UUIDs are suppressed, device references are frozen so the SDK can work with stable pointers.</p>
+
+  <p><strong>2. SDK sync</strong> (sdkQueue, ~15 seconds)</p>
+<pre><code>performSync(dots:runnerId:completion:)
+  &boxvr;&boxh; snapshot device references (before SDK can mutate them)
+  &boxur;&boxh; DotSyncManager.startSync(devices) { results in ... }</code></pre>
+
+  <p>During this time the SDK internally <strong>disconnects and reconnects</strong> each sensor. Those events are suppressed via <code>syncingUuids</code> &mdash; the user sees nothing.</p>
+
+  <p><strong>3. Parse results and cleanup</strong> (stateQueue)</p>
+<pre><code>completion fires with SyncResult:
+  &boxvr;&boxh; parse per-sensor success/failure
+  &boxvr;&boxh; dot.refreshSyncStatus() on each    // device.isSynced() &rarr; @Published sessionSynced
+  &boxvr;&boxh; cleanup: clear resyncingRunnersInternal, syncingUuids, syncInProgress
+  &boxvr;&boxh; failed sensors: recordDisconnection (must reconnect)
+  &boxvr;&boxh; succeeded sensors: refreshStorage (re-fetch flash info)
+  &boxur;&boxh; notify()                             // UI clears spinner, shows checkmark</code></pre>
+
+  <p>Sensors now report <code>device.isSynced() == true</code>. Button changes to &ldquo;Start&rdquo;.</p>
+
+  <h3>Start Recording (~1&ndash;3 seconds)</h3>
+
+  <p>User taps &ldquo;Start&rdquo; &rarr;</p>
+
+  <p><strong>1. Validate</strong> (stateQueue)</p>
+<pre><code>beginSession(runnerId)
+  &boxvr;&boxh; guard: phase .idle, no pending connections
+  &boxvr;&boxh; collect dots where connectionPhase == .ready
+  &boxvr;&boxh; guard: if 2+ dots, ALL must have device.isSynced() == true
+  &boxvr;&boxh; guard: none already recording
+  &boxur;&boxh; configure each dot (output rate, filter)</code></pre>
+
+  <p><strong>2. Start each sensor sequentially</strong> (sdkQueue)</p>
+<pre><code>setPhase(.startingRecording)              // UI: "Starting..."
+
+for each dot (one at a time):
+  device.startRecording(0xFFFF)           // SDK command: record indefinitely
+  waitForRecordingState(target: true)     // poll every 0.3s, 10s timeout
+    &boxur;&boxh; when recordingStatus == .isRecording:
+        syncRecordingState()              // @Published isRecording = true
+        done(true)                        // next dot</code></pre>
+
+  <p><strong>3. All done</strong> (stateQueue)</p>
+<pre><code>if all succeeded:
+  setPhase(.recording)                    // UI: red "Stop" button
+  ExportManager.clearCart()               // clear stale export state
+if any failed:
+  setPhase(.error("Recording failed...")) // UI: error banner</code></pre>
+
+  <h3>Stop Recording (~1&ndash;2 seconds)</h3>
+
+  <p>User taps &ldquo;Stop&rdquo; &rarr;</p>
+
+  <p><strong>1. Validate and stop each sensor</strong> (stateQueue &rarr; sdkQueue)</p>
+<pre><code>endSession(runnerId)
+  &boxvr;&boxh; guard: phase == .recording
+  &boxvr;&boxh; collect connected dots with connectionPhase == .ready
+  &boxvr;&boxh; setPhase(.stoppingRecording)              // UI: "Stopping..."
+  &boxv;
+  for each dot:
+    &boxvr;&boxh; check live SDK property: device.recording.recordingStatus
+    &boxvr;&boxh; if already idle: skip, call syncRecordingState()
+    &boxur;&boxh; if recording: device.stopRecording()
+        waitForRecordingState(target: false)   // poll until stopped
+          &boxur;&boxh; syncRecordingState()               // @Published isRecording = false</code></pre>
+
+  <p><strong>2. Finalize</strong> (stateQueue)</p>
+<pre><code>if all succeeded:
+  setPhase(.idle)                         // UI: back to "Start"
+  2-second settle delay                   // sensor finalizes flash
+  then: getFlashInfo() on each dot        // refresh storage bars
+if any failed:
+  setPhase(.error("Failed to stop..."))   // UI: error banner</code></pre>
+
+  <p>Sensors <strong>stay synced</strong> after stop &mdash; <code>endSession</code> does not call <code>stopSync</code>. The user can record again without re-syncing.</p>
+
+  <hr>
+
+  <h2>Two-Step Process (Reference)</h2>
+
+  <p>Sync and recording are <strong>separate actions</strong>. When a runner has 2+ sensors, the user must sync first, then start recording. <code>beginSession</code> guards on <code>device.isSynced()</code> and <strong>blocks recording if any sensor is not synced</strong>. With only 1 sensor, recording starts directly (no sync needed).</p>
+
+  <table>
+    <thead>
+      <tr><th>Step</th><th>Entry Point</th><th>Precondition</th><th>Phase Transition</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Sync</td>
+        <td><code>resyncRunner(runnerId:)</code> or <code>syncSession()</code></td>
+        <td>2+ ready sensors, no other sync active</td>
+        <td>Runner stays <code>.idle</code>; tracked via <code>resyncingRunners</code></td>
+      </tr>
+      <tr>
+        <td>Record</td>
+        <td><code>beginSession(runnerId:)</code> or <code>beginSession()</code></td>
+        <td>All sensors <code>isSynced()</code> if 2+, none already recording</td>
+        <td><code>idle &rarr; startingRecording &rarr; recording</code></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>The solo runner convenience methods (<code>syncSession()</code>, <code>beginSession()</code>) create or update an ephemeral runner with ID <code>"__single__"</code> from all connected ready sensors, then delegate to the multi-runner methods.</p>
+
+  <h2>Step 1: Sync &mdash; <code>resyncRunner(runnerId:)</code></h2>
+
+  <p>Called when the user taps "Sync Sensors" on a runner card (or the Resync button). Runs on <code>stateQueue</code>:</p>
+
+<pre><code>resyncRunner(runnerId:)
+    &boxur;&boxh; stateQueue.async
+        &boxvr;&boxh; Guard: runnerPhasesInternal[runnerId] == .idle
+        &boxvr;&boxh; Guard: !resyncingRunnersInternal.contains(runnerId)
+        &boxvr;&boxh; Guard: no runner syncing (no .isSyncActive phases, resyncingRunnersInternal empty)
+        &boxvr;&boxh; Guard: runner exists in RunnerStore with sensor UUIDs
+        &boxvr;&boxh; Collect dots in .ready phase for this runner's UUIDs
+        &boxvr;&boxh; Guard: dots.count &ge; 2
+        &boxv;
+        &boxvr;&boxh; resyncingRunnersInternal.insert(runnerId)
+        &boxvr;&boxh; registry.syncingUuids.formUnion(uuids)
+        &boxvr;&boxh; registry.syncInProgress = true
+        &boxvr;&boxh; @Published resyncingRunners.insert(runnerId) on main
+        &boxv;
+        &boxur;&boxh; performSync(dots:, runnerId:) { result in
+               // Cleanup FIRST &mdash; before any refreshStorage calls
+               resyncingRunnersInternal.remove(runnerId)
+               registry.syncingUuids.subtract(runner.sensorUuids)
+               registry.syncInProgress = (any .isSyncActive || resyncingRunnersInternal non-empty)
+               @Published resyncingRunners.remove(runnerId) on main
+
+               // Reset failed sensors so scan &rarr; connect can recover them
+               for uuid in result.failedUuids:
+                   registry.recordDisconnection(uuid)
+
+               // Refresh storage only for sensors that succeeded
+               refreshStorage(dots: succeededDots)
+           }</code></pre>
+
+  <p><strong>Note:</strong> <code>resyncRunner</code> does NOT call <code>setPhase(.syncing, ...)</code>. The resync state is tracked separately via <code>resyncingRunnersInternal</code> / <code>@Published resyncingRunners</code>. The runner phase stays <code>.idle</code> throughout the resync &mdash; the UI shows resync progress via the <code>resyncingRunners</code> set, not the session phase. <code>registry.syncInProgress</code> is set directly to block connections during resync.</p>
+
+  <h2>Step 2: Record &mdash; <code>beginSession(runnerId:)</code></h2>
 
   <p>Called when the user taps "Start" on a runner card. Runs on <code>stateQueue</code>:</p>
 
@@ -34,49 +189,57 @@
     &boxur;&boxh; stateQueue.async
         &boxvr;&boxh; Guard: runnerPhasesInternal[runnerId] is .idle or .error
         &boxvr;&boxh; Guard: connectQueue is empty AND connectInProgress is nil
-        &boxv;     (can't sync while connections are in flight)
-        &boxvr;&boxh; Guard: no other runner is in .syncing phase (isAnySyncing == false)
         &boxvr;&boxh; Guard: runner exists in RunnerStore with sensor UUIDs
         &boxvr;&boxh; Collect dots in .ready phase for this runner's UUIDs
         &boxvr;&boxh; Guard: none of the dots are currently recording
+        &boxvr;&boxh; Guard: dots.count &ge; 2 implies all dots report device.isSynced()
         &boxv;
         &boxvr;&boxh; Configure each dot: dot.configure(outputRate:, filterIndex:)
-        &boxvr;&boxh; setPhase(runnerId, .syncing)
+        &boxvr;&boxh; setPhase(.startingRecording, forRunner: runnerId)
         &boxv;
-        &boxvr;&boxh; if dots.count &ge; 2:
-        &boxv;     &boxvr;&boxh; registry.syncingUuids = Set(uuids)  // freeze these UUIDs
-        &boxv;     &boxur;&boxh; performSync(dots: dots) { success, error in
-        &boxv;            if success:
-        &boxv;                performStartRecording(runnerId:, dots:)
-        &boxv;            else:
-        &boxv;                setPhase(runnerId, .error(error))
-        &boxv;         }
-        &boxv;
-        &boxur;&boxh; if dots.count == 1:
-              &boxur;&boxh; performStartRecording(runnerId:, dots:)
-                  // Single sensor doesn't need sync</code></pre>
+        &boxur;&boxh; performStartRecording(dots:, runnerId:)
+               &boxvr;&boxh; DotOperationRunner.runAll: dot.startRecording(seconds: 0xFFFF)
+               &boxvr;&boxh; On success: setPhase(.recording, forRunner: runnerId)
+               &boxur;&boxh; On failure: setPhase(.error(...), forRunner: runnerId)</code></pre>
 
-  <h2><code>performSync(dots:completion:)</code></h2>
+  <p><strong>Key difference from old design:</strong> <code>beginSession</code> no longer calls <code>performSync</code>. It validates that sensors are already synced (via <code>device.isSynced()</code>) and proceeds directly to recording. If sensors aren't synced, the UI shows "Sync Sensors" instead of "Start" and routes to <code>resyncRunner</code>.</p>
 
-<pre><code>performSync(dots:, completion:)
-    &boxur;&boxh; stateQueue (capture device references while state is stable)
-        &boxvr;&boxh; Snapshot: devices = dots.map { $0.device }
-        &boxv;     (must capture BEFORE dispatching to sdkQueue, because
-        &boxv;      the SDK will disconnect/reconnect and device refs change)
-        &boxv;
-        &boxur;&boxh; sdkQueue.async {
-               DotSyncManager.startSync(devices) { results in
-                   stateQueue.async {
-                       // Parse results array
-                       // Each result has .success boolean
-                       // Mark dots as sessionSynced = true
-                       // Clear syncingUuids for these UUIDs
-                       // Call refreshStorage to re-fetch flash info
-                       //   (flash info may be stale after SDK reconnect)
-                       completion(allSucceeded, errorMessage)
-                   }
+  <h2><code>performSync(dots:runnerId:completion:)</code></h2>
+
+  <p>Returns a <code>SyncResult</code> with per-sensor success info:</p>
+
+<pre><code>struct SyncResult {
+    let allSuccess: Bool
+    let succeededUuids: Set&lt;String&gt;
+    let failedUuids: Set&lt;String&gt;
+    let errorMsg: String?
+}</code></pre>
+
+<pre><code>performSync(dots:, runnerId:, completion:)
+    &boxur;&boxh; Snapshot: devices = dots.map { $0.device }
+    &boxv;     (must capture BEFORE dispatching to sdkQueue, because
+    &boxv;      the SDK will disconnect/reconnect and device refs change)
+    &boxv;
+    &boxur;&boxh; sdkQueue.async {
+           // Stop any previously synced devices first
+           for device in devices where device.isSynced():
+               DotSyncManager.stopSync([device])
+
+           DotSyncManager.startSync(devices) { results in
+               stateQueue.async {
+                   // Parse results: each has address, success, status
+                   // Match each result back to dot UUID
+                   // Dots not in results at all count as failed
+                   dots.forEach { $0.refreshSyncStatus() }
+
+                   // NOTE: refreshStorage and syncingUuids cleanup are NOT
+                   // done here &mdash; the caller is responsible for cleanup
+                   // AFTER clearing sync flags, so refreshStorage doesn't
+                   // get blocked by isBusyInternal.
+                   completion(SyncResult(...))
                }
-           }</code></pre>
+           }
+       }</code></pre>
 
   <h2>Per-UUID Suppression via <code>syncingUuids</code></h2>
 
@@ -117,29 +280,53 @@ if registry.syncInProgress &amp;&amp; registry.syncingUuids.contains(uuid) {
 
   <h2><code>setPhase</code> and Sync Flag Maintenance</h2>
 
-<pre><code>private func setPhase(_ runnerId: String, _ phase: SessionPhase) {
+<pre><code>private func setPhase(_ phase: SessionPhase, forRunner runnerId: String) {
     // Must be on stateQueue
     runnerPhasesInternal[runnerId] = phase
 
-    // Keep syncInProgress in lockstep
+    // Keep syncInProgress in lockstep &mdash; accounts for both session sync
+    // phases AND active resync operations
     registry.syncInProgress = runnerPhasesInternal.values.contains { $0.isSyncActive }
+        || !resyncingRunnersInternal.isEmpty
 
     // If this runner is no longer syncing, release its UUIDs
-    if !phase.isSyncActive, let runner = runnerStore.runner(forId: runnerId) {
-        for uuid in runner.sensorUuids {
-            registry.syncingUuids.remove(uuid)
+    if !phase.isSyncActive {
+        let sensorUuids = Set(RunnerStore.shared.runner(forId: runnerId)?.sensorUuids ?? [])
+        registry.syncingUuids.subtract(sensorUuids)
+    }
+
+    // Clear stale export cart when a new recording begins
+    if phase == .recording {
+        DispatchQueue.main.async {
+            ExportManager.shared.clearCart()
+            ExportManager.shared.resetExport()
+        }
+    }
+
+    // Safety net: when returning to idle, purge connection-tracking entries
+    // for devices that are already connected. Prevents stale hasPendingConnections
+    // from blocking the UI after edge-case races.
+    if phase == .idle {
+        registry.connectQueue.removeAll { uuid in
+            registry.byUuid[uuid]?.connectionPhase.isConnected == true
+        }
+        if let ip = registry.connectInProgress,
+           registry.byUuid[ip]?.connectionPhase.isConnected == true {
+            registry.connectInProgress = nil
         }
     }
 
     // Snapshot to main thread
     let snapshot = runnerPhasesInternal
     DispatchQueue.main.async { self.runnerPhases = snapshot }
-    notify()
+    notify()  // also snapshots resyncingRunnersInternal &rarr; resyncingRunners
 }</code></pre>
+
+  <p><strong>Note:</strong> <code>notify()</code> now includes a snapshot of <code>resyncingRunnersInternal</code> alongside the other state. This consolidates all <code>@Published</code> updates through a single mechanism &mdash; no more scattered <code>DispatchQueue.main.async</code> calls for <code>resyncingRunners</code>.</p>
 
   <h2><code>endSession(runnerId:)</code> &mdash; Stop Recording</h2>
 
-  <p>Called when the user taps &ldquo;Stop&rdquo;. Runs on <code>stateQueue</code>, sends stop commands via <code>DotOperationRunner.runAll</code>:</p>
+  <p>Called when the user taps &ldquo;Stop&rdquo;. Runs on <code>stateQueue</code>, sends stop commands via <code>DotOperationRunner.runAll</code>. <strong>Does not call <code>stopSync</code></strong> &mdash; sensors stay in measurement mode (synced) after recording stops, allowing multiple recordings without re-syncing.</p>
 
   <h3>Dot filtering</h3>
   <ul>
@@ -157,6 +344,62 @@ if registry.syncInProgress &amp;&amp; registry.syncingUuids.contains(uuid) {
 
   <h3><code>waitForRecordingState</code></h3>
   <p>Polls <code>device.recording.recordingStatus</code> (the live SDK property) on <code>sdkQueue</code> every 0.3s. On success, calls <code>syncRecordingState()</code> and then the completion handler in the same <code>DispatchQueue.main.async</code> block. <code>syncRecordingState()</code> uses <code>setOnMain</code> which runs synchronously when already on main thread, so the flag is guaranteed to update before the completion triggers the runner phase transition.</p>
+
+  <h2>UI Flow: RunnerCard Action Button</h2>
+
+  <p>The RunnerCard's primary action button dynamically changes based on runner state:</p>
+
+  <table>
+    <thead>
+      <tr><th>State</th><th>Button Label</th><th>Color</th><th>Action</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>No sensors assigned</td>
+        <td>No Sensors</td>
+        <td>Gray (disabled)</td>
+        <td>&mdash;</td>
+      </tr>
+      <tr>
+        <td>2+ sensors, not synced</td>
+        <td>Sync Sensors</td>
+        <td>Orange</td>
+        <td><code>resyncRunner</code></td>
+      </tr>
+      <tr>
+        <td>Sensors synced (or 1 sensor)</td>
+        <td>Start [Runner]</td>
+        <td>Green</td>
+        <td><code>beginSession</code></td>
+      </tr>
+      <tr>
+        <td>Recording</td>
+        <td>Stop [Runner]</td>
+        <td>Red</td>
+        <td><code>endSession</code></td>
+      </tr>
+      <tr>
+        <td>Syncing / Starting / Stopping</td>
+        <td>Syncing... / Starting... / Stopping...</td>
+        <td>Gray (disabled)</td>
+        <td>&mdash;</td>
+      </tr>
+      <tr>
+        <td>Error + needs sync</td>
+        <td>Sync Sensors</td>
+        <td>Orange</td>
+        <td><code>resyncRunner</code></td>
+      </tr>
+      <tr>
+        <td>Error + synced</td>
+        <td>Retry</td>
+        <td>Green</td>
+        <td><code>beginSession</code></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>The resync button and trash icon in the RunnerCard header are grayed out and disabled while syncing is in progress.</p>
 
   <div class="page-nav">
     <a href="connections.html">&larr; Connections</a>

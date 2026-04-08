@@ -26,13 +26,13 @@
   <h1>Brooks Movella App</h1>
   <p class="subtitle">Architecture &amp; Design Decisions</p>
 
-  <p>iOS app for capturing motion data from Movella DOT wearable sensors. Connects sensors via Bluetooth, records synchronized motion data, exports CSV files, and uploads to Supabase.</p>
+  <p>iOS app for capturing motion data from Movella DOT wearable sensors. Connects sensors via Bluetooth, synchronizes clocks, records motion data to on-sensor flash, exports CSV files, and uploads to Supabase.</p>
 
   <h2>Reference</h2>
   <div class="card-grid">
     <a class="card" href="overview.html">
       <h3>Overview &amp; Concepts</h3>
-      <p>Sensor basics, synchronization, threading model, connection lifecycle, recording, runners, export, persistence, and key lessons.</p>
+      <p>Sensor basics, synchronization, threading model, busy state hierarchy, connection lifecycle, recording, runners, export, persistence, key lessons, and known limitations.</p>
     </a>
   </div>
 
@@ -44,11 +44,11 @@
     </a>
     <a class="card" href="connections.html">
       <h3>Connections &amp; Reconnect</h3>
-      <p>Serial connection queue, timeout handling, four reconnection paths, initialization flow, and the settle delay.</p>
+      <p>Serial connection queue, timeout handling, four reconnection paths, initialization flow, settle delay, and Bluetooth power-off recovery.</p>
     </a>
     <a class="card" href="sync.html">
-      <h3>Sync Flow</h3>
-      <p>beginSession entry point, performSync, per-UUID suppression via syncingUuids, device reference freezing, and phase management.</p>
+      <h3>Sync &amp; Record Flow</h3>
+      <p>Separated sync/record flow, standalone resync, SyncResult per-sensor tracking, per-UUID suppression, device reference freezing, and phase management.</p>
     </a>
     <a class="card" href="registry.html">
       <h3>DotRegistry</h3>
@@ -60,7 +60,7 @@
     </a>
     <a class="card" href="export.html">
       <h3>Export Pipeline</h3>
-      <p>Three-queue architecture, per-file BLE transfer, generation IDs, watchdog timers, packet validation, cancel, retry, session folders, metadata.csv, share packaging, and Files app integration.</p>
+      <p>Three-queue architecture, per-file BLE transfer, generation IDs, watchdog timers, packet validation, cancel, retry with semaphore timeouts, session folders, metadata.csv, share packaging, and Files app integration.</p>
     </a>
     <a class="card" href="flash-recovery.html">
       <h3>Flash Recovery</h3>

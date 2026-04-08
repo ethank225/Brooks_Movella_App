@@ -4,6 +4,7 @@ struct ExportTaskRow: View {
     @ObservedObject var task: ExportTask
     var onRetryUpload: (() -> Void)? = nil
     var onRetryTransfer: (() -> Void)? = nil
+    var isExporting: Bool = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -61,10 +62,11 @@ struct ExportTaskRow: View {
                         .foregroundColor(.white)
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 7)
-                        .background(Color.orange)
+                        .background(isExporting ? Color.gray : Color.orange)
                         .clipShape(Capsule())
                 }
                 .buttonStyle(.plain)
+                .disabled(isExporting)
             }
 
             // File path
@@ -82,9 +84,9 @@ struct ExportTaskRow: View {
         .padding(10)
         .background(taskBackground)
         .cornerRadius(10)
-        .animation(.easeInOut(duration: 0.3), value: task.status)
-        .animation(.easeInOut(duration: 0.3), value: task.uploadStatus)
-        .animation(.easeInOut(duration: 0.3), value: task.hasPacketLoss)
+        .animation(AppAnimation.phase, value: task.status)
+        .animation(AppAnimation.phase, value: task.uploadStatus)
+        .animation(AppAnimation.phase, value: task.hasPacketLoss)
     }
 
     @ViewBuilder

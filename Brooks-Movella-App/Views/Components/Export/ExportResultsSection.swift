@@ -27,7 +27,7 @@ struct ExportResultsSection: View {
                         onRetryUpload(task)
                     }, onRetryTransfer: {
                         exportManager.retrySingleTask(task)
-                    })
+                    }, isExporting: isExporting)
                 }
             }
 

@@ -59,6 +59,26 @@
     <li>Never synchronously dispatch from stateQueue to sdkQueue or vice versa &mdash; deadlock risk</li>
   </ul>
 
+  <h2>Busy State Hierarchy</h2>
+
+  <p>DotManager exposes several busy flags at different levels. Understanding which flag gates which operation is critical:</p>
+
+<pre><code>DotManager.isBusy (UI gate &mdash; blocks export, erase, connect, scan)
+&boxvr;&boxh; isAnySyncing
+&boxv;   &boxvr;&boxh; runnerPhases contains .syncing
+&boxv;   &boxur;&boxh; resyncingRunners is non-empty
+&boxur;&boxh; runnerPhases contains .startingRecording / .recording / .stoppingRecording
+
+DotManager.isBusyInternal (stateQueue gate &mdash; blocks refreshStorage, flash timers)
+&boxvr;&boxh; registry.syncInProgress (also used for sync-specific reconnect suppression)
+&boxur;&boxh; runnerPhasesInternal contains active phases
+
+DotManager.isErasing (derived from connectedDots &mdash; blocks export, recording start)
+DotManager.hasFlashIssue (derived &mdash; blocks recording start, shows banners)
+&boxur;&boxh; isAnyErasingFromPreviousSession (subset &mdash; distinguishes "finishing erase" from "corrupted")</code></pre>
+
+  <p><code>isBusy</code> reads published state on main thread and is the primary UI gate. <code>isBusyInternal</code> reads <code>runnerPhasesInternal</code> on <code>stateQueue</code> and gates internal operations like <code>refreshStorage</code> that shouldn't run during active sessions.</p>
+
   <h2>Connection Lifecycle</h2>
   <ul>
     <li>Phases: <code>idle &rarr; connecting &rarr; initializing &rarr; ready</code></li>
@@ -68,6 +88,9 @@
     <li><code>refreshRecordingStatus()</code> is async with two queue hops (sdkQueue &rarr; SDK callback &rarr; main) &mdash; checking isRecording immediately after calling it will see stale data. Always use the callback-based checkSensorActivity instead.</li>
     <li>Battery and flash data are unavailable on the fast recording reconnect path (getFlashInfo won't respond during recording). The UI shows a hatched bar with &ldquo;&mdash;&rdquo; until data becomes available after recording stops.</li>
     <li>The SDK fires disconnect/reconnect events during sync &mdash; suppress these when <code>syncingUuids</code> contains the device UUID, not based on a global sync flag.</li>
+    <li><strong>Flash timeout recovery:</strong> if <code>getFlashInfo</code> times out and <code>recordingStatus == .isRecording</code>, the sensor recovers to <code>.ready</code> with recording phase restoration instead of failing initialization. See <a href="connections.html">Connections</a>.</li>
+    <li><strong>Battery on fast path:</strong> Battery is NOT read on the fast recording reconnect path &mdash; reused SDK device objects return stale 0 values. The pre-disconnect battery value is preserved by the Dot model.</li>
+    <li>See <a href="flash-recovery.html">Flash Recovery</a> for how flash corruption and mid-erase states are detected and recovered during initialization.</li>
   </ul>
 
   <h2>Recording</h2>
@@ -79,13 +102,26 @@
     <li>On reconnect, <code>device.recording.recordingStatus</code> from the SDK is the source of truth for recording state</li>
     <li><code>dot.isRecording</code> is <code>@Published private(set)</code> &mdash; only writable from within Dot via <code>syncRecordingState()</code>. This single method reads <code>device.recording.recordingStatus</code> (the live SDK stored property) and pushes the result to <code>@Published</code> on main thread. All recording state updates &mdash; SDK callbacks, polling success, idle-sensor skip paths &mdash; go through this one method. The <code>private(set)</code> makes any external write a compile error.</li>
     <li><code>waitForRecordingState</code> polls <code>device.recording.recordingStatus</code> on <code>sdkQueue</code> every 0.3s. On success, calls <code>syncRecordingState()</code> on main thread before the completion handler, ensuring the UI flag is updated before the runner phase transition.</li>
+    <li><code>performStopRecording</code> checks the live SDK property <code>device.recording.recordingStatus</code> before sending stop &mdash; if a sensor is already idle (e.g. power-cycled during recording), the stop is skipped and <code>syncRecordingState()</code> is called on the skip path to sync the UI flag.</li>
+    <li><code>endSession</code> no longer calls <code>stopSync</code> &mdash; sensors stay in measurement mode (synced) after recording stops. Multiple recordings can be started/stopped without re-syncing.</li>
     <li>No recovery persistence file needed &mdash; isRecording + RunnerStore runner assignments restore everything</li>
+  </ul>
+
+  <h2>Sync Status</h2>
+  <ul>
+    <li><code>sessionSynced</code> is <code>@Published private(set)</code>, updated only through <code>refreshSyncStatus()</code> which reads <code>device.isSynced()</code> on <code>sdkQueue</code> and publishes on main.</li>
+    <li><code>device.isSynced()</code> is an in-memory flag on the SDK &mdash; set to <code>true</code> after successful <code>startSync</code>, never queried from hardware on reconnect.</li>
+    <li>On fresh app launch, <code>isSynced()</code> is always <code>false</code> &mdash; user must sync before recording (2+ sensors).</li>
+    <li>Sync and record are <strong>independent operations</strong>: sync first, then record (two separate user actions). <code>beginSession</code> guards on <code>device.isSynced()</code> for all dots and refuses to record if not synced.</li>
+    <li><code>resyncRunner(runnerId:)</code> provides standalone re-sync without starting recording. <code>syncSession()</code> is the single-runner convenience wrapper.</li>
+    <li><code>refreshSyncStatus()</code> is skipped during active sync windows (<code>updateDevice(isSyncing: true)</code>) to avoid misleading intermediate values from the SDK's internal disconnect/reconnect cycle.</li>
   </ul>
 
   <h2>Per-Runner Session Management</h2>
   <ul>
-    <li>A Runner is a named group of sensor UUIDs (typically 3 dots per runner)</li>
-    <li>Each runner has its own independent SessionPhase: <code>idle &rarr; syncing &rarr; startingRecording &rarr; recording &rarr; stoppingRecording &rarr; idle</code></li>
+    <li>A Runner is a named group of sensor UUIDs (up to 3 dots per runner)</li>
+    <li>Each runner has its own independent SessionPhase tracked in <code>runnerPhasesInternal</code></li>
+    <li>Sync and recording are <strong>separate steps</strong>: user must sync first (when 2+ sensors), then start recording. <code>beginSession</code> guards on <code>device.isSynced()</code> and <strong>refuses to record unsynced sensors</strong>. The UI action button routes to the correct step based on sync status.</li>
     <li>Multiple runners can record concurrently</li>
     <li>Runners cannot sync concurrently (SDK limitation) &mdash; UI disables start buttons on other runners while one is syncing</li>
     <li>RunnerStore persists runner assignments to <code>runners.json</code></li>
@@ -93,11 +129,44 @@
     <li>A computed <code>aggregateSessionPhase</code> provides backward compatibility for views that don't need per-runner granularity</li>
   </ul>
 
+  <h3>Per-Runner State Machine</h3>
+
+<pre><code>                  +----------------------------------------------------------+
+                  |                                                          |
+                  v                                                          |
+   idle ---> [resync] ---> idle (synced)                                     |
+     |            |                |                                         |
+     |            +---> error -----+--> [dismiss] ---> idle                  |
+     |          ("Sync failed")                                              |
+     |                             |                                         |
+     +-----------------------------+                                         |
+     |                                                                       |
+     | guard: isSynced() if 2+ sensors                                       |
+     |                                                                       |
+     +---> startingRecording ---> recording ---> stoppingRecording ----------+
+                  |                                      |
+                  +---> error("Failed to start")         +---> error("Failed to stop")
+                              |                                      |
+                              +---> [dismiss] ---> idle &lt;------------+</code></pre>
+
+  <p><strong>Sync is required before recording</strong> (2+ sensors). <code>beginSession</code> checks <code>device.isSynced()</code> on every dot and blocks if any is not synced. With 1 sensor, the resync step is skipped. After <code>stoppingRecording</code>, sensors stay synced &mdash; can record again without re-sync.</p>
+
+  <p><strong>Key constraint:</strong> <code>beginSession</code> checks <code>device.isSynced()</code> on every dot. With 2+ sensors, if any dot is not synced, recording is <strong>blocked</strong>. The UI shows &ldquo;Sync Sensors&rdquo; instead of &ldquo;Start&rdquo;. The only path to recording with 2+ sensors goes through sync first.</p>
+
   <h2>Two UI Modes</h2>
   <ul>
-    <li><strong>Single runner mode</strong> (default): all connected dots record as one unit. A temporary runner with id <code>"__single__"</code> is created on recording start and deleted on stop.</li>
-    <li><strong>Multi-runner mode</strong>: user assigns dots to named runners. Runners persist across start/stop cycles. Mode toggle locked when sensors are connected.</li>
-    <li>The mode is purely a UI concern backed by UserDefaults <code>"multi_runner_mode"</code>. DotManager doesn't know about modes &mdash; it just operates on runner IDs.</li>
+    <li><strong>Solo runner mode</strong> (default, <code>SyncView</code>): all connected dots treated as one group. An ephemeral runner with id <code>"__single__"</code> is managed automatically by convenience methods (<code>syncSession()</code>, <code>beginSession()</code>, <code>endSession()</code>). Shows a single sync status indicator and record button for all sensors.</li>
+    <li><strong>Researcher mode</strong> (<code>ResearcherModeRecordView</code>): user creates named runners and assigns dots via drag-and-drop from an AvailableDots pool to RunnerCard drop slots. Each runner syncs and records independently. Runners persist across app sessions.</li>
+    <li>Toggled by <code>RunnerStore.isMultiRunnerMode</code>, backed by UserDefaults <code>"multi_runner_mode"</code>. DotManager doesn't know about modes &mdash; it just operates on runner IDs.</li>
+  </ul>
+
+  <h2>UI Components (Researcher Mode)</h2>
+  <ul>
+    <li><strong>RunnerCard</strong>: Per-runner card with header (status circle, editable name, sync status icon, resync button, trash button), dots row (up to 3 DotChip views + EmptyDotSlot drop targets in equal-width layout), and a dynamic action button that shows Sync/Start/Stop/Retry based on runner phase.</li>
+    <li><strong>AvailableDots</strong>: Horizontal scrollable row of unassigned sensors. Each DotChip is fixed-width (100pt) and draggable. The entire row is a drop target for unassigning sensors from runners.</li>
+    <li><strong>DotChip</strong>: Sensor display tile showing display name, storage bar with percentage, and connection indicator. Supports drag-and-drop, double-tap to identify, and optional unassign (X) button.</li>
+    <li><strong>EmptyDotSlot</strong>: Dashed-border drop target within RunnerCard. Highlights blue when a sensor is dragged over. Does not animate when sensors are added/removed.</li>
+    <li>Resync button and trash icon gray out during sync. The action button is disabled during transitions.</li>
   </ul>
 
   <h2>Sensor Naming</h2>
@@ -136,7 +205,40 @@
     <li>iOS Bluetooth UUIDs are phone-specific and can theoretically change, but are stable enough for single-phone workflows.</li>
     <li>The sensor's MAC address (D4:22:CD:xx:xx:xx) is the only truly permanent identifier across devices.</li>
     <li>The Movella SDK sometimes reuses the same device object (same pointer) after reconnect. Stored properties on reused objects retain stale values from the previous session, and block-based callbacks (<code>updateRecordingStatus</code>, battery updates) are silently broken. Always verify state via fresh BLE reads (<code>getRecordingStatus</code>) or property polling rather than trusting cached properties or callbacks on reconnected devices.</li>
+    <li><strong>Single-writer pattern for <code>isRecording</code>:</strong> All recording state updates go through <code>syncRecordingState()</code>, which reads the live SDK property <code>device.recording.recordingStatus</code> and pushes to <code>@Published</code> on main thread. The property is <code>@Published private(set)</code> &mdash; any external write is a compile error. SDK callbacks, polling success, and idle-sensor skip paths all funnel through this one method.</li>
+    <li><strong>Single-writer pattern for <code>sessionSynced</code>:</strong> Same approach &mdash; <code>refreshSyncStatus()</code> reads <code>device.isSynced()</code> on <code>sdkQueue</code> and publishes on main. Skipped during active sync windows (<code>updateDevice(isSyncing: true)</code>) to avoid misleading intermediate values from the SDK's internal disconnect/reconnect cycle.</li>
+    <li><code>DotManager.isBusy</code> is the single gate for all BLE operations. Views should never independently compute busy state from session phases.</li>
+    <li>Derive state from per-Dot properties when possible (e.g. <code>isErasing</code> computed from <code>connectedDots</code>) instead of manually set/clear flags that can go stale.</li>
   </ul>
+
+  <h2>Vulnerabilities &amp; Known Limitations</h2>
+
+  <p>Identified through code audit of the full sensor lifecycle. Grouped by impact.</p>
+
+  <h3>High Priority</h3>
+  <ol>
+    <li><strong>Partial sensor failure escalates to full session error.</strong> <code>DotOperationRunner.runAll</code> reports a single <code>success</code> boolean. If 1 of 3 sensors fails <code>startRecording</code> or <code>stopRecording</code>, the entire runner moves to <code>.error</code>. <em>Partially fixed:</em> <code>performStartRecording</code> now aborts the group on first failure (preventing a crash), but the underlying <code>runAll</code> design still uses a single boolean rather than per-sensor results. See <a href="operations.html">DotOperationRunner</a>.</li>
+    <li><strong>Disconnect during recording only errors when ALL sensors disconnect.</strong> <code>onDeviceDisconnected</code> checks <code>hasConnected</code> across the runner &mdash; if a 3-sensor runner loses 1 sensor mid-recording, no warning is shown. The runner only moves to <code>.error</code> when the last connected sensor drops.</li>
+    <li><strong><code>checkSensorActivity</code> timeout assumes idle.</strong> The polling loop trusts <code>.isRecording</code>/<code>.isErasing</code> immediately and only waits 1s for <code>.isIdle</code>, but the 3-second fallback timeout still assumes idle. If BLE is too slow, a recording sensor gets marked idle. The <a href="flash-recovery.html">flash timeout recovery</a> path catches most cases, but recording state may not restore until <code>resumeRecordingSession()</code> on next <code>SyncView.onAppear</code>. See <a href="connections.html">Connections</a> for the three-path mechanism.</li>
+    <li><strong>Erase poll timeout marks sensor as corrupted.</strong> After 60 polls (~3 minutes), <code>flashCorrupted = true</code> with no automatic recovery. Large flash contents may legitimately take longer to erase. See <a href="flash-recovery.html">Flash Recovery</a>.</li>
+    <li><strong>BT power-off during sync leaves stale callback risk.</strong> <code>onManagerStateUpdate(.poweredOff)</code> calls <code>clearBusyFlags()</code>, resetting <code>syncInProgress</code> and <code>syncingUuids</code>. But <code>performSync</code>&rsquo;s SDK completion closure may still fire later with captured pre-reset data, potentially re-setting <code>syncInProgress</code> or modifying cleared state. <em>Potential fix:</em> guard at the top of the <code>performSync</code> completion checking if <code>syncingUuids</code> was already cleared. See <a href="connections.html#bt-recovery">BT Power-Off Recovery</a>.</li>
+  </ol>
+
+  <h3>Medium Priority</h3>
+  <ol start="6">
+    <li><strong>Frozen device references during sync can go stale.</strong> <code>syncingUuids</code> prevents device reference updates during sync via <code>recordDiscovery</code>/<code>recordReconnection</code> guards. If the SDK creates a new device object during its internal reconnect, the frozen reference may have outdated properties until sync completes. See <a href="sync.html">Device Reference Freezing</a>.</li>
+    <li><strong><code>canResync</code> TOCTOU window.</strong> <code>canResync(runnerId:)</code> reads <code>@Published runnerPhases</code> on main thread; <code>resyncRunner</code> re-checks <code>runnerPhasesInternal</code> on <code>stateQueue</code>. Another runner could start syncing between the two checks. Mitigated by guards in <code>resyncRunner</code>, but the UI may briefly show an enabled button that becomes disabled on tap.</li>
+    <li><strong>Flash settle delay is heuristic (2s).</strong> After a BT-reset reconnect, <code>initializeAfterConnect</code> adds a 2-second settle delay before querying flash. If SDK initialization takes longer, <code>getFlashInfo</code> times out with no retry. Results in <code>.failed("Initialization timed out")</code>. See <a href="connections.html">The Settle Delay</a>.</li>
+    <li><strong>Post-stop flash refresh can race with user actions.</strong> <code>endSession</code> uses a 2-second <code>asyncAfter</code> to refresh flash info after recording stops. The <code>isBusyInternal</code> guard helps, but there is a window where the user has already started a new recording and the phase transition hasn't propagated to the guard check.</li>
+    <li><strong>Single-runner <code>beginSession()</code> main&rarr;stateQueue hop.</strong> The convenience <code>beginSession()</code> dispatches to main for <code>RunnerStore.setRunner()</code>, then calls <code>beginSession(runnerId:)</code> which re-enters <code>stateQueue</code>. Another stateQueue operation could interleave between the two dispatches.</li>
+  </ol>
+
+  <h3>Lower Priority</h3>
+  <ol start="11">
+    <li><strong>Connect timer on main, cancellation on stateQueue.</strong> <code>DispatchWorkItem</code> timers run on main thread; cancellation dispatches to <code>stateQueue</code>. If <code>stateQueue</code> is blocked (e.g., during sync), the timeout fires late. Not a correctness issue but delays user feedback.</li>
+    <li><strong>SDK duplicate callbacks guarded manually everywhere.</strong> The <code>hasCapturedResult</code> pattern is repeated in <code>setFlashInfoDoneBlock</code>, <code>exportFileDone</code>, and <code>onDeviceConnectSucceeded</code> without abstraction. Each guard works correctly but the repetition is error-prone.</li>
+    <li><strong><code>resumeRecordingSession</code> only checks <code>isRecording</code>.</strong> If <code>checkSensorActivity</code> timed out and marked the sensor idle, <code>isRecording</code> will be false. The session won't auto-restore until the user navigates to SyncView (which calls <code>resumeRecordingSession()</code>).</li>
+  </ol>
 
   <div class="page-nav">
     <a href="index.html">&larr; Home</a>

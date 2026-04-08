@@ -13,11 +13,14 @@ final class RunnerStore: ObservableObject {
     private var _runnersSnapshot: [Runner] = []
 
     let fileURL: URL?
+    private let isExplicitFileURL: Bool
 
     init(fileURL: URL? = nil) {
         if let explicit = fileURL {
             self.fileURL = explicit
+            self.isExplicitFileURL = true
         } else {
+            self.isExplicitFileURL = false
             let fm = FileManager.default
             if let appSupport = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first {
                 try? fm.createDirectory(at: appSupport, withIntermediateDirectories: true)
@@ -122,7 +125,8 @@ final class RunnerStore: ObservableObject {
         var data = try? Data(contentsOf: url)
 
         // Fallback: check old Documents path if file doesn't exist at new Application Support path.
-        if data == nil,
+        // Skip fallback when an explicit fileURL was provided (e.g. tests).
+        if data == nil, !isExplicitFileURL,
            let docsURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first?
                .appendingPathComponent("runners.json") {
             data = try? Data(contentsOf: docsURL)

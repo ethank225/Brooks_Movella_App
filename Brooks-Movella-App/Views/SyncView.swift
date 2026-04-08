@@ -20,11 +20,11 @@ struct SyncView: View {
                             if manager.isErasing {
                                 ErasingBanner()
                                     .padding(.horizontal)
-                                    .transition(.move(edge: .top).combined(with: .opacity))
+                                    .transition(AppAnimation.bannerTransition)
                             } else if manager.hasFlashIssue {
                                 FlashIssueBanner(isErasingFromPreviousSession: manager.isAnyErasingFromPreviousSession)
                                     .padding(.horizontal)
-                                    .transition(.move(edge: .top).combined(with: .opacity))
+                                    .transition(AppAnimation.bannerTransition)
                             }
 
                             // MARK: - Sensor Status
@@ -60,10 +60,39 @@ struct SyncView: View {
                                     SessionErrorBanner(message: msg, onDismiss: { manager.dismissError() })
                                 }
 
-                                // Status text
-                                if let statusText = phaseStatusText {
+                                // Group sync status indicator
+                                if !manager.connectedDots.isEmpty && phase != .recording {
+                                    HStack(spacing: 6) {
+                                        syncStatusIcon
+                                            .frame(width: 14, height: 14)
+                                        Text(syncStatusLabel)
+                                            .font(.caption)
+                                            .foregroundColor(syncStatusColor)
+                                        Spacer()
+                                        if manager.connectedDots.count >= 2 {
+                                            Button {
+                                                manager.syncSession()
+                                            } label: {
+                                                HStack(spacing: 4) {
+                                                    Image(systemName: "arrow.triangle.2.circlepath")
+                                                        .font(.caption2)
+                                                    Text("Resync")
+                                                        .font(.caption)
+                                                }
+                                                .foregroundColor(isSyncing || phase != .idle ? .gray : .blue)
+                                            }
+                                            .buttonStyle(.plain)
+                                            .disabled(isSyncing || phase != .idle)
+                                        }
+                                    }
+                                    .frame(height: 20)
+                                    .padding(.bottom, 4)
+                                }
+
+                                // Status text (not shown during sync — button already communicates it)
+                                if !isSyncing, let statusText = phaseStatusText {
                                     HStack(spacing: 8) {
-                                        if phase.isBusy {
+                                        if phase.isTransitioning {
                                             ProgressView()
                                                 .progressViewStyle(CircularProgressViewStyle(tint: phaseColor))
                                                 .scaleEffect(0.8)
@@ -80,7 +109,7 @@ struct SyncView: View {
                                     handlePrimaryAction()
                                 } label: {
                                     HStack {
-                                        if phase.isBusy || manager.isErasing || manager.isAnyErasingFromPreviousSession {
+                                        if phase.isTransitioning || isSyncing || manager.isErasing || manager.isAnyErasingFromPreviousSession {
                                             ProgressView()
                                                 .progressViewStyle(CircularProgressViewStyle(tint: .white))
                                         } else {
@@ -100,7 +129,7 @@ struct SyncView: View {
                             Spacer()
                         }
                         .padding(.top)
-                        .animation(.easeInOut(duration: 0.3), value: manager.hasFlashIssue)
+                        .animation(AppAnimation.phase, value: manager.hasFlashIssue)
                     }
                 }
             }
@@ -136,12 +165,13 @@ struct SyncView: View {
     }
 
     private var primaryButtonTitle: String {
+        if isSyncing { return "Syncing Sensors..." }
         switch phase {
         case .idle:                return noSensors ? "No Sensors Connected"
                                           : sensorsInitializing ? "Sensors Initializing..."
                                           : manager.hasPendingConnections ? "Connecting..."
                                           : (manager.isErasing || manager.hasFlashIssue) ? flashIssueTitle
-                                          : "Start Recording"
+                                          : needsSync ? "Sync Sensors" : "Start Recording"
         case .syncing:             return "Syncing Sensors..."
         case .startingRecording:   return "Starting..."
         case .recording:           return noSensors ? "Sensors Disconnected" : "Stop Recording"
@@ -150,14 +180,15 @@ struct SyncView: View {
                                           : sensorsInitializing ? "Sensors Initializing..."
                                           : manager.hasPendingConnections ? "Connecting..."
                                           : (manager.isErasing || manager.hasFlashIssue) ? flashIssueTitle
-                                          : "Start Recording"
+                                          : needsSync ? "Sync Sensors" : "Start Recording"
         }
     }
 
     private var primaryButtonIcon: String {
+        if isSyncing { return "arrow.triangle.2.circlepath" }
         switch phase {
         case .recording:           return "stop.fill"
-        default:                   return "circle.fill"
+        default:                   return needsSync ? "arrow.triangle.2.circlepath" : "circle.fill"
         }
     }
 
@@ -166,15 +197,17 @@ struct SyncView: View {
     }
 
     private var primaryButtonColor: Color {
+        if isSyncing { return .gray }
         switch phase {
-        case .idle:                return (noSensors || sensorsInitializing || manager.hasPendingConnections) ? .gray : (manager.isErasing || manager.hasFlashIssue) ? flashIssueColor : .green
+        case .idle:                return (noSensors || sensorsInitializing || manager.hasPendingConnections) ? .gray : (manager.isErasing || manager.hasFlashIssue) ? flashIssueColor : needsSync ? .blue : .green
         case .recording:           return (noSensors || sensorsInitializing) ? .gray : .red
-        case .error:               return (noSensors || sensorsInitializing || manager.hasPendingConnections) ? .gray : (manager.isErasing || manager.hasFlashIssue) ? flashIssueColor : .green
+        case .error:               return (noSensors || sensorsInitializing || manager.hasPendingConnections) ? .gray : (manager.isErasing || manager.hasFlashIssue) ? flashIssueColor : needsSync ? .blue : .green
         default:                   return .gray
         }
     }
 
     private var primaryButtonDisabled: Bool {
+        if isSyncing { return true }
         switch phase {
         case .idle:    return noSensors || sensorsInitializing || manager.hasPendingConnections || manager.isErasing || manager.hasFlashIssue
         case .recording: return sensorsInitializing
@@ -184,6 +217,7 @@ struct SyncView: View {
     }
 
     private var phaseStatusText: String? {
+        if isSyncing { return "Synchronizing sensor clocks..." }
         switch phase {
         case .idle:                        return nil
         case .syncing:                     return "Synchronizing sensor clocks..."
@@ -195,10 +229,50 @@ struct SyncView: View {
     }
 
     private var phaseColor: Color {
+        if isSyncing { return .blue }
         switch phase {
         case .recording:   return noSensors ? .orange : .red
         case .error:       return .orange
         default:           return .blue
+        }
+    }
+
+    // MARK: - Sync Status
+
+    private var allDotsSynced: Bool {
+        let dots = manager.connectedDots
+        return dots.count >= 2 && dots.allSatisfy { $0.sessionSynced }
+    }
+
+    private var needsSync: Bool {
+        manager.connectedDots.count >= 2 && !allDotsSynced
+    }
+
+    private var isSyncing: Bool {
+        phase.isSyncActive
+    }
+
+    // MARK: - Sync Status Row
+
+    private var syncStatusLabel: String {
+        if isSyncing { return "Syncing..." }
+        return allDotsSynced ? "Sensors synced" : "Sensors not synced"
+    }
+
+    private var syncStatusColor: Color {
+        if isSyncing { return .blue }
+        return allDotsSynced ? .green : .orange
+    }
+
+    @ViewBuilder
+    private var syncStatusIcon: some View {
+        if isSyncing {
+            ProgressView()
+                .scaleEffect(0.5)
+        } else {
+            Image(systemName: allDotsSynced ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                .font(.caption)
+                .foregroundColor(syncStatusColor)
         }
     }
 
@@ -207,7 +281,11 @@ struct SyncView: View {
     private func handlePrimaryAction() {
         switch phase {
         case .idle, .error:
-            manager.beginSession()
+            if needsSync {
+                manager.syncSession()
+            } else {
+                manager.beginSession()
+            }
         case .recording:
             manager.endSession()
         default:
@@ -333,7 +411,7 @@ struct DotStatusRow: View {
         .padding()
         .background(rowBackgroundView)
         .cornerRadius(10)
-        .animation(.easeInOut(duration: 0.3), value: sessionPhase)
+        .animation(AppAnimation.phase, value: sessionPhase)
         .onChange(of: sessionPhase) { newPhase in
             if newPhase != .recording {
                 breathe = false

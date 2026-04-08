@@ -39,6 +39,7 @@ struct ProfilesView: View {
                     emptyState
                 } else {
                     profileList
+                        .contentLoadAnimation()
                 }
             }
             .searchable(text: $searchText, prompt: "Search by name")

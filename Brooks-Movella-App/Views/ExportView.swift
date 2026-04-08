@@ -5,8 +5,9 @@ struct ExportView: View {
     @ObservedObject private var exportManager = ExportManager.shared
 
     @State private var showCart = false
-    @State private var showClearConfirmation = false
     @State private var showInitializingAlert = false
+    @State private var localGroups: [RunnerRecordingGroup]?  // mutable copy for reassignment
+    @State private var selectedFileIds: Set<String> = []
 
     private var connectedDots: [Dot] { manager.connectedDots }
     private var readyDots: [Dot] { connectedDots.filter { $0.connectionPhase == .ready } }
@@ -14,9 +15,7 @@ struct ExportView: View {
         connectedDots.contains { $0.connectionPhase != .ready }
     }
     private var cartCount: Int { exportManager.cartItems.count }
-    private var isAnyRecording: Bool {
-        manager.runnerPhases.values.contains { $0 == .recording || $0 == .syncing || $0 == .startingRecording || $0 == .stoppingRecording }
-    }
+    private var isBusy: Bool { manager.isBusy }
 
     var body: some View {
         NavigationView {
@@ -35,7 +34,7 @@ struct ExportView: View {
                     .padding(.top)
                 }
                 .refreshable {
-                    guard !isAnyRecording else { return }
+                    guard !isBusy else { return }
                     if hasInitializingSensors {
                         showInitializingAlert = true
                     } else {
@@ -43,34 +42,7 @@ struct ExportView: View {
                     }
                 }
 
-                if !exportManager.selectedIDs.isEmpty {
-                    VStack(spacing: 0) {
-                        Divider()
-                        FullWidthButton(
-                            icon: "cart.badge.plus",
-                            label: "Add \(exportManager.selectedIDs.count) to Cart",
-                            color: .purple
-                        ) {
-                            if exportManager.hasRestoredTasks {
-                                showClearConfirmation = true
-                            } else {
-                                exportManager.buildCart()
-                            }
-                        }
-                        .padding(.horizontal)
-                        .padding(.vertical, 12)
-                    }
-                    .background(.ultraThinMaterial)
-                }
-            }
-            .alert("Clear Previous Results?", isPresented: $showClearConfirmation) {
-                Button("Clear & Continue", role: .destructive) {
-                    exportManager.resetExport()
-                    exportManager.buildCart()
-                }
-                Button("Cancel", role: .cancel) {}
-            } message: {
-                Text("You have exported files from a previous session. Adding new files will clear those results.")
+                bottomBar
             }
             .alert("Sensors Initializing", isPresented: $showInitializingAlert) {
                 Button("OK", role: .cancel) {}
@@ -89,7 +61,7 @@ struct ExportView: View {
                 // but only when it's safe: sensors connected, not mid-export, not
                 // in the post-export done state (user may be about to share).
                 let safeToRefresh = !readyDots.isEmpty
-                    && !isAnyRecording
+                    && !isBusy
                     && exportManager.exportPhase != .exporting
                     && exportManager.exportPhase != .done
                     && !manager.isErasing
@@ -100,18 +72,6 @@ struct ExportView: View {
             }
             .navigationTitle("Export")
             .toolbar {
-//                #if DEBUG
-//
-//                //If you just want to sample the export, then uncomment this
-//
-//                ToolbarItem(placement: .navigationBarLeading) {
-//                    Button {
-//                        showMockTest = true
-//                    } label: {
-//                        Label("Mock Upload", systemImage: "flask")
-//                    }
-//                }
-//                #endif
                 ToolbarItem(placement: .navigationBarTrailing) {
                     CartBadgeButton(count: cartCount) { showCart = true }
                 }
@@ -119,17 +79,99 @@ struct ExportView: View {
             .sheet(isPresented: $showCart) {
                 CartView()
             }
-//            #if DEBUG
-//            .sheet(isPresented: $showMockTest) {
-//                MockUploadTestView()
-//            }
-//            #endif
+            .onChange(of: exportManager.isFetching) { fetching in
+                if fetching {
+                    localGroups = nil
+                    selectedFileIds = []
+                }
+            }
         }
+    }
+
+    // MARK: - Cart Helpers
+
+    private func addSelectedToCart() {
+        let groups = localGroups ?? exportManager.runnerGroups
+        let addable = selectedFileIds.subtracting(exportManager.cartFileIds)
+        guard !addable.isEmpty else { return }
+
+        var entries: [(sessionId: UUID, fileIds: Set<String>)] = []
+        for group in groups {
+            for session in group.sessions {
+                let ids = Set(session.files.map { $0.id }).intersection(addable)
+                if !ids.isEmpty {
+                    entries.append((sessionId: session.id, fileIds: ids))
+                }
+            }
+        }
+        exportManager.addToCart(fromSessions: entries)
+        selectedFileIds.removeAll()
+    }
+
+    private func addToCart(session: RecordingSession, fileIds: Set<String>) {
+        let toAdd = fileIds.subtracting(exportManager.cartFileIds)
+        guard !toAdd.isEmpty else { return }
+        exportManager.addToCart(fromSessions: [(sessionId: session.id, fileIds: toAdd)])
+    }
+
+    private func removeSession(_ session: RecordingSession) {
+        let ids = Set(session.files.map { $0.id })
+        exportManager.removeFromCart(fileIds: ids)
+    }
+
+    private func formattedBytes(_ bytes: Int) -> String {
+        if bytes >= 1_000_000 {
+            return String(format: "%.1f MB", Double(bytes) / 1_000_000)
+        } else if bytes >= 1_000 {
+            return String(format: "%.0f KB", Double(bytes) / 1_000)
+        }
+        return "\(bytes) B"
+    }
+
+    private func moveFile(_ file: RecordingSession.SessionFile, to destinationSessionId: UUID?, in group: RunnerRecordingGroup) {
+        // Lazily snapshot into localGroups on first reassignment.
+        if localGroups == nil {
+            localGroups = exportManager.runnerGroups
+        }
+        guard var groups = localGroups else { return }
+        guard let groupIdx = groups.firstIndex(where: { $0.id == group.id }) else { return }
+
+        // Extract sessions, mutate, then rebuild the group.
+        var sessions = groups[groupIdx].sessions
+
+        // Remove from source session.
+        for sIdx in sessions.indices {
+            sessions[sIdx].files.removeAll { $0.id == file.id }
+        }
+        // Remove empty sessions.
+        sessions.removeAll { $0.files.isEmpty }
+
+        if let destId = destinationSessionId,
+           let sIdx = sessions.firstIndex(where: { $0.id == destId }) {
+            sessions[sIdx].files.append(file)
+        } else {
+            let newSession = RecordingSession(
+                id: UUID(),
+                timestamp: Date(timeIntervalSince1970: TimeInterval(file.recording.timestamp)),
+                files: [file],
+                expectedSensorCount: sessions.first?.expectedSensorCount ?? 1
+            )
+            sessions.insert(newSession, at: 0)
+        }
+
+        groups[groupIdx] = RunnerRecordingGroup(
+            id: groups[groupIdx].id,
+            runnerName: groups[groupIdx].runnerName,
+            dotNames: groups[groupIdx].dotNames,
+            sessions: sessions
+        )
+
+        localGroups = groups
     }
 
     @ViewBuilder
     private var recordingsContent: some View {
-        if isAnyRecording {
+        if isBusy {
             SectionCard(title: "Recordings", icon: "doc.on.doc") {
                 HStack(spacing: 8) {
                     Image(systemName: "record.circle")
@@ -167,27 +209,161 @@ struct ExportView: View {
                     }
                 }
             }
+        } else if exportManager.isFetching {
+            SectionCard(title: "Recordings", icon: "doc.on.doc") {
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .progressViewStyle(CircularProgressViewStyle())
+                        .scaleEffect(0.8)
+                    Text("Fetching recordings...")
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .center)
+                .padding(.vertical, 8)
+            }
         } else {
+            sessionGroupedContent
+                .contentLoadAnimation()
+        }
+    }
+
+    @ViewBuilder
+    private var sessionGroupedContent: some View {
+        let groups = localGroups ?? exportManager.runnerGroups
+        let totalFiles = groups.flatMap { $0.sessions.flatMap { $0.files } }.count
+        let cartIds = exportManager.cartFileIds
+
+        if totalFiles == 0 {
+            SectionCard(title: "Recordings", icon: "doc.on.doc") {
+                EmptyStateView(
+                    icon: "doc.on.doc",
+                    headline: "No recordings found",
+                    subheadline: "Record data on the Record tab, then come back here to export"
+                )
+            }
+        } else if groups.count == 1, let group = groups.first {
+            // Single runner mode — show sessions directly.
             SectionCard(
-                title: connectedDots.count > 0
-                    ? "Recordings — \(connectedDots.count) sensor\(connectedDots.count == 1 ? "" : "s")"
-                    : "Recordings",
+                title: "\(group.sessions.count) session\(group.sessions.count == 1 ? "" : "s") · \(totalFiles) file\(totalFiles == 1 ? "" : "s") on device",
                 icon: "doc.on.doc"
             ) {
-                ForEach(connectedDots, id: \.address) { dot in
-                    let files = exportManager.recordings[dot.address]
-                    RecordingListSection(
-                        dot: dot,
-                        files: files ?? [],
-                        isLoading: files == nil && exportManager.isFetching,
-                        selectedIDs: $exportManager.selectedIDs,
-                        onToggle: { file in exportManager.toggleSelection(file) },
-                        onSelectAll: { exportManager.selectAll(for: dot.address) },
-                        onDeselectAll: { exportManager.deselectAll(for: dot.address) }
+                ForEach(Array(group.sessions.enumerated()), id: \.element.id) { index, session in
+                    SessionCard(
+                        session: session,
+                        sessionNumber: index + 1,
+                        sessionType: exportManager.sessionType(for: session.id),
+                        cartItemIds: cartIds,
+                        allSessions: group.sessions,
+                        onAddToCart: { sess, fileIds in addToCart(session: sess, fileIds: fileIds) },
+                        onRemoveSession: { removeSession($0) },
+                        onToggleSessionType: { exportManager.cycleSessionType(for: $0.id) },
+                        onMoveFile: { file, destination in
+                            moveFile(file, to: destination, in: group)
+                        },
+                        selectedFileIds: $selectedFileIds
                     )
-                    .animation(.easeInOut(duration: 0.25), value: files == nil)
                 }
             }
+        } else {
+            // Multi-runner mode — show runner sections.
+            ForEach(groups) { group in
+                RunnerRecordingSection(
+                    group: group,
+                    cartItemIds: cartIds,
+                    sessionTypes: exportManager.sessionTypes,
+                    onAddToCart: { sess, fileIds in addToCart(session: sess, fileIds: fileIds) },
+                    onRemoveSession: { removeSession($0) },
+                    onToggleSessionType: { exportManager.cycleSessionType(for: $0.id) },
+                    onMoveFile: { file, destination, grp in
+                        moveFile(file, to: destination, in: grp)
+                    },
+                    selectedFileIds: $selectedFileIds
+                )
+                .padding(.horizontal)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var bottomBar: some View {
+        let addable = selectedFileIds.subtracting(exportManager.cartFileIds)
+        let cartCount = exportManager.cartItems.count
+
+        if exportManager.exportPhase == .ready {
+            VStack(spacing: 0) {
+                Divider()
+
+                if !addable.isEmpty {
+                    // Selection mode — "Add N to cart"
+                    FullWidthButton(
+                        icon: "cart.badge.plus",
+                        label: "Add \(addable.count) to Cart",
+                        color: .purple
+                    ) {
+                        addSelectedToCart()
+                    }
+                    .padding(.horizontal)
+                    .padding(.vertical, 12)
+                } else if cartCount > 0 {
+                    // Cart summary + export button
+                    let sessions = exportManager.cartSessions
+                    let grouped = Dictionary(grouping: exportManager.cartItems) { $0.sessionId }
+                    let runSessions = sessions.filter { exportManager.sessionType(for: $0) == .run }
+                    let calSessions = sessions.filter { exportManager.sessionType(for: $0) == .calibration }
+                    let runFiles = runSessions.flatMap { grouped[$0] ?? [] }.count
+                    let calFiles = calSessions.flatMap { grouped[$0] ?? [] }.count
+                    let runBytes = runSessions.flatMap { grouped[$0] ?? [] }.reduce(0) { $0 + $1.recording.fileSize }
+                    let calBytes = calSessions.flatMap { grouped[$0] ?? [] }.reduce(0) { $0 + $1.recording.fileSize }
+
+                    VStack(spacing: 6) {
+                        VStack(spacing: 2) {
+                            if !runSessions.isEmpty {
+                                HStack {
+                                    Text("\(runSessions.count) run (\(runFiles) file\(runFiles == 1 ? "" : "s"))")
+                                        .font(.caption)
+                                        .foregroundColor(.green)
+                                    Spacer()
+                                    Text(formattedBytes(runBytes))
+                                        .font(.caption)
+                                        .foregroundColor(.green)
+                                }
+                            }
+                            if !calSessions.isEmpty {
+                                HStack {
+                                    Text("\(calSessions.count) calibration (\(calFiles) file\(calFiles == 1 ? "" : "s"))")
+                                        .font(.caption)
+                                        .foregroundColor(.blue)
+                                    Spacer()
+                                    Text(formattedBytes(calBytes))
+                                        .font(.caption)
+                                        .foregroundColor(.blue)
+                                }
+                            }
+                        }
+                        .padding(.horizontal)
+
+                        Button {
+                            showCart = true
+                        } label: {
+                            Text("Export \(cartCount) file\(cartCount == 1 ? "" : "s")")
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundColor(.black)
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 14)
+                                .background(Color.green.opacity(0.7))
+                                .cornerRadius(12)
+                        }
+                        .buttonStyle(.plain)
+                        .padding(.horizontal)
+                    }
+                    .padding(.vertical, 8)
+                }
+            }
+            .background(.ultraThinMaterial)
+            .clipShape(RoundedRectangle(cornerRadius: 16))
+            .animation(AppAnimation.content, value: addable.isEmpty)
+            .animation(AppAnimation.content, value: cartCount)
         }
     }
 }
@@ -229,6 +405,7 @@ struct CartView: View {
         let test: String
         let product: String
         let sessionMetadata: SessionMetadata?
+        let sessionTypes: [String: SessionType]?  // UUID string → SessionType
     }
 
     @ObservedObject private var exportManager   = ExportManager.shared
@@ -274,12 +451,10 @@ struct CartView: View {
         }
     }
 
-    private var isAnyRecording: Bool {
-        dotManager.runnerPhases.values.contains { $0 == .recording || $0 == .syncing || $0 == .startingRecording || $0 == .stoppingRecording }
-    }
+    private var isBusy: Bool { dotManager.isBusy }
 
     private var canExport: Bool {
-        !exportManager.cartItems.isEmpty && selectedProfile != nil && emptyMetadataFields.isEmpty && !isAnyRecording && !dotManager.isErasing && !dotManager.hasFlashIssue
+        !exportManager.cartItems.isEmpty && selectedProfile != nil && emptyMetadataFields.isEmpty && !isBusy && !dotManager.isErasing && !dotManager.hasFlashIssue
     }
 
     var body: some View {
@@ -375,22 +550,111 @@ struct CartView: View {
 
     @ViewBuilder
     private var cartItemsSection: some View {
-        SectionCard(title: "Cart — \(exportManager.cartItems.count) item\(exportManager.cartItems.count == 1 ? "" : "s")", icon: "cart") {
-            let sessions = exportManager.cartSessions
-            ForEach(exportManager.cartItems) { item in
-                let sessionNumber = (sessions.firstIndex(of: item.sessionId) ?? 0) + 1
-                CartItemRow(
-                    item: item,
-                    sessionNumber: sessionNumber,
-                    sessions: sessions,
-                    onLabelChange:   { exportManager.updateLabel(for: item.id, label: $0) },
-                    onRemove:        { exportManager.removeFromCart(item) },
-                    onSessionChange: { exportManager.reassignSession(itemId: item.id, to: $0) },
-                    onNewSession:    { exportManager.reassignSession(itemId: item.id, to: UUID()) },
-                    disabled: isExporting
-                )
+        let sessions = exportManager.cartSessions
+        let grouped = Dictionary(grouping: exportManager.cartItems) { $0.sessionId }
+
+        ForEach(Array(sessions.enumerated()), id: \.element) { index, sessionId in
+            let items = grouped[sessionId] ?? []
+            let sessionNumber = index + 1
+            let sType = exportManager.sessionType(for: sessionId)
+
+            VStack(alignment: .leading, spacing: 0) {
+                // Header
+                HStack {
+                    Label(
+                        "Session \(sessionNumber) — \(items.count) file\(items.count == 1 ? "" : "s")",
+                        systemImage: sType.icon
+                    )
+                    .font(.headline)
+                    Spacer()
+                }
+                .padding(.horizontal)
+                .padding(.top)
+                .padding(.bottom, 8)
+
+                // Session type toggle
+                if !isExporting {
+                    HStack {
+                        SessionTypeToggle(type: sType) {
+                            exportManager.cycleSessionType(for: sessionId)
+                        }
+                        Spacer()
+                    }
+                    .padding(.horizontal)
+                    .padding(.bottom, 8)
+                }
+
+                Divider()
+
+                // File rows
+                ForEach(Array(items.enumerated()), id: \.element.id) { rowIndex, item in
+                    if rowIndex > 0 { Divider() }
+                    CartItemRow(
+                        item: item,
+                        sessionNumber: sessionNumber,
+                        sessions: sessions,
+                        isCalibration: sType == .calibration,
+                        onLabelChange:   { exportManager.updateLabel(for: item.id, label: $0) },
+                        onRemove:        { exportManager.removeFromCart(item) },
+                        onSessionChange: { exportManager.reassignSession(itemId: item.id, to: $0) },
+                        onNewSession:    { exportManager.reassignSession(itemId: item.id, to: UUID()) },
+                        disabled: isExporting
+                    )
+                    .padding(.horizontal)
+                }
+                .padding(.vertical, 4)
             }
+            .background(sType.cardBackground)
+            .cornerRadius(12)
+            .overlay(
+                RoundedRectangle(cornerRadius: 12)
+                    .stroke(sType.borderColor, lineWidth: 2)
+            )
+            .padding(.horizontal)
         }
+
+        // Cart summary
+        if !exportManager.cartItems.isEmpty {
+            cartSummary
+        }
+    }
+
+    @ViewBuilder
+    private var cartSummary: some View {
+        let sessions = exportManager.cartSessions
+        let grouped = Dictionary(grouping: exportManager.cartItems) { $0.sessionId }
+        let runSessions = sessions.filter { exportManager.sessionType(for: $0) == .run }
+        let calSessions = sessions.filter { exportManager.sessionType(for: $0) == .calibration }
+        let runFiles = runSessions.flatMap { grouped[$0] ?? [] }.count
+        let calFiles = calSessions.flatMap { grouped[$0] ?? [] }.count
+        let totalBytes = exportManager.cartItems.reduce(0) { $0 + $1.recording.fileSize }
+
+        VStack(alignment: .leading, spacing: 4) {
+            if !runSessions.isEmpty {
+                Text("\(runSessions.count) run session\(runSessions.count == 1 ? "" : "s") (\(runFiles) file\(runFiles == 1 ? "" : "s"))")
+                    .font(.caption)
+                    .foregroundColor(.green)
+            }
+            if !calSessions.isEmpty {
+                Text("\(calSessions.count) calibration session\(calSessions.count == 1 ? "" : "s") (\(calFiles) file\(calFiles == 1 ? "" : "s"))")
+                    .font(.caption)
+                    .foregroundColor(.blue)
+            }
+            Text("Total: \(formattedBytes(totalBytes))")
+                .font(.caption)
+                .foregroundColor(.secondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal)
+    }
+
+    private func formattedBytes(_ bytes: Int) -> String {
+        if bytes >= 1_000_000 {
+            return String(format: "%.1f MB", Double(bytes) / 1_000_000)
+        } else if bytes >= 1_000 {
+            return String(format: "%.0f KB", Double(bytes) / 1_000)
+        }
+        return "\(bytes) B"
     }
 
     @ViewBuilder
@@ -435,7 +699,8 @@ struct CartView: View {
             dbSessionMap: Dictionary(uniqueKeysWithValues: dbSessionMap.map { ($0.key.uuidString, $0.value) }),
             shoeBrand: shoeBrand, shoeModel: shoeModel, shoeGeneration: shoeGeneration,
             conditionTags: conditionTags, study: study, test: test, product: product,
-            sessionMetadata: exportManager.sessionMetadata
+            sessionMetadata: exportManager.sessionMetadata,
+            sessionTypes: Dictionary(uniqueKeysWithValues: exportManager.sessionTypes.map { ($0.key.uuidString, $0.value) })
         )
         if let data = try? JSONEncoder().encode(ctx) {
             UserDefaults.standard.set(data, forKey: "activeExportContext")
@@ -462,6 +727,12 @@ struct CartView: View {
         conditionTags = ctx.conditionTags; study = ctx.study; test = ctx.test; product = ctx.product
         selectedProfile = supabaseManager.profiles.first(where: { $0.id == ctx.profileId })
         exportManager.sessionMetadata = ctx.sessionMetadata
+        if let types = ctx.sessionTypes {
+            exportManager.sessionTypes = Dictionary(uniqueKeysWithValues: types.compactMap {
+                guard let k = UUID(uuidString: $0.key) else { return nil }
+                return (k, $0.value)
+            })
+        }
 
         // Re-wire callback only if tasks are still in flight.
         if exportManager.exportPhase == .exporting {

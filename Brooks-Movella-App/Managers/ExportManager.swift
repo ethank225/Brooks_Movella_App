@@ -68,6 +68,15 @@ final class ExportManager: ObservableObject {
     /// Items added to the export cart.
     @Published var cartItems: [CartItem] = []
 
+    /// File IDs currently in the cart. Single source of truth for cart membership checks.
+    var cartFileIds: Set<String> { Set(cartItems.map { $0.id }) }
+
+    /// Session-grouped recordings, organized by runner (researcher mode) or as a single group.
+    @Published var runnerGroups: [RunnerRecordingGroup] = []
+
+    /// Per-session type (run, calibration, etc.). Sessions not in the dict default to `.run`.
+    @Published var sessionTypes: [UUID: SessionType] = [:]
+
     /// Active export tasks (one per cart item).
     @Published private(set) var tasks: [ExportTask] = []
 
@@ -141,6 +150,7 @@ final class ExportManager: ObservableObject {
     /// Fetch recording file metadata from each connected dot.
     func fetchRecordings(for dots: [Dot]) {
         guard !isFetching else { return }
+        guard !DotManager.shared.isBusy else { return }
         guard !DotManager.shared.isErasing else { return }
         setOnMain {
             self.isFetching = true
@@ -184,6 +194,7 @@ final class ExportManager: ObservableObject {
             let availableIDs = Set(self.recordings.values.flatMap { $0 }.map { $0.id })
             self.selectedIDs = self.selectedIDs.intersection(availableIDs)
             self.cartItems.removeAll { !availableIDs.contains($0.recording.id) }
+            self.rebuildSessionGroups()
         }
     }
 
@@ -218,11 +229,10 @@ final class ExportManager: ObservableObject {
     func buildCart() {
         let allFiles = recordings.values.flatMap { $0 }
         let selected = allFiles.filter { selectedIDs.contains($0.id) }
-        let existingIDs = Set(cartItems.map { $0.id })
 
         var newItems: [CartItem] = []
         for file in selected
-                .filter({ !existingIDs.contains($0.id) })
+                .filter({ !cartFileIds.contains($0.id) })
                 .sorted(by: { $0.timestamp < $1.timestamp }) {
             let sid = sessionForFile(file, considering: cartItems + newItems) ?? UUID()
             var item = CartItem(recording: file)
@@ -245,10 +255,70 @@ final class ExportManager: ObservableObject {
 
     func removeFromCart(_ item: CartItem) {
         cartItems.removeAll { $0.id == item.id }
+        pruneOrphanedSessionTypes()
+    }
+
+    func removeFromCart(fileId: String) {
+        cartItems.removeAll { $0.id == fileId }
+        pruneOrphanedSessionTypes()
+    }
+
+    func removeFromCart(fileIds: Set<String>) {
+        cartItems.removeAll { fileIds.contains($0.id) }
+        pruneOrphanedSessionTypes()
+    }
+
+    /// Remove session type entries for sessions that no longer have any cart items.
+    private func pruneOrphanedSessionTypes() {
+        let activeSessionIds = Set(cartItems.map { $0.sessionId })
+        sessionTypes = sessionTypes.filter { activeSessionIds.contains($0.key) }
     }
 
     func clearCart() {
         cartItems.removeAll()
+        sessionTypes.removeAll()
+    }
+
+    // MARK: - Session Type
+
+    func sessionType(for sessionId: UUID) -> SessionType {
+        sessionTypes[sessionId] ?? .run
+    }
+
+    func setSessionType(_ type: SessionType, for sessionId: UUID) {
+        if type == .run {
+            sessionTypes.removeValue(forKey: sessionId)
+        } else {
+            sessionTypes[sessionId] = type
+        }
+    }
+
+    func cycleSessionType(for sessionId: UUID) {
+        let current = sessionType(for: sessionId)
+        let all = SessionType.allCases
+        let nextIdx = (all.firstIndex(of: current)! + 1) % all.count
+        setSessionType(all[nextIdx], for: sessionId)
+    }
+
+    /// Add files to the cart using pre-computed session IDs from the session-grouped browser.
+    /// Each entry maps a `RecordingSession.id` to the file IDs that should be added from it.
+    func addToCart(fromSessions sessionFileIds: [(sessionId: UUID, fileIds: Set<String>)]) {
+        let allFiles = recordings.values.flatMap { $0 }
+        let fileMap = Dictionary(uniqueKeysWithValues: allFiles.map { ($0.id, $0) })
+        let existing = cartFileIds
+
+        var newItems: [CartItem] = []
+        for (sessionId, fileIds) in sessionFileIds {
+            for fileId in fileIds {
+                guard !existing.contains(fileId),
+                      let file = fileMap[fileId] else { continue }
+                var item = CartItem(recording: file)
+                item.sessionId = sessionId
+                newItems.append(item)
+            }
+        }
+
+        cartItems.append(contentsOf: newItems)
     }
 
     func updateLabel(for itemID: String, label: String) {
@@ -262,6 +332,7 @@ final class ExportManager: ObservableObject {
     /// Start exporting all cart items. All devices transfer concurrently.
     func startExport() {
         guard !cartItems.isEmpty, exportPhase != .exporting else { return }
+        guard !DotManager.shared.isBusy else { return }
 
         beginExportBackgroundTask()
         currentExportCanceled = false
@@ -310,7 +381,13 @@ final class ExportManager: ObservableObject {
         // Wait for all N devices to finish without blocking main.
         exportSequenceQueue.async { [weak self] in
             guard let self else { return }
-            for _ in 0..<deviceCount { semaphore.wait() }
+            for i in 0..<deviceCount {
+                let result = semaphore.wait(timeout: .now() + 300)
+                if result == .timedOut {
+                    print("⚠️ Export semaphore timed out after 5 minutes (device \(i + 1)/\(deviceCount))")
+                    break
+                }
+            }
             DispatchQueue.main.async {
                 self.exportPendingSignals = 0
             }
@@ -328,7 +405,7 @@ final class ExportManager: ObservableObject {
                 self.exportFileGenerations[address, default: 0] += 1
             }
             self.currentExportCanceled = true
-            self.isTransferring = false
+            setOnMain { self.isTransferring = false }
         }
 
         for watchdog in activeWatchdogs.values { watchdog.stop() }
@@ -391,6 +468,8 @@ final class ExportManager: ObservableObject {
     func retryFailed() {
         let retryable = tasks.filter { $0.status == .failed || $0.status == .canceled }
         guard !retryable.isEmpty else { return }
+        guard exportPhase != .exporting else { return }
+        guard !DotManager.shared.isBusy else { return }
 
         beginExportBackgroundTask()
         currentExportCanceled = false
@@ -449,8 +528,6 @@ final class ExportManager: ObservableObject {
                     }
                 } else {
                     // File is gone — needs a full BLE re-transfer.
-                    // fileQueue is serial so these appends never race with each other,
-                    // and group.notify fires on main only after all blocks call leave().
                     fullPipeline.append(task)
                     self.setTaskStatus(task, .queued)
                     setOnMain { task.progress = 0; task.error = nil; task.subphase = .idle; task.hasPacketLoss = false }
@@ -497,13 +574,18 @@ final class ExportManager: ObservableObject {
                 for (address, tasksForDot) in grouped {
                     guard !self.currentExportCanceled else { break }
 
-                    guard let dot = DotManager.shared.dot(forUuid: address), dot.isConnected else {
-                        tasksForDot.forEach { self.setTaskStatus($0, .failed, error: "Sensor disconnected") }
+                    guard let dot = DotManager.shared.dot(forUuid: address), dot.connectionPhase == .ready else {
+                        tasksForDot.forEach { self.setTaskStatus($0, .failed, error: "Sensor not ready") }
                         continue
                     }
 
                     self.exportFilesForDot(dot: dot, tasks: tasksForDot) { semaphore.signal() }
-                    semaphore.wait()
+                    let result = semaphore.wait(timeout: .now() + 300)
+                    if result == .timedOut {
+                        print("⚠️ Export retry semaphore timed out after 5 minutes for \(address)")
+                        tasksForDot.forEach { self.setTaskStatus($0, .failed, error: "Export timed out") }
+                        break
+                    }
                 }
 
                 self.finalizeExport(generation: myGen)
@@ -516,6 +598,7 @@ final class ExportManager: ObservableObject {
     /// BLE pipeline reruns for that one task.
     func retrySingleTask(_ task: ExportTask) {
         guard task.status == .failed || task.status == .canceled else { return }
+        guard exportPhase != .exporting else { return }
 
         beginExportBackgroundTask()
         currentExportCanceled = false
@@ -574,14 +657,18 @@ final class ExportManager: ObservableObject {
 
                             let address = task.cartItem.recording.dotAddress
                             guard !self.currentExportCanceled,
-                                  let dot = DotManager.shared.dot(forUuid: address), dot.isConnected else {
-                                self.setTaskStatus(task, .failed, error: "Sensor disconnected")
+                                  let dot = DotManager.shared.dot(forUuid: address), dot.connectionPhase == .ready else {
+                                self.setTaskStatus(task, .failed, error: "Sensor not ready")
                                 self.finalizeExport(generation: myGen)
                                 return
                             }
 
                             self.exportFilesForDot(dot: dot, tasks: [task]) { semaphore.signal() }
-                            semaphore.wait()
+                            let result = semaphore.wait(timeout: .now() + 300)
+                            if result == .timedOut {
+                                print("⚠️ Single-task retry semaphore timed out after 5 minutes for \(task.cartItem.recording.dotAddress)")
+                                self.setTaskStatus(task, .failed, error: "Export timed out")
+                            }
 
                             self.finalizeExport(generation: myGen)
                         }
@@ -628,14 +715,18 @@ final class ExportManager: ObservableObject {
 
                 let address = task.cartItem.recording.dotAddress
                 guard !self.currentExportCanceled,
-                      let dot = DotManager.shared.dot(forUuid: address), dot.isConnected else {
-                    self.setTaskStatus(task, .failed, error: "Sensor disconnected")
+                      let dot = DotManager.shared.dot(forUuid: address), dot.connectionPhase == .ready else {
+                    self.setTaskStatus(task, .failed, error: "Sensor not ready")
                     self.finalizeExport(generation: myGen)
                     return
                 }
 
                 self.exportFilesForDot(dot: dot, tasks: [task]) { semaphore.signal() }
-                semaphore.wait()
+                let result = semaphore.wait(timeout: .now() + 300)
+                if result == .timedOut {
+                    print("⚠️ Single-task retry semaphore timed out after 5 minutes for \(task.cartItem.recording.dotAddress)")
+                    self.setTaskStatus(task, .failed, error: "Export timed out")
+                }
 
                 self.finalizeExport(generation: myGen)
             }
@@ -658,6 +749,7 @@ final class ExportManager: ObservableObject {
         tasks.removeAll()
         exportedSessionFolderURLs.removeAll()
         sessionMetadata = nil
+        sessionTypes.removeAll()
         hasRestoredTasks = false
         exportPhase = recordings.isEmpty ? .idle : .ready
         cleanupSharePackages()
@@ -748,6 +840,7 @@ final class ExportManager: ObservableObject {
         let fileIndex: Int
         let timestamp: UInt32
         let taskId: String
+        let sessionType: SessionType
     }
 
     /// Snapshots successful task data on the main thread. Must be called on main.
@@ -761,7 +854,8 @@ final class ExportManager: ObservableObject {
                 dotAddress: task.cartItem.recording.dotAddress,
                 fileIndex: task.cartItem.recording.fileIndex,
                 timestamp: task.cartItem.recording.timestamp,
-                taskId: task.id
+                taskId: task.id,
+                sessionType: sessionType(for: task.cartItem.sessionId)
             )
         }
     }
@@ -780,7 +874,8 @@ final class ExportManager: ObservableObject {
                 .map { $0.timestamp }
                 .min() ?? UInt32(Date().timeIntervalSince1970)
             let date = Date(timeIntervalSince1970: TimeInterval(earliest))
-            let folderName = Self.sessionFolderFormatter.string(from: date)
+            let sType = sessionItems.first?.sessionType ?? .run
+            let folderName = Self.sessionFolderFormatter.string(from: date) + sType.suffix
 
             // Reuse existing folder if its metadata.csv has the same Session ID (retry case).
             let sessionDir = resolveSessionFolder(baseName: folderName, sessionId: sessionId, in: baseDir)
@@ -792,10 +887,10 @@ final class ExportManager: ObservableObject {
                 continue
             }
 
-            writeMetadataCSV(to: sessionDir, metadata: metadata, items: sessionItems, sessionId: sessionId)
+            writeMetadataCSV(to: sessionDir, metadata: metadata, items: sessionItems, sessionId: sessionId, sessionType: sType)
 
             for item in sessionItems {
-                let preferredName = sanitize(item.label) + ".csv"
+                let preferredName = sanitize(item.label) + sType.suffix + ".csv"
                 safeCopy(from: item.sourceURL, toDirectory: sessionDir, preferredName: preferredName, taskId: item.taskId)
             }
 
@@ -890,10 +985,11 @@ final class ExportManager: ObservableObject {
     }
 
     /// Writes a metadata.csv file summarizing the export session.
-    private func writeMetadataCSV(to dir: URL, metadata: SessionMetadata, items: [TaskMoveInfo], sessionId: UUID) {
+    private func writeMetadataCSV(to dir: URL, metadata: SessionMetadata, items: [TaskMoveInfo], sessionId: UUID, sessionType: SessionType = .run) {
         var rows: [[String]] = []
         rows.append(["Key", "Value"])
         rows.append(["Session ID", sessionId.uuidString])
+        rows.append(["Session Type", sessionType.rawValue])
         rows.append(["Runner Name", metadata.runnerName])
         rows.append(["Shoe Brand", metadata.shoeBrand])
         rows.append(["Shoe Model", metadata.shoeModel])
@@ -914,7 +1010,7 @@ final class ExportManager: ObservableObject {
         let isoFormatter = ISO8601DateFormatter()
         for item in items.sorted(by: { $0.fileIndex < $1.fileIndex }) {
             let date = Date(timeIntervalSince1970: TimeInterval(item.timestamp))
-            rows.append(["Recording (\(item.label))", isoFormatter.string(from: date)])
+            rows.append(["Recording (\(item.label))", isoFormatter.string(from: date), sessionType.rawValue])
         }
 
         let csv = rows.map { row in
@@ -1036,5 +1132,63 @@ final class ExportManager: ObservableObject {
             task.status = status
             if let error { task.error = error }
         }
+    }
+}
+
+// MARK: - Testable Decision Logic
+
+/// Lightweight snapshot of a task's retry-relevant state.
+/// Avoids coupling test code to `ExportTask` (which wraps SDK objects).
+struct ExportTaskSnapshot {
+    let hasPacketLoss: Bool
+    let fileExists: Bool
+}
+
+/// What action to take for a single task during retry.
+enum RetryAction: Equatable {
+    case markSuccess
+    case addToPipeline
+    case deleteAndRecheck
+}
+
+/// Extracted pure functions for unit testing retry logic without Bluetooth.
+/// Each function mirrors a decision point inside ExportManager but takes
+/// value-type inputs and returns value-type outputs — no SDK, no queues.
+enum ExportManagerLogic {
+
+    /// Validates whether a retry operation can start.
+    /// Returns `nil` on success, or an error message describing why it's blocked.
+    static func validateRetry(
+        exportPhase: ExportPhase,
+        isBusy: Bool,
+        retryableCount: Int
+    ) -> String? {
+        guard retryableCount > 0 else { return "No retryable tasks" }
+        guard exportPhase != .exporting else { return "Export already in progress" }
+        guard !isBusy else { return "System busy" }
+        return nil
+    }
+
+    /// Decides what to do with a single failed task based on its state.
+    /// - No packet loss + file exists → markSuccess (already exported)
+    /// - No packet loss + file missing → addToPipeline (needs BLE re-transfer)
+    /// - Packet loss → deleteAndRecheck (delete partial CSV first, then decide)
+    static func triageTask(_ snapshot: ExportTaskSnapshot) -> RetryAction {
+        if snapshot.hasPacketLoss { return .deleteAndRecheck }
+        return snapshot.fileExists ? .markSuccess : .addToPipeline
+    }
+
+    /// After attempting to delete a packet-loss CSV, decides the next step.
+    /// - File still exists (deletion failed) → markSuccess
+    /// - File gone → addToPipeline (needs full BLE re-transfer)
+    static func triageAfterDeletion(fileStillExists: Bool) -> RetryAction {
+        fileStillExists ? .markSuccess : .addToPipeline
+    }
+
+    /// Validates whether a dot is usable for retry export.
+    /// Returns `nil` on success, or an error message.
+    static func validateDotForRetry(dotExists: Bool, dotReady: Bool) -> String? {
+        guard dotExists, dotReady else { return "Sensor not ready" }
+        return nil
     }
 }

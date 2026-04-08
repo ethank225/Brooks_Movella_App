@@ -17,6 +17,7 @@ extension ExportManager {
         // CartItem fields
         let sessionId: UUID
         let label: String
+        let sessionType: SessionType?   // nil decodes as .run for backwards compatibility
         // RecordingFile fields
         let dotAddress: String
         let macAddress: String
@@ -52,6 +53,7 @@ extension ExportManager {
                 uploadError:   task.uploadError,
                 sessionId:     task.cartItem.sessionId,
                 label:         task.cartItem.label,
+                sessionType:   sessionType(for: task.cartItem.sessionId),
                 dotAddress:    task.cartItem.recording.dotAddress,
                 macAddress:    task.cartItem.recording.macAddress,
                 fileIndex:     task.cartItem.recording.fileIndex,
@@ -126,6 +128,14 @@ extension ExportManager {
         }
 
         guard !restored.isEmpty else { return }
+
+        // Restore session types from persisted records.
+        for record in records {
+            let sType = record.sessionType ?? .run
+            if sType != .run {
+                setSessionType(sType, for: record.sessionId)
+            }
+        }
 
         // Delete orphaned flat CSVs in ExportCache/ (Application Support).
         // Session folders in Documents/Exports/ are permanent user data — never deleted by the app.

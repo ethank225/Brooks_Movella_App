@@ -82,7 +82,7 @@ final class DotRegistry {
         state.device = device
 
         if let dot = state.dot {
-            dot.updateDevice(device)
+            dot.updateDevice(device, isSyncing: syncingUuids.contains(uuid))
         } else {
             state.dot = Dot(device: device, sdkQueue: sdkQueue)
         }
@@ -103,7 +103,7 @@ final class DotRegistry {
         } else {
             state.device = device
             if let dot = state.dot {
-                dot.updateDevice(device)
+                dot.updateDevice(device, isSyncing: syncingUuids.contains(uuid))
             }
         }
         state.lastSeen = Date()
@@ -112,7 +112,6 @@ final class DotRegistry {
 
     func recordDisconnection(_ uuid: String) {
         setConnectionPhase(uuid, .idle)
-        byUuid[uuid]?.dot?.setSessionSynced(false)
         initializationInProgress.remove(uuid)
     }
 
