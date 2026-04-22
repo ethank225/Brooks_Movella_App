@@ -18,24 +18,13 @@ struct CartItemRow: View {
             sessionBadge
 
             VStack(alignment: .leading, spacing: 4) {
-                HStack(spacing: 6) {
-                    TextField("File label", text: $editedLabel)
-                        .font(.subheadline.weight(.medium))
-                        .textFieldStyle(.plain)
-                        .disabled(disabled)
-                        .onChange(of: editedLabel) { newValue in
-                            onLabelChange(newValue)
-                        }
-                    if isCalibration {
-                        Text("CAL")
-                            .font(.system(size: 9, weight: .bold))
-                            .foregroundColor(.blue)
-                            .padding(.horizontal, 4)
-                            .padding(.vertical, 1)
-                            .background(Color.blue.opacity(0.12))
-                            .cornerRadius(3)
+                TextField("File label", text: $editedLabel)
+                    .font(.subheadline.weight(.medium))
+                    .textFieldStyle(.plain)
+                    .disabled(disabled)
+                    .onChange(of: editedLabel) { newValue in
+                        onLabelChange(newValue)
                     }
-                }
 
                 HStack(spacing: 8) {
                     Text(item.recording.formattedSize)
@@ -56,8 +45,10 @@ struct CartItemRow: View {
                 }
             }
         }
-        .padding(.vertical, 8)
-        .padding(.horizontal, 4)
+        .padding(.vertical, 10)
+        .padding(.horizontal, 12)
+        .background(Color.gray.opacity(0.08))
+        .cornerRadius(8)
         .onAppear { editedLabel = item.label }
     }
 

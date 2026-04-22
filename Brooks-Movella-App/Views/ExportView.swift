@@ -560,12 +560,11 @@ struct CartView: View {
 
             VStack(alignment: .leading, spacing: 0) {
                 // Header
-                HStack {
-                    Label(
-                        "Session \(sessionNumber) — \(items.count) file\(items.count == 1 ? "" : "s")",
-                        systemImage: sType.icon
-                    )
-                    .font(.headline)
+                HStack(spacing: 8) {
+                    Image(systemName: sType.icon)
+                        .frame(width: 24, height: 24)
+                    Text("Session \(sessionNumber) — \(items.count) file\(items.count == 1 ? "" : "s")")
+                        .font(.headline)
                     Spacer()
                 }
                 .padding(.horizontal)
@@ -584,25 +583,24 @@ struct CartView: View {
                     .padding(.bottom, 8)
                 }
 
-                Divider()
-
                 // File rows
-                ForEach(Array(items.enumerated()), id: \.element.id) { rowIndex, item in
-                    if rowIndex > 0 { Divider() }
-                    CartItemRow(
-                        item: item,
-                        sessionNumber: sessionNumber,
-                        sessions: sessions,
-                        isCalibration: sType == .calibration,
-                        onLabelChange:   { exportManager.updateLabel(for: item.id, label: $0) },
-                        onRemove:        { exportManager.removeFromCart(item) },
-                        onSessionChange: { exportManager.reassignSession(itemId: item.id, to: $0) },
-                        onNewSession:    { exportManager.reassignSession(itemId: item.id, to: UUID()) },
-                        disabled: isExporting
-                    )
-                    .padding(.horizontal)
+                VStack(spacing: 8) {
+                    ForEach(items) { item in
+                        CartItemRow(
+                            item: item,
+                            sessionNumber: sessionNumber,
+                            sessions: sessions,
+                            isCalibration: sType == .calibration,
+                            onLabelChange:   { exportManager.updateLabel(for: item.id, label: $0) },
+                            onRemove:        { exportManager.removeFromCart(item) },
+                            onSessionChange: { exportManager.reassignSession(itemId: item.id, to: $0) },
+                            onNewSession:    { exportManager.reassignSession(itemId: item.id, to: UUID()) },
+                            disabled: isExporting
+                        )
+                    }
                 }
-                .padding(.vertical, 4)
+                .padding(.horizontal)
+                .padding(.vertical, 8)
             }
             .background(sType.cardBackground)
             .cornerRadius(12)
@@ -634,11 +632,13 @@ struct CartView: View {
                 Text("\(runSessions.count) run session\(runSessions.count == 1 ? "" : "s") (\(runFiles) file\(runFiles == 1 ? "" : "s"))")
                     .font(.caption)
                     .foregroundColor(.green)
+                    .transition(.opacity)
             }
             if !calSessions.isEmpty {
                 Text("\(calSessions.count) calibration session\(calSessions.count == 1 ? "" : "s") (\(calFiles) file\(calFiles == 1 ? "" : "s"))")
                     .font(.caption)
                     .foregroundColor(.blue)
+                    .transition(.opacity)
             }
             Text("Total: \(formattedBytes(totalBytes))")
                 .font(.caption)
@@ -646,6 +646,8 @@ struct CartView: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal)
+        .animation(AppAnimation.content, value: runSessions.count)
+        .animation(AppAnimation.content, value: calSessions.count)
     }
 
     private func formattedBytes(_ bytes: Int) -> String {

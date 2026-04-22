@@ -32,8 +32,8 @@ enum SessionType: String, Codable, CaseIterable, Equatable {
 
     var shortLabel: String {
         switch self {
-        case .run:         return "Run"
-        case .calibration: return "Cal"
+        case .run:         return "RUN"
+        case .calibration: return "CAL"
         }
     }
 

@@ -97,15 +97,6 @@ struct SessionCard: View {
                         .font(.subheadline.weight(.medium))
                         .lineLimit(1)
 
-                    Text("cal")
-                        .font(.system(size: 9, weight: .bold))
-                        .foregroundColor(.blue)
-                        .padding(.horizontal, 4)
-                        .padding(.vertical, 1)
-                        .background(Color.blue.opacity(0.15))
-                        .cornerRadius(3)
-                        .opacity(isCal && inCart ? 1 : 0)
-
                     Spacer()
 
                     Text("file \(file.recording.fileIndex) · \(file.recording.formattedSize)")
