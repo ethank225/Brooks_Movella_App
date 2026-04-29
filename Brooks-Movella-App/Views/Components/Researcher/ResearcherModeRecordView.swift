@@ -4,9 +4,6 @@ struct ResearcherModeRecordView: View {
     @ObservedObject private var manager = DotManager.shared
     @ObservedObject private var runnerStore = RunnerStore.shared
 
-    @State private var selectedDotId: String? = nil
-    /// Runner whose empty slot was tapped (slot-first flow). Mutually exclusive with selectedDotId.
-    @State private var selectedSlotRunnerId: String? = nil
     @State private var showInitializingAlert = false
 
     /// Runners to display — excludes the single-runner-mode ephemeral runner.
@@ -18,18 +15,6 @@ struct ResearcherModeRecordView: View {
     private var availableDots: [Dot] {
         let allAssigned = Set(runners.flatMap { $0.sensorUuids })
         return manager.connectedDots.filter { !allAssigned.contains($0.address) }
-    }
-
-    /// Whether the selected dot is currently assigned to some runner (not in the pool).
-    private var selectedIsAssigned: Bool {
-        guard let id = selectedDotId else { return false }
-        return runners.contains { $0.sensorUuids.contains(id) }
-    }
-
-    /// The runner that currently owns the selected dot, if any.
-    private var sourceRunner: Runner? {
-        guard let id = selectedDotId else { return nil }
-        return runners.first { $0.sensorUuids.contains(id) }
     }
 
     /// Connected sensors assigned to a specific runner.
@@ -48,34 +33,10 @@ struct ResearcherModeRecordView: View {
         VStack(spacing: 0) {
             AvailableDots(
                 dots: availableDots,
-                selectedDotId: selectedDotId,
-                selectedIsAssigned: selectedIsAssigned,
-                slotIsActive: selectedSlotRunnerId != nil,
-                onTapDot: { dot in
-                    // Slot-first: a slot is waiting, assign this dot there
-                    if let runnerId = selectedSlotRunnerId {
-                        withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
-                            runnerStore.assignSensor(uuid: dot.address, to: runnerId)
-                            selectedSlotRunnerId = nil
-                        }
-                        return
-                    }
-                    // Dot-first: toggle selection
-                    withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
-                        if selectedDotId == dot.address {
-                            selectedDotId = nil
-                        } else {
-                            selectedDotId = dot.address
-                            selectedSlotRunnerId = nil
-                        }
-                    }
-                },
-                onReturnToPool: {
-                    guard let uuid = selectedDotId,
-                          let source = sourceRunner else { return }
-                    withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+                onReturnToPool: { uuid in
+                    // Find which runner owns this dot and unassign
+                    if let source = runners.first(where: { $0.sensorUuids.contains(uuid) }) {
                         runnerStore.unassignSensor(uuid: uuid, from: source.id)
-                        selectedDotId = nil
                     }
                 }
             )
@@ -84,16 +45,16 @@ struct ResearcherModeRecordView: View {
             if manager.isErasing {
                 ErasingBanner()
                     .padding(.horizontal)
-                    .transition(.move(edge: .top).combined(with: .opacity))
+                    .transition(AppAnimation.bannerTransition)
             } else if manager.hasFlashIssue {
                 FlashIssueBanner(isErasingFromPreviousSession: manager.isAnyErasingFromPreviousSession)
                     .padding(.horizontal)
-                    .transition(.move(edge: .top).combined(with: .opacity))
+                    .transition(AppAnimation.bannerTransition)
             }
 
             runnerList
         }
-        .animation(.easeInOut(duration: 0.3), value: manager.hasFlashIssue)
+        .animation(AppAnimation.phase, value: manager.hasFlashIssue)
         .alert("Sensors Initializing", isPresented: $showInitializingAlert) {
             Button("OK", role: .cancel) {}
         } message: {
@@ -108,14 +69,11 @@ struct ResearcherModeRecordView: View {
             VStack(spacing: 12) {
                 ForEach(runners) { runner in
                     runnerCard(for: runner)
-                        .transition(.asymmetric(
-                            insertion: .move(edge: .top).combined(with: .opacity),
-                            removal: .move(edge: .top).combined(with: .opacity)
-                        ))
+                        .transition(AppAnimation.cardTransition)
                 }
 
                 AddRunnerButton {
-                    withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+                    withAnimation(AppAnimation.interactive) {
                         _ = runnerStore.addRunner(label: "")
                     }
                 }
@@ -123,12 +81,6 @@ struct ResearcherModeRecordView: View {
                 .padding(.bottom, 24)
             }
             .padding(.top, 12)
-        }
-        .onTapGesture {
-            withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
-                if selectedDotId != nil { selectedDotId = nil }
-                if selectedSlotRunnerId != nil { selectedSlotRunnerId = nil }
-            }
         }
     }
 
@@ -139,47 +91,11 @@ struct ResearcherModeRecordView: View {
             assignedDots: assignedDots(for: runner),
             hasAvailableDots: !availableDots.isEmpty,
             isStartDisabled: (manager.isAnySyncing && phase(for: runner) != .syncing) || manager.isErasing || manager.hasFlashIssue,
-            selectedDotId: selectedDotId,
-            isSlotSelected: selectedSlotRunnerId == runner.id,
-            onPlaceDot: {
-                guard let uuid = selectedDotId else { return }
-                withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
-                    // If the dot is assigned to another runner, move it
-                    if let source = sourceRunner, source.id != runner.id {
-                        runnerStore.unassignSensor(uuid: uuid, from: source.id)
-                    }
-                    runnerStore.assignSensor(uuid: uuid, to: runner.id)
-                    selectedDotId = nil
-                }
-            },
-            onCancelSelection: {
-                withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
-                    selectedDotId = nil
-                    selectedSlotRunnerId = nil
-                }
-            },
-            onSelectSlot: {
-                withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
-                    if selectedSlotRunnerId == runner.id {
-                        selectedSlotRunnerId = nil
-                    } else {
-                        selectedSlotRunnerId = runner.id
-                        selectedDotId = nil
-                    }
-                }
-            },
-            onSelectDot: { uuid in
-                withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
-                    if selectedDotId == uuid {
-                        selectedDotId = nil
-                    } else {
-                        selectedDotId = uuid
-                        selectedSlotRunnerId = nil
-                    }
-                }
+            onAssignDot: { uuid in
+                runnerStore.assignSensor(uuid: uuid, to: runner.id)
             },
             onUnassign: { uuid in
-                withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+                withAnimation(AppAnimation.interactive) {
                     runnerStore.unassignSensor(uuid: uuid, from: runner.id)
                 }
             },
@@ -195,10 +111,8 @@ struct ResearcherModeRecordView: View {
                 manager.endSession(runnerId: runner.id)
             },
             onRemove: {
-                withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+                withAnimation(AppAnimation.interactive) {
                     runnerStore.removeRunner(id: runner.id)
-                    selectedDotId = nil
-                    selectedSlotRunnerId = nil
                 }
             },
             onRename: { newName in
@@ -206,6 +120,11 @@ struct ResearcherModeRecordView: View {
             },
             onDismissError: {
                 manager.dismissError(runnerId: runner.id)
+            },
+            isSynced: assignedDots(for: runner).count >= 2 && assignedDots(for: runner).allSatisfy { $0.sessionSynced },
+            isResyncing: phase(for: runner) == .syncing,
+            onResync: {
+                manager.resyncRunner(runnerId: runner.id)
             }
         )
     }

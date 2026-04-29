@@ -43,7 +43,7 @@ final class Dot: ObservableObject, Identifiable {
 
     var isConnected: Bool { connectionPhase.isConnected }
     @Published private(set) var isRecording = false
-    @Published var sessionSynced = false
+    @Published private(set) var sessionSynced = false
     @Published var isErasing = false
     @Published private(set) var recordingFiles: [DotRecordingFile] = []
 
@@ -72,9 +72,6 @@ final class Dot: ObservableObject, Identifiable {
     /// Whether the SDK has finished initializing this device after connection.
     var isInitialized: Bool { device.isInitialized() }
 
-    /// Whether the SDK considers this device time-synced with the host.
-    var isSynced: Bool { device.isSynced() }
-
     // MARK: - SDK Queue
 
     /// Serializes all SDK device calls. Shared with `DotManager.sdkQueue`.
@@ -83,6 +80,16 @@ final class Dot: ObservableObject, Identifiable {
     /// Single-flight guard for `getFlashInfo`. Accessed only on `sdkQueue`.
     private var flashInfoInFlight = false
     private var flashInfoWaiters: [(Bool) -> Void] = []
+
+    /// True after any successful BLE round-trip on the current `device`
+    /// reference (recording-status response, flash-info response, etc.).
+    /// Reset to false in `updateDevice(_:)` when the device reference is
+    /// swapped after a reconnect.
+    ///
+    /// Used by `DotOperationRunner.waitForInitialization` to skip the 2s
+    /// post-reconnect settle delay once we already have BLE proof of life.
+    /// Accessed only on `sdkQueue`.
+    private(set) var bleConnectionProven = false
 
     /// One-shot completion for the next recording status query. Accessed only on `sdkQueue`.
     private var recordingStatusCompletion: ((Bool) -> Void)?
@@ -115,10 +122,16 @@ final class Dot: ObservableObject, Identifiable {
 
     /// Replace the underlying device reference (e.g. after SDK reconnects during sync).
     /// Re-installs the recording callback since the old device object is stale.
-    func updateDevice(_ newDevice: DotDevice) {
+    /// When `isSyncing` is true, skips `refreshSyncStatus()` because the SDK
+    /// produces misleading intermediate values during its internal reconnects.
+    func updateDevice(_ newDevice: DotDevice, isSyncing: Bool = false) {
         self.device = newDevice
         sdkQueue.async {
+            self.bleConnectionProven = false
             self.installRecordingStatusHandler()
+        }
+        if !isSyncing {
+            refreshSyncStatus()
         }
         print("🔄 [\(address)] Device reference updated")
     }
@@ -142,6 +155,7 @@ final class Dot: ObservableObject, Identifiable {
             self.syncRecordingState()
             // Fire one-shot completion if pending
             self.sdkQueue.async {
+                self.bleConnectionProven = true
                 if let cb = self.recordingStatusCompletion {
                     self.recordingStatusCompletion = nil
                     cb(isRec)
@@ -154,10 +168,6 @@ final class Dot: ObservableObject, Identifiable {
 
     func setConnectionPhase(_ phase: ConnectionPhase) {
         setOnMain { self.connectionPhase = phase }
-    }
-
-    func setSessionSynced(_ value: Bool) {
-        setOnMain { self.sessionSynced = value }
     }
 
     /// Single source of truth for isRecording updates.
@@ -187,6 +197,7 @@ final class Dot: ObservableObject, Identifiable {
     func refreshSyncStatus() {
         sdkQueue.async {
             let synced = self.device.isSynced()
+            print("🔄 [\(self.address)] refreshSyncStatus: device.isSynced() = \(synced)")
             setOnMain { self.sessionSynced = synced }
         }
     }
@@ -250,10 +261,12 @@ final class Dot: ObservableObject, Identifiable {
                     switch status {
                     case .isRecording:
                         hasCompleted = true
+                        self.bleConnectionProven = true
                         self.recordingStatusCompletion = nil
                         completion(.recording)
                     case .isErasing:
                         hasCompleted = true
+                        self.bleConnectionProven = true
                         self.recordingStatusCompletion = nil
                         completion(.erasing)
                     case .isIdle, .isRecordingStopped:
@@ -261,6 +274,7 @@ final class Dot: ObservableObject, Identifiable {
                         // property may just be the uninitialized default (0).
                         if elapsed >= 1.0 {
                             hasCompleted = true
+                            self.bleConnectionProven = true
                             self.recordingStatusCompletion = nil
                             completion(.idle)
                         } else if elapsed < 2.5 {
@@ -317,6 +331,7 @@ final class Dot: ObservableObject, Identifiable {
             self.device.setFlashInfoDoneBlock { [weak self] status in
                 guard let self, !hasCapturedResult else { return }
                 hasCapturedResult = true
+                self.bleConnectionProven = true
 
                 let used = Int(self.device.usedSpace)
                 let total = Int(self.device.totalSpace)
@@ -381,7 +396,8 @@ final class Dot: ObservableObject, Identifiable {
             DispatchQueue.main.asyncAfter(deadline: .now() + 5.0) { [weak self] in
                 guard !hasCapturedResult else { return }
                 hasCapturedResult = true
-                print("⏰ [\(self?.address ?? "?")] Flash info timed out")
+                let isInit = self?.device.isInitialized() ?? false
+                print("⏰ [\(self?.address ?? "?")] getFlashInfo timed out — device.isInitialized=\(isInit)")
                 self?.sdkQueue.async {
                     self?.device.setFlashInfoDoneBlock(nil)
                     let waiters = self?.flashInfoWaiters ?? []
@@ -629,7 +645,10 @@ final class Dot: ObservableObject, Identifiable {
             self.device.setEraseDataDoneBlock { [weak self] success in
                 let ok = success != 0
                 print("🗑️ [\(self?.address ?? "?")] Erase: \(ok ? "success" : "failed")")
-                setOnMain { self?.isErasing = false }
+                setOnMain {
+                    self?.isErasing = false
+                    self?.onEraseStateChanged?()
+                }
                 if ok {
                     setOnMain {
                         self?.flashCorrupted = false

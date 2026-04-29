@@ -82,11 +82,11 @@ struct RecordingListSection: View {
         .contentShape(Rectangle())
         .onTapGesture {
             if canExpand {
-                withAnimation(.easeInOut(duration: 0.2)) { isExpanded.toggle() }
+                withAnimation(AppAnimation.expand) { isExpanded.toggle() }
             }
         }
-        .animation(.easeInOut(duration: 0.2), value: isLoading)
-        .animation(.easeInOut(duration: 0.2), value: isExpanded)
+        .animation(AppAnimation.expand, value: isLoading)
+        .animation(AppAnimation.expand, value: isExpanded)
     }
 }
 

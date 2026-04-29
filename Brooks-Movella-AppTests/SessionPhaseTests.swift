@@ -3,30 +3,30 @@ import XCTest
 
 final class SessionPhaseTests: XCTestCase {
 
-    // MARK: - isBusy
+    // MARK: - isTransitioning
 
-    func testIsBusyTrueForSyncing() {
-        XCTAssertTrue(SessionPhase.syncing.isBusy)
+    func testIsTransitioningTrueForSyncing() {
+        XCTAssertTrue(SessionPhase.syncing.isTransitioning)
     }
 
-    func testIsBusyTrueForStartingRecording() {
-        XCTAssertTrue(SessionPhase.startingRecording.isBusy)
+    func testIsTransitioningTrueForStartingRecording() {
+        XCTAssertTrue(SessionPhase.startingRecording.isTransitioning)
     }
 
-    func testIsBusyTrueForStoppingRecording() {
-        XCTAssertTrue(SessionPhase.stoppingRecording.isBusy)
+    func testIsTransitioningTrueForStoppingRecording() {
+        XCTAssertTrue(SessionPhase.stoppingRecording.isTransitioning)
     }
 
-    func testIsBusyFalseForIdle() {
-        XCTAssertFalse(SessionPhase.idle.isBusy)
+    func testIsTransitioningFalseForIdle() {
+        XCTAssertFalse(SessionPhase.idle.isTransitioning)
     }
 
-    func testIsBusyFalseForRecording() {
-        XCTAssertFalse(SessionPhase.recording.isBusy)
+    func testIsTransitioningFalseForRecording() {
+        XCTAssertFalse(SessionPhase.recording.isTransitioning)
     }
 
-    func testIsBusyFalseForError() {
-        XCTAssertFalse(SessionPhase.error("oops").isBusy)
+    func testIsTransitioningFalseForError() {
+        XCTAssertFalse(SessionPhase.error("oops").isTransitioning)
     }
 
     // MARK: - isError

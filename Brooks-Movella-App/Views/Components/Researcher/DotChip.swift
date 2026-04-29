@@ -1,8 +1,15 @@
 import SwiftUI
 
+private extension View {
+    @ViewBuilder func `if`<Content: View>(_ condition: Bool, transform: (Self) -> Content) -> some View {
+        if condition { transform(self) } else { self }
+    }
+}
+
 struct DotChip: View {
     @ObservedObject var dot: Dot
     var isSelected: Bool = false
+    var isDraggable: Bool = false
     var onTap: (() -> Void)? = nil
     var onUnassign: (() -> Void)? = nil
 
@@ -56,7 +63,7 @@ struct DotChip: View {
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 6)
-        .frame(width: 92)
+        .frame(height: 52)
         .background(
             isIdentifying
                 ? Color.orange.opacity(0.25)
@@ -72,8 +79,11 @@ struct DotChip: View {
         )
         .shadow(color: isSelected ? Color.blue.opacity(0.35) : .clear, radius: 5, x: 0, y: 0)
         .scaleEffect(isSelected ? 1.06 : 1.0)
-        .animation(.easeInOut(duration: 0.2), value: isSelected)
-        .animation(.easeInOut(duration: 0.3), value: isIdentifying)
+        .animation(AppAnimation.standard, value: isSelected)
+        .animation(AppAnimation.phase, value: isIdentifying)
+        .if(isDraggable) { view in
+            view.draggable(dot.address)
+        }
         .onTapGesture {
             onTap?()
         }

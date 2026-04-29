@@ -89,12 +89,12 @@
       <tr>
         <td><code>recordReconnection(device)</code></td>
         <td>Auto-reconnect or sync reconnect</td>
-        <td>Lightweight: updates device ref and <code>lastSeen</code>, calls <code>dot.updateDevice()</code>. Does NOT change phase. Skips device ref update for syncing UUIDs.</td>
+        <td>Lightweight: updates device ref and <code>lastSeen</code>, calls <code>dot.updateDevice(device, isSyncing:)</code>. Does NOT change phase. Skips device ref update entirely for syncing UUIDs. When not syncing, <code>updateDevice</code> calls <code>refreshSyncStatus()</code>.</td>
       </tr>
       <tr>
         <td><code>recordDisconnection(uuid)</code></td>
         <td>Sensor disconnects</td>
-        <td>Sets phase to <code>.idle</code>, clears <code>sessionSynced</code>, removes from <code>initializationInProgress</code>.</td>
+        <td>Sets phase to <code>.idle</code>, removes from <code>initializationInProgress</code>.</td>
       </tr>
       <tr>
         <td><code>setConnectionPhase(uuid, phase)</code></td>

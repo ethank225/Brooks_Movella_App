@@ -27,7 +27,7 @@ struct ExportResultsSection: View {
                         onRetryUpload(task)
                     }, onRetryTransfer: {
                         exportManager.retrySingleTask(task)
-                    })
+                    }, isExporting: isExporting)
                 }
             }
 
@@ -41,8 +41,20 @@ struct ExportResultsSection: View {
             if isDone {
                 VStack(spacing: 12) {
                     if hasFailed {
-                        FullWidthButton(icon: "arrow.clockwise", label: "Retry All Failed", color: .orange) {
+                        FullWidthButton(
+                            icon: "arrow.clockwise",
+                            label: "Retry All Failed",
+                            color: exportManager.canRetry ? .orange : .gray
+                        ) {
                             exportManager.retryFailed()
+                        }
+                        .disabled(!exportManager.canRetry)
+
+                        if !exportManager.canRetry {
+                            Text("Reconnect sensors to retry")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                                .frame(maxWidth: .infinity, alignment: .center)
                         }
                     }
 

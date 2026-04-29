@@ -2,8 +2,14 @@ import SwiftUI
 
 struct ExportTaskRow: View {
     @ObservedObject var task: ExportTask
+    @ObservedObject private var dotManager = DotManager.shared
     var onRetryUpload: (() -> Void)? = nil
     var onRetryTransfer: (() -> Void)? = nil
+    var isExporting: Bool = false
+
+    private var sensorReady: Bool {
+        dotManager.dot(forUuid: task.cartItem.recording.dotAddress)?.connectionPhase == .ready
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -55,16 +61,24 @@ struct ExportTaskRow: View {
 
             // Retry transfer button for failed BLE transfers
             if task.status == .failed {
+                let retryDisabled = isExporting || !sensorReady
                 Button(action: { onRetryTransfer?() }) {
                     Label("Retry Transfer", systemImage: "arrow.clockwise")
                         .font(.caption.weight(.medium))
                         .foregroundColor(.white)
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 7)
-                        .background(Color.orange)
+                        .background(retryDisabled ? Color.gray : Color.orange)
                         .clipShape(Capsule())
                 }
                 .buttonStyle(.plain)
+                .disabled(retryDisabled)
+
+                if !isExporting && !sensorReady {
+                    Text("Reconnect sensor to retry")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
             }
 
             // File path
@@ -82,9 +96,9 @@ struct ExportTaskRow: View {
         .padding(10)
         .background(taskBackground)
         .cornerRadius(10)
-        .animation(.easeInOut(duration: 0.3), value: task.status)
-        .animation(.easeInOut(duration: 0.3), value: task.uploadStatus)
-        .animation(.easeInOut(duration: 0.3), value: task.hasPacketLoss)
+        .animation(AppAnimation.phase, value: task.status)
+        .animation(AppAnimation.phase, value: task.uploadStatus)
+        .animation(AppAnimation.phase, value: task.hasPacketLoss)
     }
 
     @ViewBuilder

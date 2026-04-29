@@ -4,6 +4,7 @@ struct CartItemRow: View {
     let item: CartItem
     let sessionNumber: Int
     let sessions: [UUID]
+    var isCalibration: Bool = false
     let onLabelChange:   (String) -> Void
     let onRemove:        () -> Void
     let onSessionChange: (UUID) -> Void
@@ -44,9 +45,10 @@ struct CartItemRow: View {
                 }
             }
         }
-        .padding(10)
-        .background(Color.gray.opacity(0.1))
-        .cornerRadius(10)
+        .padding(.vertical, 10)
+        .padding(.horizontal, 12)
+        .background(Color.gray.opacity(0.08))
+        .cornerRadius(8)
         .onAppear { editedLabel = item.label }
     }
 
