@@ -81,6 +81,16 @@ final class Dot: ObservableObject, Identifiable {
     private var flashInfoInFlight = false
     private var flashInfoWaiters: [(Bool) -> Void] = []
 
+    /// True after any successful BLE round-trip on the current `device`
+    /// reference (recording-status response, flash-info response, etc.).
+    /// Reset to false in `updateDevice(_:)` when the device reference is
+    /// swapped after a reconnect.
+    ///
+    /// Used by `DotOperationRunner.waitForInitialization` to skip the 2s
+    /// post-reconnect settle delay once we already have BLE proof of life.
+    /// Accessed only on `sdkQueue`.
+    private(set) var bleConnectionProven = false
+
     /// One-shot completion for the next recording status query. Accessed only on `sdkQueue`.
     private var recordingStatusCompletion: ((Bool) -> Void)?
 
@@ -117,6 +127,7 @@ final class Dot: ObservableObject, Identifiable {
     func updateDevice(_ newDevice: DotDevice, isSyncing: Bool = false) {
         self.device = newDevice
         sdkQueue.async {
+            self.bleConnectionProven = false
             self.installRecordingStatusHandler()
         }
         if !isSyncing {
@@ -144,6 +155,7 @@ final class Dot: ObservableObject, Identifiable {
             self.syncRecordingState()
             // Fire one-shot completion if pending
             self.sdkQueue.async {
+                self.bleConnectionProven = true
                 if let cb = self.recordingStatusCompletion {
                     self.recordingStatusCompletion = nil
                     cb(isRec)
@@ -249,10 +261,12 @@ final class Dot: ObservableObject, Identifiable {
                     switch status {
                     case .isRecording:
                         hasCompleted = true
+                        self.bleConnectionProven = true
                         self.recordingStatusCompletion = nil
                         completion(.recording)
                     case .isErasing:
                         hasCompleted = true
+                        self.bleConnectionProven = true
                         self.recordingStatusCompletion = nil
                         completion(.erasing)
                     case .isIdle, .isRecordingStopped:
@@ -260,6 +274,7 @@ final class Dot: ObservableObject, Identifiable {
                         // property may just be the uninitialized default (0).
                         if elapsed >= 1.0 {
                             hasCompleted = true
+                            self.bleConnectionProven = true
                             self.recordingStatusCompletion = nil
                             completion(.idle)
                         } else if elapsed < 2.5 {
@@ -316,6 +331,7 @@ final class Dot: ObservableObject, Identifiable {
             self.device.setFlashInfoDoneBlock { [weak self] status in
                 guard let self, !hasCapturedResult else { return }
                 hasCapturedResult = true
+                self.bleConnectionProven = true
 
                 let used = Int(self.device.usedSpace)
                 let total = Int(self.device.totalSpace)
@@ -380,7 +396,8 @@ final class Dot: ObservableObject, Identifiable {
             DispatchQueue.main.asyncAfter(deadline: .now() + 5.0) { [weak self] in
                 guard !hasCapturedResult else { return }
                 hasCapturedResult = true
-                print("⏰ [\(self?.address ?? "?")] Flash info timed out")
+                let isInit = self?.device.isInitialized() ?? false
+                print("⏰ [\(self?.address ?? "?")] getFlashInfo timed out — device.isInitialized=\(isInit)")
                 self?.sdkQueue.async {
                     self?.device.setFlashInfoDoneBlock(nil)
                     let waiters = self?.flashInfoWaiters ?? []

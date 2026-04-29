@@ -101,14 +101,29 @@ final class DotOperationRunner {
     /// `getFlashInfo` from being dispatched while the SDK is still mid-BLE-handshake
     /// after a Bluetooth power-off/reset reconnect (where `bindDevice` prematurely
     /// sets `isInitialized() = true` before characteristic reads finish).
+    ///
+    /// **Optimization:** if `dot.bleConnectionProven` is true (a successful BLE
+    /// round-trip has happened on the current device reference), the settle
+    /// delay is skipped — we already have proof the channel is live. The full
+    /// delay still applies when the flag is false, so the fallback for the
+    /// edge case where `checkSensorActivity` timed out is unchanged.
     private func waitForInitialization(dot: Dot, timeout: TimeInterval, settleDelay: TimeInterval = 0, completion: @escaping (Bool) -> Void) {
         let start = Date()
 
         func check() {
             if dot.isInitialized {
-                if settleDelay > 0 {
-                    print("⏳ [\(dot.address)] isInitialized=true — settling \(settleDelay)s before flash query")
-                    sdkQueue.asyncAfter(deadline: .now() + settleDelay) {
+                let effectiveDelay: TimeInterval
+                if dot.bleConnectionProven {
+                    if settleDelay > 0 {
+                        print("💾 [\(dot.address)] BLE proven ready — skipping \(settleDelay)s settle delay")
+                    }
+                    effectiveDelay = 0
+                } else {
+                    effectiveDelay = settleDelay
+                }
+                if effectiveDelay > 0 {
+                    print("⏳ [\(dot.address)] isInitialized=true — settling \(effectiveDelay)s before flash query")
+                    sdkQueue.asyncAfter(deadline: .now() + effectiveDelay) {
                         completion(true)
                     }
                 } else {

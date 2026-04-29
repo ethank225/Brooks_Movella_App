@@ -295,10 +295,10 @@ struct ExportView: View {
                 Divider()
 
                 if !addable.isEmpty {
-                    // Selection mode — "Add N to cart"
+                    // Selection mode — "Add N to Export"
                     FullWidthButton(
-                        icon: "cart.badge.plus",
-                        label: "Add \(addable.count) to Cart",
+                        icon: "plus.circle.fill",
+                        label: "Add \(addable.count) to Export",
                         color: .purple
                     ) {
                         addSelectedToCart()
@@ -348,10 +348,10 @@ struct ExportView: View {
                         } label: {
                             Text("Export \(cartCount) file\(cartCount == 1 ? "" : "s")")
                                 .font(.subheadline.weight(.semibold))
-                                .foregroundColor(.black)
+                                .foregroundColor(.white)
                                 .frame(maxWidth: .infinity)
                                 .padding(.vertical, 14)
-                                .background(Color.green.opacity(0.7))
+                                .background(Color.green)
                                 .cornerRadius(12)
                         }
                         .buttonStyle(.plain)
@@ -374,18 +374,8 @@ private struct CartBadgeButton: View {
 
     var body: some View {
         Button(action: action) {
-            HStack(spacing: 4) {
-                Image(systemName: "cart")
-                if count > 0 {
-                    Text("\(count)")
-                        .font(.caption2.bold())
-                        .foregroundColor(.white)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(Color.purple)
-                        .clipShape(Capsule())
-                }
-            }
+            Image(systemName: "square.and.arrow.up")
+                .offset(y: -2)
         }
     }
 }
@@ -415,6 +405,8 @@ struct CartView: View {
 
     @State private var showCloseBlockedAlert = false
     @State private var showInitializingAlert = false
+    @State private var showDisconnectedAlert = false
+    @State private var disconnectedSensorNames: [String] = []
     @State private var dbSessionMap: [UUID: UUID] = [:]
 
     // Run Details state
@@ -462,10 +454,10 @@ struct CartView: View {
             ScrollView {
                 VStack(spacing: 16) {
                     if exportManager.cartItems.isEmpty && exportManager.tasks.isEmpty {
-                        SectionCard(title: "Cart", icon: "cart") {
+                        SectionCard(title: "Export", icon: "square.and.arrow.up") {
                             EmptyStateView(
-                                icon: "cart",
-                                headline: "Cart is empty",
+                                icon: "square.and.arrow.up",
+                                headline: "Nothing to export",
                                 subheadline: "Select recordings from the Export tab to add them here"
                             )
                         }
@@ -501,7 +493,7 @@ struct CartView: View {
                 }
                 .padding(.top)
             }
-            .navigationTitle("Export Cart")
+            .navigationTitle("Export Queue")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .navigationBarLeading) {
@@ -524,6 +516,11 @@ struct CartView: View {
                 Button("OK", role: .cancel) {}
             } message: {
                 Text("Some sensors are still initializing. Please wait until all sensors are ready.")
+            }
+            .alert("Sensors Disconnected", isPresented: $showDisconnectedAlert) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text("Reconnect these sensors before exporting:\n\n\(disconnectedSensorNames.joined(separator: "\n"))")
             }
             .task {
                 await supabaseManager.fetchProfiles()
@@ -667,7 +664,11 @@ struct CartView: View {
                 label: "Export \(exportManager.cartItems.count) File\(exportManager.cartItems.count == 1 ? "" : "s")",
                 color: canExport ? .purple : .gray
             ) {
-                if hasInitializingSensors {
+                let disconnected = exportManager.disconnectedCartSensorNames
+                if !disconnected.isEmpty {
+                    disconnectedSensorNames = disconnected
+                    showDisconnectedAlert = true
+                } else if hasInitializingSensors {
                     showInitializingAlert = true
                 } else {
                     Task { await prepareAndStartExport() }

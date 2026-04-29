@@ -89,6 +89,43 @@ final class ExportManager: ObservableObject {
     /// True when tasks were rehydrated from disk on launch (not from a live export session).
     @Published private(set) var hasRestoredTasks: Bool = false
 
+    // MARK: - Retry Availability
+
+    /// True when at least one failed/canceled task has its sensor connected.
+    /// Drives the retry button's disabled state in the UI.
+    var canRetry: Bool {
+        let failed = tasks.filter { $0.status == .failed || $0.status == .canceled }
+        let failedAddresses = Set(failed.map { $0.cartItem.recording.dotAddress })
+        let readyAddresses = Set(
+            DotManager.shared.connectedDots
+                .filter { $0.connectionPhase == .ready }
+                .map { $0.address }
+        )
+        return ExportManagerLogic.canRetry(
+            failedAddresses: failedAddresses,
+            readyAddresses: readyAddresses
+        )
+    }
+
+    /// Display names of cart sensors that are truly disconnected (missing,
+    /// idle, connecting, or failed). Sensors that are `.initializing` are
+    /// excluded — they'll become `.ready` on their own. Empty when every cart
+    /// sensor is connected.
+    var disconnectedCartSensorNames: [String] {
+        let cartAddresses = Set(cartItems.map { $0.recording.dotAddress })
+        let states = cartAddresses.map { address -> ExportManagerLogic.CartSensorState in
+            let dot = DotManager.shared.dot(forUuid: address)
+            let phase = dot?.connectionPhase
+            return ExportManagerLogic.CartSensorState(
+                address: address,
+                displayName: dot?.displayName ?? String(address.suffix(4)),
+                isReady: phase == .ready,
+                isInitializing: phase == .initializing
+            )
+        }
+        return ExportManagerLogic.disconnectedCartSensorNames(states)
+    }
+
     // MARK: - Export State
 
     // Internal so ExportManager+BLETransfer.swift can access them.
@@ -372,7 +409,7 @@ final class ExportManager: ObservableObject {
             }
             guard let dot = DotManager.shared.dot(forUuid: address),
                   dot.connectionPhase == .ready else {
-                tasksForDot.forEach { setTaskStatus($0, .failed, error: "Sensor not ready") }
+                tasksForDot.forEach { setTaskStatus($0, .failed, error: "Sensor not connected") }
                 semaphore.signal(); continue
             }
             exportFilesForDot(dot: dot, tasks: tasksForDot) { semaphore.signal() }
@@ -466,10 +503,30 @@ final class ExportManager: ObservableObject {
     /// If the CSV already exists on disk it is marked done immediately; otherwise the full
     /// BLE pipeline reruns.
     func retryFailed() {
-        let retryable = tasks.filter { $0.status == .failed || $0.status == .canceled }
-        guard !retryable.isEmpty else { return }
+        let allRetryable = tasks.filter { $0.status == .failed || $0.status == .canceled }
+        guard !allRetryable.isEmpty else { return }
         guard exportPhase != .exporting else { return }
         guard !DotManager.shared.isBusy else { return }
+
+        // Partition tasks by whether their sensor is currently .ready. The
+        // disconnected tasks stay failed with an updated error so the UI can
+        // show which to reconnect; the BLE pipeline only runs for the rest.
+        let readyAddresses = Set(
+            DotManager.shared.connectedDots
+                .filter { $0.connectionPhase == .ready }
+                .map { $0.address }
+        )
+        var retryable: [ExportTask] = []
+        for task in allRetryable {
+            let address = task.cartItem.recording.dotAddress
+            if readyAddresses.contains(address) {
+                retryable.append(task)
+            } else {
+                print("⚠️ [\(address)] Retry skipped — sensor not connected")
+                setTaskStatus(task, .failed, error: "Sensor not connected")
+            }
+        }
+        guard !retryable.isEmpty else { return }
 
         beginExportBackgroundTask()
         currentExportCanceled = false
@@ -575,7 +632,7 @@ final class ExportManager: ObservableObject {
                     guard !self.currentExportCanceled else { break }
 
                     guard let dot = DotManager.shared.dot(forUuid: address), dot.connectionPhase == .ready else {
-                        tasksForDot.forEach { self.setTaskStatus($0, .failed, error: "Sensor not ready") }
+                        tasksForDot.forEach { self.setTaskStatus($0, .failed, error: "Sensor not connected") }
                         continue
                     }
 
@@ -599,6 +656,13 @@ final class ExportManager: ObservableObject {
     func retrySingleTask(_ task: ExportTask) {
         guard task.status == .failed || task.status == .canceled else { return }
         guard exportPhase != .exporting else { return }
+
+        let address = task.cartItem.recording.dotAddress
+        guard DotManager.shared.dot(forUuid: address)?.connectionPhase == .ready else {
+            print("⚠️ [\(address)] Retry skipped — sensor not connected")
+            setTaskStatus(task, .failed, error: "Sensor not connected")
+            return
+        }
 
         beginExportBackgroundTask()
         currentExportCanceled = false
@@ -658,7 +722,7 @@ final class ExportManager: ObservableObject {
                             let address = task.cartItem.recording.dotAddress
                             guard !self.currentExportCanceled,
                                   let dot = DotManager.shared.dot(forUuid: address), dot.connectionPhase == .ready else {
-                                self.setTaskStatus(task, .failed, error: "Sensor not ready")
+                                self.setTaskStatus(task, .failed, error: "Sensor not connected")
                                 self.finalizeExport(generation: myGen)
                                 return
                             }
@@ -716,7 +780,7 @@ final class ExportManager: ObservableObject {
                 let address = task.cartItem.recording.dotAddress
                 guard !self.currentExportCanceled,
                       let dot = DotManager.shared.dot(forUuid: address), dot.connectionPhase == .ready else {
-                    self.setTaskStatus(task, .failed, error: "Sensor not ready")
+                    self.setTaskStatus(task, .failed, error: "Sensor not connected")
                     self.finalizeExport(generation: myGen)
                     return
                 }
@@ -1190,5 +1254,48 @@ enum ExportManagerLogic {
     static func validateDotForRetry(dotExists: Bool, dotReady: Bool) -> String? {
         guard dotExists, dotReady else { return "Sensor not ready" }
         return nil
+    }
+
+    /// Whether the "Retry All Failed" button should be enabled.
+    /// True iff at least one failed task has its sensor currently `.ready`.
+    static func canRetry(failedAddresses: Set<String>, readyAddresses: Set<String>) -> Bool {
+        guard !failedAddresses.isEmpty else { return false }
+        return !failedAddresses.isDisjoint(with: readyAddresses)
+    }
+
+    /// Per-cart-sensor connection state used to compute the disconnect list.
+    /// `isReady` = `connectionPhase == .ready`. `isInitializing` = `connectionPhase == .initializing`.
+    /// A sensor with no dot at all has both flags false.
+    struct CartSensorState: Equatable {
+        let address: String
+        let displayName: String
+        let isReady: Bool
+        let isInitializing: Bool
+    }
+
+    /// Display names of cart sensors that are truly disconnected — not `.ready`
+    /// and not `.initializing`. Sorted ascending so output is deterministic.
+    static func disconnectedCartSensorNames(_ cart: [CartSensorState]) -> [String] {
+        cart.filter { !$0.isReady && !$0.isInitializing }
+            .map { $0.displayName }
+            .sorted()
+    }
+
+    /// Partition retryable task addresses into those that should retry vs.
+    /// those that should be marked failed because their sensor isn't ready.
+    static func partitionRetryable(
+        taskAddresses: [String],
+        readyAddresses: Set<String>
+    ) -> (retry: [String], failDisconnected: [String]) {
+        var retry: [String] = []
+        var failDisconnected: [String] = []
+        for address in taskAddresses {
+            if readyAddresses.contains(address) {
+                retry.append(address)
+            } else {
+                failDisconnected.append(address)
+            }
+        }
+        return (retry, failDisconnected)
     }
 }

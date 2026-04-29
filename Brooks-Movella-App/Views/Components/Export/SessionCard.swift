@@ -148,7 +148,7 @@ struct SessionCard: View {
                 onAddToCart(session, sessionFileIds)
                 selectedFileIds.subtract(sessionFileIds)
             } label: {
-                Text("Add all to cart")
+                Text("Add all to export")
                     .font(.subheadline)
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 10)

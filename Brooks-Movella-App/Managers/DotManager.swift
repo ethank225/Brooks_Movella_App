@@ -621,6 +621,10 @@ final class DotManager: NSObject, ObservableObject {
                             self?.stateQueue.async {
                                 guard let self, !self.isBusyInternal else { return }
                                 for dot in dots {
+                                    guard dot.connectionPhase == .ready else {
+                                        print("💾 [\(dot.address)] Post-stop flash refresh skipped — not ready")
+                                        continue
+                                    }
                                     dot.getFlashInfo { _ in }
                                 }
                             }
@@ -680,6 +684,8 @@ final class DotManager: NSObject, ObservableObject {
             self.performSync(dots: dots, runnerId: runnerId) { [weak self] result in
                 guard let self else { return }
                 self.stateQueue.async {
+                    print("🔄 Resync result: succeeded=\(result.succeededUuids.sorted()) failed=\(result.failedUuids.sorted())")
+
                     // setPhase handles syncInProgress and syncingUuids cleanup.
                     if result.allSuccess {
                         self.setPhase(.idle, forRunner: runnerId)
@@ -688,17 +694,41 @@ final class DotManager: NSObject, ObservableObject {
                         print("❌ Resync failed for runner \(runnerId): \(result.errorMsg ?? "unknown")")
                     }
 
-                    // Refresh storage for sensors that are still connected.
-                    // After a failed sync the SDK has already reconnected the
-                    // devices, so they remain at .ready — no need to reset their
-                    // connection state. The runner's .error phase prompts the user
-                    // to retry.
-                    let connectedDots = dots.filter {
-                        self.registry.byUuid[$0.address]?.connectionPhase == .ready
+                    // Reset connection state for sensors that failed sync. The SDK
+                    // reconnected them BLE-wise during sync, but the failed clock
+                    // handshake leaves the characteristic in a stale state where
+                    // getFlashInfo will time out. Demoting to .idle lets the SDK
+                    // auto-reconnect cycle (DotReconnectManager) put them back
+                    // through initializeAfterConnect, which proves BLE liveness
+                    // via checkSensorActivity before any flash query.
+                    for uuid in result.failedUuids {
+                        let phase = self.registry.byUuid[uuid]?.connectionPhase ?? .idle
+                        guard phase == .ready || phase == .initializing else { continue }
+                        print("⚠️ [\(uuid)] Sync failed — resetting connection state")
+                        self.registry.recordDisconnection(uuid)
+                        // Force the BLE link down so DotReconnectManager auto-reconnects
+                        // and the dot goes back through initializeAfterConnect cleanly.
+                        if let device = self.registry.byUuid[uuid]?.device {
+                            self.sdkQueue.async {
+                                DotDevicePool.unbindDevice(device)
+                                DotConnectionManager.disconnect(device)
+                            }
+                        }
                     }
-                    if !connectedDots.isEmpty {
-                        self.refreshStorage(dots: connectedDots)
+
+                    // Refresh storage only for sensors whose sync succeeded —
+                    // the failed ones have been demoted above and will refresh
+                    // on their next reconnect.
+                    let succeededDots = dots.filter {
+                        result.succeededUuids.contains($0.address)
+                            && self.registry.byUuid[$0.address]?.connectionPhase == .ready
                     }
+                    print("💾 Refreshing storage for succeeded dots: \(succeededDots.map { $0.address })")
+                    if !succeededDots.isEmpty {
+                        self.refreshStorage(dots: succeededDots)
+                    }
+
+                    self.notify()
                 }
             }
         }
@@ -992,13 +1022,18 @@ final class DotManager: NSObject, ObservableObject {
     /// Fetch flash usage for each dot after sync or connection. Must be called on `stateQueue`.
     private func refreshStorage(dots: [Dot], settleDelay: TimeInterval = 0) {
         guard !isBusyInternal else {
-            print("💾 Storage refresh skipped — system busy")
+            let blocked = dots.map { $0.address }.joined(separator: ",")
+            print("💾 Storage refresh skipped — system busy (blocked=[\(blocked)] phase=\(runnerPhasesInternal))")
             return
+        }
+        for dot in dots {
+            print("💾 [\(dot.address)] getFlashInfo starting (settleDelay=\(settleDelay) isInitialized=\(dot.device.isInitialized()))")
         }
         operations.refreshStorage(dots: dots, settleDelay: settleDelay) { [weak self] dot, success in
             self?.stateQueue.async {
                 guard let self else { return }
                 let uuid = dot.device.uuid
+                print("💾 [\(uuid)] getFlashInfo result: success=\(success) used=\(dot.device.usedSpace) total=\(dot.device.totalSpace)")
 
                 self.registry.initializationInProgress.remove(uuid)
 
@@ -1065,10 +1100,12 @@ final class DotManager: NSObject, ObservableObject {
     /// and `isRecording` hasn't updated by the time we check it.
     private func initializeAfterConnect(dot: Dot, settleDelay: TimeInterval = 0) {
         let uuid = dot.address
+        print("🔗 [\(uuid)] initializeAfterConnect entered (settleDelay=\(settleDelay)) phase=\(runnerPhasesInternal) isBusyInternal=\(isBusyInternal)")
 
         dot.checkSensorActivity { [weak self] activity in
             guard let self else { return }
             self.stateQueue.async {
+                print("🔗 [\(uuid)] checkSensorActivity → \(activity) (phase=\(self.runnerPhasesInternal))")
 
                 switch activity {
                 case .recording:
@@ -1209,6 +1246,10 @@ extension DotManager: DotConnectionDelegate {
                 return
             }
 
+            let uuid = device.uuid
+            print("🔗 [\(uuid)] Reconnect during phase: \(self.runnerPhasesInternal)")
+            print("🔗 [\(uuid)] isBusyInternal=\(self.isBusyInternal) syncInProgress=\(self.registry.syncInProgress)")
+
             self.cancelConnectTimer(device.uuid)
 
             // During sync the SDK internally reconnects each sensor.
@@ -1216,6 +1257,7 @@ extension DotManager: DotConnectionDelegate {
             // path — the dots were never shown as disconnected to the user.
             // Only suppress sensors that are part of the active sync operation.
             if self.registry.syncInProgress && self.registry.syncingUuids.contains(device.uuid) {
+                print("🔗 [\(uuid)] Branch: sync-suppressed")
                 self.registry.recordReconnection(device)
                 return
             }
@@ -1227,6 +1269,7 @@ extension DotManager: DotConnectionDelegate {
             // device was not connectInProgress.
             if self.registry.connectQueue.contains(device.uuid)
                 && self.registry.connectInProgress != device.uuid {
+                print("🔗 [\(uuid)] Branch: queued-auto-reconnect (settleDelay=2.0)")
                 self.registry.connectQueue.removeAll { $0 == device.uuid }
                 print("🔄 [\(device.uuid)] Connected while still queued — treating as auto-reconnect")
 
@@ -1239,7 +1282,7 @@ extension DotManager: DotConnectionDelegate {
 
                 if let dot = self.registry.dot(forUuid: device.uuid) {
                     self.resetEraseState(dot)
-                    self.initializeAfterConnect(dot: dot)
+                    self.initializeAfterConnect(dot: dot, settleDelay: 2.0)
                 }
                 self.notify()
                 return
@@ -1254,6 +1297,7 @@ extension DotManager: DotConnectionDelegate {
                 && !self.registry.connectQueue.contains(device.uuid)
 
             if isAutoReconnect {
+                print("🔗 [\(uuid)] Branch: SDK auto-reconnect (settleDelay=2.0)")
                 print("🔄 [\(device.uuid)] Auto-reconnect detected")
                 self.registry.recordReconnection(device)
                 self.registry.setConnectionPhase(device.uuid, .initializing)
@@ -1264,7 +1308,7 @@ extension DotManager: DotConnectionDelegate {
 
                 if let dot = self.registry.dot(forUuid: device.uuid) {
                     self.resetEraseState(dot)
-                    self.initializeAfterConnect(dot: dot)
+                    self.initializeAfterConnect(dot: dot, settleDelay: 2.0)
                 }
                 self.notify()
                 return
@@ -1278,6 +1322,7 @@ extension DotManager: DotConnectionDelegate {
             // settle delay before calling getFlashInfo.
             let isReconnect = self.registry.byUuid[device.uuid]?.dot != nil
             let settleDelay: TimeInterval = isReconnect ? 2.0 : 0
+            print("🔗 [\(uuid)] Branch: normal-connect (isReconnect=\(isReconnect) settleDelay=\(settleDelay))")
 
             // recordConnection sets phase to .initializing
             self.registry.recordConnection(device)
@@ -1316,6 +1361,7 @@ extension DotManager: DotConnectionDelegate {
         guard !device.uuid.isEmpty else { return }
         print("⛓️‍💥 Disconnected: \(device.uuid)")
         stateQueue.async {
+            print("⛓️‍💥 [\(device.uuid)] Disconnect during phase: \(self.runnerPhasesInternal) isBusyInternal=\(self.isBusyInternal)")
             if self.registry.syncInProgress && self.registry.syncingUuids.contains(device.uuid) {
                 // SDK-managed disconnect during sync — ignore entirely.
                 // The dots remain visually "connected" throughout the sync process.
